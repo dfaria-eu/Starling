@@ -860,6 +860,24 @@ class AdminCtrl
         }
     }
 
+    private function fmtDate(string $iso): string
+    {
+        $ts = strtotime($iso);
+        return $ts === false ? '—' : date('Y-m-d', $ts);
+    }
+
+    private function fmtDateTime(string $iso): string
+    {
+        $ts = strtotime($iso);
+        return $ts === false ? '—' : date('Y-m-d H:i:s', $ts);
+    }
+
+    private function fmtDateTimeShort(string $iso): string
+    {
+        $ts = strtotime($iso);
+        return $ts === false ? '—' : date('Y-m-d H:i', $ts);
+    }
+
     private function redirect(string $url): never
     {
         header('Location: ' . $url); exit;
@@ -1384,7 +1402,7 @@ HTML;
               <td>{$adminBadge}{$botBadge}{$lockBadge}{$suspBadge}</td>
               <td class='td-dim'>{$e($u['follower_count'])} followers / {$e($u['following_count'])} following</td>
               <td class='td-dim'>{$e($u['status_count'])} posts</td>
-              <td class='td-dim' style='font-size:.7rem'>{$e(substr($u['created_at'],0,10))}</td>
+              <td class='td-dim' style='font-size:.7rem'>{$e($this->fmtDate($u['created_at'] ?? ''))}</td>
               <td style='white-space:nowrap'>$editBtn $suspBtn $adminBtn $delBtn</td>
             </tr>
             <tr id='user-edit-{$e($u['id'])}' style='display:none'>
@@ -1523,7 +1541,7 @@ HTML;
                 ? $e(($row['target_type'] ?? '') . ':' . ($row['target_id'] ?? ''))
                 : '—';
             $rows .= "<tr>
-              <td class='td-dim' style='font-size:.75rem'>{$e(substr((string)$row['created_at'], 0, 19))}</td>
+              <td class='td-dim' style='font-size:.75rem'>{$e($this->fmtDateTime($row['created_at'] ?? ''))}</td>
               <td class='td-mono'>{$e($row['admin_username'] ?? 'system')}</td>
               <td><span class='badge badge-blue'>{$e($row['action'])}</span></td>
               <td class='td-mono td-dim'>{$target}</td>
@@ -1563,7 +1581,7 @@ HTML;
               <td class='td-mono'>@{$e($row['username'] ?? 'unknown')}</td>
               <td><span class='badge badge-dim'>{$e($row['type'])}</span> {$attached}</td>
               <td class='td-dim' style='max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{$desc}</td>
-              <td class='td-dim' style='font-size:.75rem'>{$e(substr((string)$row['created_at'], 0, 10))}</td>
+              <td class='td-dim' style='font-size:.75rem'>{$e($this->fmtDate($row['created_at'] ?? ''))}</td>
               <td style='white-space:nowrap'>
                 <a class='btn btn-sm btn-ghost' href='{$e($row['url'])}' target='_blank' rel='noopener'>Open</a>
                 <form method='POST' action='/admin/media/{$e($row['id'])}/delete' style='display:inline' onsubmit='return confirm(\"{$confirm}\")'>
@@ -1701,7 +1719,7 @@ HTML;
               <td>{$e($row['reason'])}</td>
               <td><span class='badge {$statusBadgeClass}'>{$e($row['status'])}</span></td>
               <td class='td-dim'>{$e($row['reporter_username'] ?? 'admin')}</td>
-              <td class='td-dim' style='font-size:.75rem'>{$e(substr((string)$row['created_at'], 0, 10))}</td>
+              <td class='td-dim' style='font-size:.75rem'>{$e($this->fmtDate($row['created_at'] ?? ''))}</td>
               <td style='padding:0'>
                 <form method='POST' action='/admin/reports/{$e($row['id'])}/update' class='form-row' style='padding:.85rem;gap:.5rem;align-items:flex-end'>
                   <div class='form-group'>
@@ -1822,7 +1840,7 @@ HTML;
             $blockedRows .= "<tr>
               <td class='td-mono'>{$e($b['domain'])}</td>
               <td class='td-dim'>{$e($b['admin_name'] ?? '—')}</td>
-              <td class='td-dim' style='font-size:.7rem'>{$e(substr($b['created_at'],0,10))}</td>
+              <td class='td-dim' style='font-size:.7rem'>{$e($this->fmtDate($b['created_at'] ?? ''))}</td>
               <td><form method='POST' action='/admin/federation'>
                 <input type='hidden' name='action' value='unblock'>
                 <input type='hidden' name='domain' value='{$e($b['domain'])}'>
@@ -1943,7 +1961,7 @@ HTML;
             $hasErr  = $r['error'] !== '';
             $errBadge= $hasErr ? "<span class='badge badge-red'>error</span>" : "<span class='badge badge-green'>ok</span>";
             $rows .= "<tr>
-              <td class='td-mono' style='font-size:.7rem'>{$e(substr($r['created_at'],0,19))}</td>
+              <td class='td-mono' style='font-size:.7rem'>{$e($this->fmtDateTime($r['created_at'] ?? ''))}</td>
               <td><span class='badge badge-blue'>{$e($r['type'])}</span></td>
               <td class='td-mono td-dim' style='font-size:.7rem;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{$e($r['actor_url'])}</td>
               <td>$errBadge</td>
@@ -1997,7 +2015,7 @@ HTML;
 {$errHtml}
 <div class="cards" style="grid-template-columns:repeat(3,auto) 1fr;gap:.6rem;margin-bottom:1.5rem">
   <div class="card"><div class="card-label">Type</div><div style="color:var(--blue);font-weight:600">{$e($r['type'])}</div></div>
-  <div class="card"><div class="card-label">Date</div><div class="card-value" style="font-size:.9rem">{$e(substr($r['created_at'],0,19))}</div></div>
+  <div class="card"><div class="card-label">Date</div><div class="card-value" style="font-size:.9rem">{$e($this->fmtDateTime($r['created_at'] ?? ''))}</div></div>
   <div class="card"><div class="card-label">Actor</div><div class="card-value" style="font-size:.7rem;word-break:break-all">{$e($r['actor_url'])}</div></div>
 </div>
 <div class="section-title">Raw activity JSON</div>
@@ -2234,7 +2252,7 @@ HTML;
                 <td>$status</td>
                 <td>$mode</td>
                 <td>$limitLabel</td>
-                <td>{$e(substr($r['created_at'], 0, 10))}</td>
+                <td>{$e($this->fmtDate($r['created_at'] ?? ''))}</td>
                 <td>
                     <form method='post' action='/admin/relays/action' style='display:inline-block;margin-right:.35rem'>
                         <input type='hidden' name='_csrf' value='$csrf'>
@@ -2347,8 +2365,8 @@ HTML;
             $nextTs  = strtotime($r['next_retry_at'] ?? '');
             $nextRel = $nextTs ? ($nextTs <= $now ? 'now' : 'in ' . gmdate('H\hi', $nextTs - $now)) : '—';
 
-            $age = $r['created_at'] ? substr($r['created_at'], 0, 16) : '—';
-            $lastAttempt = !empty($r['last_attempt_at']) ? substr((string)$r['last_attempt_at'], 0, 16) : '—';
+            $age = $this->fmtDateTimeShort($r['created_at'] ?? '');
+            $lastAttempt = $this->fmtDateTimeShort($r['last_attempt_at'] ?? '');
 
             $tableRows .= "<tr>
               <td class='td-mono' style='font-size:.75rem'>$domain</td>
@@ -2369,8 +2387,8 @@ HTML;
         $retryingColor = $stats['retrying'] > 0 ? 'var(--amber)' : 'var(--green)';
         $failedColor   = $stats['failed']   > 0 ? 'var(--red)'   : 'var(--green)';
         $dueColor      = $stats['due']      > 0 ? 'var(--amber)' : 'var(--green)';
-        $nextDueLabel  = $stats['next_due'] ? $e(substr((string)$stats['next_due'], 0, 16)) : '—';
-        $lastAttemptLabel = $stats['last_attempt'] ? $e(substr((string)$stats['last_attempt'], 0, 16)) : '—';
+        $nextDueLabel  = $e($this->fmtDateTimeShort($stats['next_due'] ?? ''));
+        $lastAttemptLabel = $e($this->fmtDateTimeShort($stats['last_attempt'] ?? ''));
 
         $bucketHtml = '';
         foreach ($errorBuckets as $row) {
@@ -2410,7 +2428,7 @@ HTML;
               <td>" . $e($row['activity_type'] ?? '—') . " <span style='color:var(--text3);font-size:.7rem'>(" . $e($row['object_type'] ?? '—') . ")</span></td>
               <td><span class='badge {$outcomeClass}'>" . $e($outcomeLabel) . "</span></td>
               <td class='td-dim' style='font-size:.72rem;max-width:260px;word-break:break-word'>" . $e($result) . "</td>
-              <td class='td-dim' style='font-size:.7rem'>" . $e(substr((string)($row['created_at'] ?? '—'), 0, 19)) . "</td>
+              <td class='td-dim' style='font-size:.7rem'>" . $e($this->fmtDateTime($row['created_at'] ?? '')) . "</td>
             </tr>";
         }
         if ($attemptRows === '') {
