@@ -61,8 +61,6 @@ It is best suited to small instances, experiments, and independent deployments t
 
 ## License
 
-Starling is free software. You can use, copy, modify, and redistribute it under the terms of the GNU Affero General Public License v3.0 or later.
-
-Starling is an idea by [Domingos Faria](https://dfaria.eu).
+Starling is free software. You can use, copy, modify, and redistribute it under the terms of the GNU Affero General Public License v3.0 or later. Starling is an idea by [Domingos Faria](https://dfaria.eu).
 
 If you build on Starling, please let me know about modifications, improvements, and new ideas via my fediverse contact: `@df@s.dfaria.eu`.
