@@ -143,6 +143,7 @@ class MediaModel
             return [$w, $h, $previewUrl, $blurhash];
         }
 
+        $img = self::autoOrientImage($img, $dest, $mime);
         $w = imagesx($img);
         $h = imagesy($img);
 
@@ -160,6 +161,57 @@ class MediaModel
         $blurhash   = self::encodeAverageBlurhash($img);
 
         return [$w, $h, $previewUrl, $blurhash];
+    }
+
+    private static function autoOrientImage($img, string $path, string $mime)
+    {
+        if ($mime !== 'image/jpeg' || !function_exists('exif_read_data')) {
+            return $img;
+        }
+
+        try {
+            $exif = @exif_read_data($path);
+        } catch (\Throwable) {
+            return $img;
+        }
+
+        $orientation = (int)($exif['Orientation'] ?? 1);
+        if ($orientation === 1) {
+            return $img;
+        }
+
+        switch ($orientation) {
+            case 2:
+                imageflip($img, IMG_FLIP_HORIZONTAL);
+                break;
+            case 3:
+                $rotated = imagerotate($img, 180, 0);
+                if ($rotated !== false) $img = $rotated;
+                break;
+            case 4:
+                imageflip($img, IMG_FLIP_VERTICAL);
+                break;
+            case 5:
+                imageflip($img, IMG_FLIP_VERTICAL);
+                $rotated = imagerotate($img, -90, 0);
+                if ($rotated !== false) $img = $rotated;
+                break;
+            case 6:
+                $rotated = imagerotate($img, -90, 0);
+                if ($rotated !== false) $img = $rotated;
+                break;
+            case 7:
+                imageflip($img, IMG_FLIP_HORIZONTAL);
+                $rotated = imagerotate($img, -90, 0);
+                if ($rotated !== false) $img = $rotated;
+                break;
+            case 8:
+                $rotated = imagerotate($img, 90, 0);
+                if ($rotated !== false) $img = $rotated;
+                break;
+        }
+
+        return $img;
     }
 
     private static function loadGdImage(string $path, string $mime)
