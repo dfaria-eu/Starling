@@ -36,6 +36,8 @@ Starling speaks ActivityPub and can interact with platforms such as:
 - PixelFed
 - other ActivityPub-compatible servers
 
+Tested clients so far include Ivory, Elk, and Phanpy.
+
 ## What You Can Do
 
 - publish posts and replies
