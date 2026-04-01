@@ -1,0 +1,30 @@
+RewriteEngine On
+RewriteBase /
+
+Header always set X-Content-Type-Options "nosniff"
+Header always set X-Frame-Options "DENY"
+Header always set Referrer-Policy "strict-origin-when-cross-origin"
+Header always set Access-Control-Allow-Origin "*"
+Header always set Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+Header always set Access-Control-Allow-Headers "Authorization, Content-Type, Accept, Idempotency-Key"
+
+Header always set Access-Control-Expose-Headers "Link, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset"
+
+<IfModule LiteSpeed>
+    # Impedir que o LiteSpeed intercepte o header Link para HTTP/2 Push
+    Header always set X-LiteSpeed-Vary "0"
+    RewriteRule .* - [E=noabort:1]
+</IfModule>
+
+RewriteCond %{REQUEST_METHOD} OPTIONS
+RewriteRule ^ - [R=204,L]
+
+RewriteCond %{HTTP:Authorization} .
+RewriteRule ^ - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+RewriteCond %{HTTP:Signature} .
+RewriteRule ^ - [E=HTTP_SIGNATURE:%{HTTP:Signature}]
+
+RewriteCond %{REQUEST_FILENAME} -f
+RewriteRule ^ - [L]
+
+RewriteRule ^ index.php [L]
