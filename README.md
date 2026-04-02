@@ -1,6 +1,6 @@
 # ⋰⋱ Starling 
 
-> Simplest way to run a fediverse instance.
+> The simplest way to run your own fediverse server.
 
 Lightweight ActivityPub for small, independent servers.
 
