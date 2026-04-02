@@ -1,12 +1,13 @@
 # ⋰⋱ Starling 
 
-> The simplest way to run your own fediverse server.
+> The simplest way to run your own fediverse server: no database, no workers, no DevOps.
 
-Lightweight ActivityPub for small, independent servers.
+- Runs on shared hosting
+- No MySQL or PostgreSQL required (uses SQLite)
+- No background workers or cron jobs
+- Deploy like a simple PHP app
 
-Starling is a lightweight ActivityPub server written in PHP.
-
-It is built for small, independent instances that want to stay simple: PHP, SQLite, a Mastodon-compatible API, and built-in web and admin interfaces.
+Starling is a lightweight ActivityPub server built with PHP and SQLite, designed to run on shared hosting and low-resource environments. It is built for small, independent instances that want to stay simple: PHP, SQLite, a Mastodon-compatible API, and built-in web and admin interfaces.
 
 Inspired by starling murmurations: decentralized, leaderless, and shaped by nearby connection.
 
