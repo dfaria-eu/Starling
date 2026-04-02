@@ -67,6 +67,13 @@ class Delivery
         return true;
     }
 
+    private static function isLocalDeliveryUrl(string $url): bool
+    {
+        $host = (string)(parse_url($url, PHP_URL_HOST) ?? '');
+        if ($host === '') return false;
+        return is_local($host);
+    }
+
     private static function isPublicIp(string $ip): bool
     {
         if (!filter_var($ip, FILTER_VALIDATE_IP)) return false;
@@ -467,6 +474,7 @@ class Delivery
     public static function enqueue(array $actor, string $inboxUrl, array $activity): void
     {
         if (!self::isQueueableUrl($inboxUrl)) return;
+        if (self::isLocalDeliveryUrl($inboxUrl)) return;
         try {
             self::ensureQueueTable();
             $payload = json_encode($activity, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -565,6 +573,7 @@ class Delivery
      */
     private static function enqueueRetry(string $actorId, string $inboxUrl, array $activity): void
     {
+        if (self::isLocalDeliveryUrl($inboxUrl)) return;
         try {
             self::ensureQueueTable();
             $payload = json_encode($activity, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -712,6 +721,12 @@ class Delivery
 
                 $activity = json_decode($row['payload'], true);
                 if (!$activity) { DB::delete('delivery_queue', 'id=?', [$row['id']]); $skipped++; continue; }
+
+                if (self::isLocalDeliveryUrl((string)$row['inbox_url'])) {
+                    DB::delete('delivery_queue', 'id=?', [$row['id']]);
+                    $skipped++;
+                    continue;
+                }
 
                 $urlState = self::classifyInboxUrl($row['inbox_url']);
                 if ($urlState['state'] === 'terminal') {
