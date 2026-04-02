@@ -829,9 +829,10 @@ class Delivery
 
         $duration = microtime(true) - $startedAt;
         $processed = $successes + $retryFailures + $terminalFailures + $skipped;
+        $shouldLogSlowBatch = $duration >= 5.0 && $leased >= 3;
         if (
             $processed > 0 &&
-            ($retryFailures > 0 || $terminalFailures > 0 || $duration >= 5.0)
+            ($retryFailures > 0 || $terminalFailures > 0 || $shouldLogSlowBatch)
         ) {
             self::logQueue('batch', [
                 'limit' => $limit,
