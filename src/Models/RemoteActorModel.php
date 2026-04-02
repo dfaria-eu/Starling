@@ -20,28 +20,61 @@ class RemoteActorModel
      */
     public static function fetch(string $url, bool $force = false): ?array
     {
+        return self::fetchDetailed($url, $force)['actor'];
+    }
+
+    /**
+     * Fetch and cache a remote actor by AP URL, with diagnostics.
+     *
+     * @return array{ok:bool,actor:?array,error:string}
+     */
+    public static function fetchDetailed(string $url, bool $force = false): array
+    {
         // Rejeitar URLs malformadas ou com credenciais embutidas (user@host)
-        if ($url === '' || !preg_match('#^https?://#i', $url)) return null;
+        if ($url === '' || !preg_match('#^https?://#i', $url)) {
+            return ['ok' => false, 'actor' => null, 'error' => 'invalid_actor_url'];
+        }
         $parsedHost = parse_url($url, PHP_URL_HOST) ?? '';
-        if ($parsedHost && is_local($parsedHost)) return null;
-        if (str_contains($parsedHost, '@') || str_contains($parsedHost, ' ')) return null;
-        if (!empty(parse_url($url, PHP_URL_USER))) return null;
+        if ($parsedHost && is_local($parsedHost)) {
+            return ['ok' => false, 'actor' => null, 'error' => 'local_actor_url_rejected'];
+        }
+        if (str_contains($parsedHost, '@') || str_contains($parsedHost, ' ')) {
+            return ['ok' => false, 'actor' => null, 'error' => 'invalid_actor_host'];
+        }
+        if (!empty(parse_url($url, PHP_URL_USER))) {
+            return ['ok' => false, 'actor' => null, 'error' => 'embedded_credentials_rejected'];
+        }
 
         if (!$force) {
             $cached = DB::one('SELECT * FROM remote_actors WHERE id=?', [$url]);
             if ($cached && $cached['fetched_at'] > gmdate('Y-m-d\TH:i:s\Z', time() - 3600)) {
-                return $cached;
+                return ['ok' => true, 'actor' => $cached, 'error' => ''];
             }
         }
 
         // SSRF protection: reject private/loopback addresses
-        if (!self::isSafeUrl($url)) return null;
+        if (!self::isSafeUrl($url)) {
+            $dns = self::resolveHostIpsDetailed($parsedHost);
+            $error = $dns['status'] !== 'ok'
+                ? $dns['status']
+                : 'unsafe_url';
+            return ['ok' => false, 'actor' => null, 'error' => $error];
+        }
 
-        $data = self::httpGet($url, 'application/activity+json');
-        if (!$data || empty($data['id'])) return null;
+        $http = self::httpGetDetailed($url, 'application/activity+json');
+        if (!$http['ok']) {
+            return ['ok' => false, 'actor' => null, 'error' => $http['error']];
+        }
+        $data = $http['data'];
+        if (!$data || empty($data['id'])) {
+            return ['ok' => false, 'actor' => null, 'error' => 'actor_response_missing_id'];
+        }
 
         // fetchCounts=true on explicit profile refreshes (force=true); skip during inbox processing
-        return self::upsert($data, $force);
+        $actor = self::upsert($data, $force);
+        return $actor
+            ? ['ok' => true, 'actor' => $actor, 'error' => '']
+            : ['ok' => false, 'actor' => null, 'error' => 'actor_upsert_failed'];
     }
 
     /** Resolve @user@domain via WebFinger, then fetch actor. */
@@ -221,7 +254,19 @@ class RemoteActorModel
      */
     public static function httpGet(string $url, string $accept, ?array $signingActor = null): ?array
     {
-        if (!self::isSafeUrl($url)) return null;
+        return self::httpGetDetailed($url, $accept, $signingActor)['data'];
+    }
+
+    /**
+     * HTTP GET with diagnostics.
+     *
+     * @return array{ok:bool,data:?array,error:string,http_code:int}
+     */
+    public static function httpGetDetailed(string $url, string $accept, ?array $signingActor = null): array
+    {
+        if (!self::isSafeUrl($url)) {
+            return ['ok' => false, 'data' => null, 'error' => 'unsafe_url', 'http_code' => 0];
+        }
 
         $headerLines = [
             'Accept: ' . $accept,
@@ -254,16 +299,35 @@ class RemoteActorModel
             CURLOPT_HTTPHEADER     => $headerLines,
         ]);
         $raw      = curl_exec($ch);
+        $errno    = curl_errno($ch);
+        $err      = curl_error($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
         self::closeCurlHandle($ch);
 
-        if (!$raw) return null;
+        if ($raw === false) {
+            return [
+                'ok' => false,
+                'data' => null,
+                'error' => $errno === 6 ? 'dns_unresolved' : ('curl_error:' . ($err !== '' ? $err : (string)$errno)),
+                'http_code' => $httpCode,
+            ];
+        }
 
         // SSRF protection: check redirect destination if the URL changed
-        if ($finalUrl && $finalUrl !== $url && !self::isSafeUrl($finalUrl)) return null;
+        if ($finalUrl && $finalUrl !== $url && !self::isSafeUrl($finalUrl)) {
+            return ['ok' => false, 'data' => null, 'error' => 'unsafe_redirect_url', 'http_code' => $httpCode];
+        }
+
+        if ($httpCode >= 400) {
+            return ['ok' => false, 'data' => null, 'error' => 'http_' . $httpCode, 'http_code' => $httpCode];
+        }
 
         $data = json_decode($raw, true);
-        return is_array($data) ? $data : null;
+        if (!is_array($data)) {
+            return ['ok' => false, 'data' => null, 'error' => 'invalid_json_response', 'http_code' => $httpCode];
+        }
+        return ['ok' => true, 'data' => $data, 'error' => '', 'http_code' => $httpCode];
     }
 
     /**

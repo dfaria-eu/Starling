@@ -77,17 +77,72 @@ class CryptoModel
      */
     public static function verifyIncoming(array $headers, string $method, string $path, string $body = ''): bool
     {
-        $sig = $headers['signature'] ?? '';
-        if (!$sig) return false;
+        return self::verifyIncomingDetailed($headers, $method, $path, $body)['ok'];
+    }
 
-        if (!preg_match('/keyId="([^"]+)"/',    $sig, $km)) return false;
-        if (!preg_match('/headers="([^"]+)"/',  $sig, $hm)) return false;
-        if (!preg_match('/signature="([^"]+)"/', $sig, $sm)) return false;
+    /**
+     * Verify the HTTP Signature on an incoming request and return diagnostics.
+     *
+     * @return array{ok:bool,error:string,key_id:string,actor_url:string,algorithm:string,headers:string}
+     */
+    public static function verifyIncomingDetailed(array $headers, string $method, string $path, string $body = ''): array
+    {
+        $sig = $headers['signature'] ?? '';
+        if (!$sig) {
+            return [
+                'ok' => false,
+                'error' => 'missing_signature_header',
+                'key_id' => '',
+                'actor_url' => '',
+                'algorithm' => '',
+                'headers' => '',
+            ];
+        }
+
+        if (!preg_match('/keyId="([^"]+)"/', $sig, $km)) {
+            return [
+                'ok' => false,
+                'error' => 'signature_missing_keyid',
+                'key_id' => '',
+                'actor_url' => '',
+                'algorithm' => '',
+                'headers' => '',
+            ];
+        }
+        if (!preg_match('/headers="([^"]+)"/', $sig, $hm)) {
+            return [
+                'ok' => false,
+                'error' => 'signature_missing_headers_list',
+                'key_id' => $km[1],
+                'actor_url' => self::actorUrlFromKeyId($km[1]),
+                'algorithm' => '',
+                'headers' => '',
+            ];
+        }
+        if (!preg_match('/signature="([^"]+)"/', $sig, $sm)) {
+            return [
+                'ok' => false,
+                'error' => 'signature_missing_signature_value',
+                'key_id' => $km[1],
+                'actor_url' => self::actorUrlFromKeyId($km[1]),
+                'algorithm' => '',
+                'headers' => $hm[1],
+            ];
+        }
         // Reject explicitly stated algorithms outside the accepted set.
         // hs2019 = "algorithm determined by key type" (IETF draft-cavage-http-signatures-12).
         // ed25519 = explicit EdDSA; accepted and handled in _verifySig().
-        if (preg_match('/algorithm="([^"]+)"/', $sig, $am) &&
-            !in_array(strtolower($am[1]), ['rsa-sha256', 'hs2019', 'ed25519'], true)) return false;
+        $algorithm = preg_match('/algorithm="([^"]+)"/', $sig, $am) ? strtolower($am[1]) : '';
+        if ($algorithm !== '' && !in_array($algorithm, ['rsa-sha256', 'hs2019', 'ed25519'], true)) {
+            return [
+                'ok' => false,
+                'error' => 'unsupported_algorithm:' . $algorithm,
+                'key_id' => $km[1],
+                'actor_url' => self::actorUrlFromKeyId($km[1]),
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
+        }
 
         $keyId   = $km[1];
         $hdrList = explode(' ', $hm[1]);
@@ -107,7 +162,17 @@ class CryptoModel
             } elseif ($h === '(expires)' && $expires !== null) {
                 $parts[] = "(expires): $expires";
             } else {
-                $parts[] = "$h: " . ($headers[$h] ?? '');
+                if (!array_key_exists($h, $headers)) {
+                    return [
+                        'ok' => false,
+                        'error' => 'signed_header_missing:' . $h,
+                        'key_id' => $keyId,
+                        'actor_url' => self::actorUrlFromKeyId($keyId),
+                        'algorithm' => $algorithm,
+                        'headers' => $hm[1],
+                    ];
+                }
+                $parts[] = "$h: " . $headers[$h];
             }
         }
         $signingStr = implode("\n", $parts);
@@ -116,9 +181,27 @@ class CryptoModel
         // This protects the body integrity for signed inbox deliveries and matches Mastodon.
         $digestHeader = trim((string)($headers['digest'] ?? ''));
         if ($digestHeader !== '') {
-            if (!preg_match('/^SHA-256=(.+)$/i', $digestHeader, $dm)) return false;
+            if (!preg_match('/^SHA-256=(.+)$/i', $digestHeader, $dm)) {
+                return [
+                    'ok' => false,
+                    'error' => 'digest_header_invalid',
+                    'key_id' => $keyId,
+                    'actor_url' => self::actorUrlFromKeyId($keyId),
+                    'algorithm' => $algorithm,
+                    'headers' => $hm[1],
+                ];
+            }
             $expectedDigest = base64_encode(hash('sha256', $body, true));
-            if (!hash_equals($expectedDigest, trim($dm[1]))) return false;
+            if (!hash_equals($expectedDigest, trim($dm[1]))) {
+                return [
+                    'ok' => false,
+                    'error' => 'digest_mismatch',
+                    'key_id' => $keyId,
+                    'actor_url' => self::actorUrlFromKeyId($keyId),
+                    'algorithm' => $algorithm,
+                    'headers' => $hm[1],
+                ];
+            }
         }
 
         // Reject requests with a stale Date header — allow ±12 hours (matches Mastodon).
@@ -126,14 +209,42 @@ class CryptoModel
         $dateStr = $headers['date'] ?? '';
         if ($dateStr) {
             $ts = strtotime($dateStr);
-            if ($ts === false || abs(time() - $ts) > 43200) return false;
+            if ($ts === false) {
+                return [
+                    'ok' => false,
+                    'error' => 'date_header_invalid',
+                    'key_id' => $keyId,
+                    'actor_url' => self::actorUrlFromKeyId($keyId),
+                    'algorithm' => $algorithm,
+                    'headers' => $hm[1],
+                ];
+            }
+            if (abs(time() - $ts) > 43200) {
+                return [
+                    'ok' => false,
+                    'error' => 'date_header_stale',
+                    'key_id' => $keyId,
+                    'actor_url' => self::actorUrlFromKeyId($keyId),
+                    'algorithm' => $algorithm,
+                    'headers' => $hm[1],
+                ];
+            }
         }
 
         $actorUrl = self::actorUrlFromKeyId($keyId);
 
         // First attempt with cached key (look up by specific keyId when available)
         $pub = self::fetchPublicKey($actorUrl, $keyId);
-        if ($pub && self::_verifySig($signingStr, $sigB64, $pub)) return true;
+        if ($pub && self::_verifySig($signingStr, $sigB64, $pub)) {
+            return [
+                'ok' => true,
+                'error' => '',
+                'key_id' => $keyId,
+                'actor_url' => $actorUrl,
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
+        }
 
         // If verification failed, the remote actor may have rotated their key.
         // Clear the cache and force a live re-fetch once, then retry.
@@ -142,13 +253,49 @@ class CryptoModel
         $cacheKey = $keyId ?: $actorUrl;
         unset(self::$keyCache[$cacheKey]);
         $actor = RemoteActorModel::fetch($actorUrl, true); // force refresh
-        if (!$actor) return false;
+        if (!$actor) {
+            return [
+                'ok' => false,
+                'error' => $pub ? 'signature_mismatch_after_cached_key' : 'public_key_fetch_failed',
+                'key_id' => $keyId,
+                'actor_url' => $actorUrl,
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
+        }
         $freshPem = self::extractKeyByIdFromRawJson($actor['raw_json'] ?? '', $keyId)
                  ?: ($actor['public_key'] ?? '');
-        if (!$freshPem) return false;
+        if (!$freshPem) {
+            return [
+                'ok' => false,
+                'error' => 'public_key_missing_for_keyid',
+                'key_id' => $keyId,
+                'actor_url' => $actorUrl,
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
+        }
         self::$keyCache[$cacheKey] = $freshPem;
 
-        return self::_verifySig($signingStr, $sigB64, $freshPem);
+        if (self::_verifySig($signingStr, $sigB64, $freshPem)) {
+            return [
+                'ok' => true,
+                'error' => '',
+                'key_id' => $keyId,
+                'actor_url' => $actorUrl,
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
+        }
+
+        return [
+            'ok' => false,
+            'error' => $pub ? 'signature_mismatch_after_refresh' : 'signature_mismatch',
+            'key_id' => $keyId,
+            'actor_url' => $actorUrl,
+            'algorithm' => $algorithm,
+            'headers' => $hm[1],
+        ];
     }
 
     /**
@@ -243,10 +390,20 @@ class CryptoModel
      */
     public static function fetchPublicKey(string $actorUrl, string $keyId = ''): ?string
     {
+        return self::fetchPublicKeyDetailed($actorUrl, $keyId)['pem'] ?: null;
+    }
+
+    /**
+     * Fetch public key for a remote actor with diagnostics.
+     *
+     * @return array{pem:string,error:string}
+     */
+    private static function fetchPublicKeyDetailed(string $actorUrl, string $keyId = ''): array
+    {
         // 1. In-memory cache (keyed by keyId when available, else actorUrl)
         $cacheKey = $keyId ?: $actorUrl;
         if (isset(self::$keyCache[$cacheKey])) {
-            return self::$keyCache[$cacheKey];
+            return ['pem' => self::$keyCache[$cacheKey], 'error' => ''];
         }
 
         // 2. DB cache — also try the trailing-slash variant.
@@ -262,22 +419,28 @@ class CryptoModel
                 ?: ($row['public_key'] ?? '');
             if ($pem) {
                 self::$keyCache[$cacheKey] = $pem;
-                return $pem;
+                return ['pem' => $pem, 'error' => ''];
             }
         }
 
         // 3. Live fetch (actor not yet cached)
-        $actor = RemoteActorModel::fetch($actorUrl);
+        $actorResult = RemoteActorModel::fetchDetailed($actorUrl);
+        $actor = $actorResult['actor'];
         if ($actor) {
             $pem = self::extractKeyByIdFromRawJson($actor['raw_json'] ?? '', $keyId)
                 ?: ($actor['public_key'] ?? '');
             if ($pem) {
                 self::$keyCache[$cacheKey] = $pem;
-                return $pem;
+                return ['pem' => $pem, 'error' => ''];
             }
         }
 
-        return null;
+        return [
+            'pem' => '',
+            'error' => $actorResult['ok']
+                ? ($keyId !== '' ? 'public_key_missing_for_keyid' : 'public_key_missing')
+                : ('actor_fetch_failed:' . $actorResult['error']),
+        ];
     }
 
     /**
@@ -399,5 +562,736 @@ class CryptoModel
             return '{' . implode(',', $parts) . '}';
         }
         return null;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // RsaSignature2017 (Linked Data Signature) verification
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * Verify an RsaSignature2017 body signature.
+     * Implements JSON-LD URDNA2015 canonicalization for ActivityPub documents.
+     */
+    public static function verifyRsaSignature2017(array $activity, string $actorId = ''): bool
+    {
+        return self::verifyRsaSignature2017Detailed($activity, $actorId)['ok'];
+    }
+
+    /**
+     * Verify an RsaSignature2017 body signature with diagnostics.
+     *
+     * @return array{ok:bool,error:string,key_id:string,actor_url:string}
+     */
+    public static function verifyRsaSignature2017Detailed(array $activity, string $actorId = ''): array
+    {
+        $sig = $activity['signature'] ?? null;
+        if (!is_array($sig) || ($sig['type'] ?? '') !== 'RsaSignature2017') {
+            return ['ok' => false, 'error' => 'missing_rsa_signature_2017', 'key_id' => '', 'actor_url' => ''];
+        }
+
+        $sigValue = (string)($sig['signatureValue'] ?? '');
+        $creator  = (string)($sig['creator'] ?? '');
+        if ($sigValue === '' || $creator === '') {
+            return ['ok' => false, 'error' => 'signature_fields_missing', 'key_id' => $creator, 'actor_url' => ''];
+        }
+
+        // Options use the legacy identity context, matching Mastodon's
+        // LinkedDataSignature implementation for RsaSignature2017.
+        $options = $sig;
+        unset($options['type'], $options['id'], $options['signatureValue']);
+        $options['@context'] = 'https://w3id.org/identity/v1';
+
+        // Document: activity minus signature
+        $document = $activity;
+        unset($document['signature']);
+
+        $optCanon = self::ldNormalize($options);
+        $docCanon = self::ldNormalize($document);
+        if ($optCanon === null || $docCanon === null) {
+            return ['ok' => false, 'error' => 'jsonld_normalization_failed', 'key_id' => $creator, 'actor_url' => self::actorUrlFromKeyId($creator)];
+        }
+
+        // Mastodon-compatible LD signatures concatenate lowercase SHA-256 hex digests,
+        // not raw binary hashes, before RSA verification.
+        $toVerify = hash('sha256', $optCanon) . hash('sha256', $docCanon);
+
+        $keyActor = self::actorUrlFromKeyId($creator);
+        if ($actorId !== '' && rtrim($keyActor, '/') !== rtrim($actorId, '/')) {
+            return ['ok' => false, 'error' => 'creator_actor_mismatch', 'key_id' => $creator, 'actor_url' => $keyActor];
+        }
+
+        $pub = self::fetchPublicKeyDetailed($keyActor, $creator);
+        if ($pub['pem'] === '') {
+            return ['ok' => false, 'error' => $pub['error'], 'key_id' => $creator, 'actor_url' => $keyActor];
+        }
+
+        $key = openssl_pkey_get_public($pub['pem']);
+        if (!$key) {
+            return ['ok' => false, 'error' => 'public_key_invalid_pem', 'key_id' => $creator, 'actor_url' => $keyActor];
+        }
+
+        $sigRaw = base64_decode($sigValue, true);
+        if ($sigRaw === false) {
+            return ['ok' => false, 'error' => 'signature_base64_invalid', 'key_id' => $creator, 'actor_url' => $keyActor];
+        }
+
+        return openssl_verify($toVerify, $sigRaw, $key, OPENSSL_ALGO_SHA256) === 1
+            ? ['ok' => true, 'error' => '', 'key_id' => $creator, 'actor_url' => $keyActor]
+            : ['ok' => false, 'error' => 'rsa_signature_mismatch', 'key_id' => $creator, 'actor_url' => $keyActor];
+    }
+
+    /**
+     * Normalize a JSON-LD document using URDNA2015.
+     * Returns canonical N-Quads string, or null on failure.
+     */
+    private static function ldNormalize(array $doc): ?string
+    {
+        $ctx = self::ldResolveContext($doc['@context'] ?? []);
+        $expanded = self::ldExpandNode($doc, $ctx);
+        if ($expanded === null) return null;
+
+        $quads = [];
+        $bn = 0;
+        self::ldToQuads($expanded, $quads, $bn);
+
+        return self::urdna2015($quads);
+    }
+
+    // ── Context resolution ───────────────────────────────────
+
+    /** Hardcoded JSON-LD context definitions (raw, with prefixes unexpanded). */
+    private static function ldKnownContextDefs(): array
+    {
+        static $c = null;
+        if ($c !== null) return $c;
+
+        $sec = [
+            'id' => '@id', 'type' => '@type',
+            'dc' => 'http://purl.org/dc/terms/',
+            'sec' => 'https://w3id.org/security#',
+            'xsd' => 'http://www.w3.org/2001/XMLSchema#',
+            'CryptographicKey' => 'sec:Key',
+            'EcdsaKoblitzSignature2016' => 'sec:EcdsaKoblitzSignature2016',
+            'Ed25519Signature2018' => 'sec:Ed25519Signature2018',
+            'EncryptedMessage' => 'sec:EncryptedMessage',
+            'GraphSignature2012' => 'sec:GraphSignature2012',
+            'LinkedDataSignature2015' => 'sec:LinkedDataSignature2015',
+            'LinkedDataSignature2016' => 'sec:LinkedDataSignature2016',
+            'authenticationTag' => 'sec:authenticationTag',
+            'canonicalizationAlgorithm' => 'sec:canonicalizationAlgorithm',
+            'cipherAlgorithm' => 'sec:cipherAlgorithm',
+            'cipherData' => 'sec:cipherData',
+            'cipherKey' => 'sec:cipherKey',
+            'created' => ['@id' => 'dc:created', '@type' => 'xsd:dateTime'],
+            'creator' => ['@id' => 'dc:creator', '@type' => '@id'],
+            'digestAlgorithm' => 'sec:digestAlgorithm',
+            'digestValue' => 'sec:digestValue',
+            'domain' => 'sec:domain',
+            'encryptionKey' => 'sec:encryptionKey',
+            'expiration' => ['@id' => 'sec:expiration', '@type' => 'xsd:dateTime'],
+            'expires' => ['@id' => 'sec:expiration', '@type' => 'xsd:dateTime'],
+            'initializationVector' => 'sec:initializationVector',
+            'iterationCount' => 'sec:iterationCount',
+            'nonce' => 'sec:nonce',
+            'normalizationAlgorithm' => 'sec:normalizationAlgorithm',
+            'owner' => ['@id' => 'sec:owner', '@type' => '@id'],
+            'password' => 'sec:password',
+            'privateKey' => ['@id' => 'sec:privateKey', '@type' => '@id'],
+            'privateKeyPem' => 'sec:privateKeyPem',
+            'publicKey' => ['@id' => 'sec:publicKey', '@type' => '@id'],
+            'publicKeyBase58' => 'sec:publicKeyBase58',
+            'publicKeyPem' => 'sec:publicKeyPem',
+            'publicKeyWif' => 'sec:publicKeyWif',
+            'publicKeyService' => ['@id' => 'sec:publicKeyService', '@type' => '@id'],
+            'revoked' => ['@id' => 'sec:revoked', '@type' => 'xsd:dateTime'],
+            'salt' => 'sec:salt',
+            'signature' => 'sec:signature',
+            'signatureAlgorithm' => 'sec:signingAlgorithm',
+            'signatureValue' => 'sec:signatureValue',
+        ];
+
+        $as = [
+            '@vocab' => '_:',
+            'xsd' => 'http://www.w3.org/2001/XMLSchema#',
+            'as' => 'https://www.w3.org/ns/activitystreams#',
+            'ldp' => 'http://www.w3.org/ns/ldp#',
+            'vcard' => 'http://www.w3.org/2006/vcard/ns#',
+            'id' => '@id', 'type' => '@type',
+            'Accept' => 'as:Accept', 'Activity' => 'as:Activity',
+            'IntransitiveActivity' => 'as:IntransitiveActivity',
+            'Add' => 'as:Add', 'Announce' => 'as:Announce',
+            'Application' => 'as:Application', 'Arrive' => 'as:Arrive',
+            'Article' => 'as:Article', 'Audio' => 'as:Audio',
+            'Block' => 'as:Block', 'Collection' => 'as:Collection',
+            'CollectionPage' => 'as:CollectionPage',
+            'Relationship' => 'as:Relationship',
+            'Create' => 'as:Create', 'Delete' => 'as:Delete',
+            'Dislike' => 'as:Dislike', 'Document' => 'as:Document',
+            'Event' => 'as:Event', 'Follow' => 'as:Follow',
+            'Flag' => 'as:Flag', 'Group' => 'as:Group',
+            'Ignore' => 'as:Ignore', 'Image' => 'as:Image',
+            'Invite' => 'as:Invite', 'Join' => 'as:Join',
+            'Leave' => 'as:Leave', 'Like' => 'as:Like',
+            'Link' => 'as:Link', 'Mention' => 'as:Mention',
+            'Note' => 'as:Note', 'Object' => 'as:Object',
+            'Offer' => 'as:Offer',
+            'OrderedCollection' => 'as:OrderedCollection',
+            'OrderedCollectionPage' => 'as:OrderedCollectionPage',
+            'Organization' => 'as:Organization', 'Page' => 'as:Page',
+            'Person' => 'as:Person', 'Place' => 'as:Place',
+            'Profile' => 'as:Profile', 'Question' => 'as:Question',
+            'Reject' => 'as:Reject', 'Remove' => 'as:Remove',
+            'Service' => 'as:Service',
+            'TentativeAccept' => 'as:TentativeAccept',
+            'TentativeReject' => 'as:TentativeReject',
+            'Tombstone' => 'as:Tombstone', 'Undo' => 'as:Undo',
+            'Update' => 'as:Update', 'Video' => 'as:Video',
+            'View' => 'as:View', 'Listen' => 'as:Listen',
+            'Read' => 'as:Read', 'Move' => 'as:Move',
+            'Travel' => 'as:Travel',
+            'IsFollowing' => 'as:IsFollowing',
+            'IsFollowedBy' => 'as:IsFollowedBy',
+            'IsContact' => 'as:IsContact', 'IsMember' => 'as:IsMember',
+            'subject' => ['@id' => 'as:subject', '@type' => '@id'],
+            'relationship' => ['@id' => 'as:relationship', '@type' => '@id'],
+            'actor' => ['@id' => 'as:actor', '@type' => '@id'],
+            'attributedTo' => ['@id' => 'as:attributedTo', '@type' => '@id'],
+            'attachment' => ['@id' => 'as:attachment', '@type' => '@id'],
+            'bcc' => ['@id' => 'as:bcc', '@type' => '@id'],
+            'bto' => ['@id' => 'as:bto', '@type' => '@id'],
+            'cc' => ['@id' => 'as:cc', '@type' => '@id'],
+            'context' => ['@id' => 'as:context', '@type' => '@id'],
+            'current' => ['@id' => 'as:current', '@type' => '@id'],
+            'first' => ['@id' => 'as:first', '@type' => '@id'],
+            'generator' => ['@id' => 'as:generator', '@type' => '@id'],
+            'icon' => ['@id' => 'as:icon', '@type' => '@id'],
+            'image' => ['@id' => 'as:image', '@type' => '@id'],
+            'inReplyTo' => ['@id' => 'as:inReplyTo', '@type' => '@id'],
+            'items' => ['@id' => 'as:items', '@type' => '@id'],
+            'instrument' => ['@id' => 'as:instrument', '@type' => '@id'],
+            'last' => ['@id' => 'as:last', '@type' => '@id'],
+            'location' => ['@id' => 'as:location', '@type' => '@id'],
+            'next' => ['@id' => 'as:next', '@type' => '@id'],
+            'object' => ['@id' => 'as:object', '@type' => '@id'],
+            'oneOf' => ['@id' => 'as:oneOf', '@type' => '@id'],
+            'anyOf' => ['@id' => 'as:anyOf', '@type' => '@id'],
+            'closed' => ['@id' => 'as:closed', '@type' => 'xsd:dateTime'],
+            'origin' => ['@id' => 'as:origin', '@type' => '@id'],
+            'accuracy' => ['@id' => 'as:accuracy', '@type' => 'xsd:float'],
+            'prev' => ['@id' => 'as:prev', '@type' => '@id'],
+            'preview' => ['@id' => 'as:preview', '@type' => '@id'],
+            'replies' => ['@id' => 'as:replies', '@type' => '@id'],
+            'result' => ['@id' => 'as:result', '@type' => '@id'],
+            'audience' => ['@id' => 'as:audience', '@type' => '@id'],
+            'partOf' => ['@id' => 'as:partOf', '@type' => '@id'],
+            'tag' => ['@id' => 'as:tag', '@type' => '@id'],
+            'target' => ['@id' => 'as:target', '@type' => '@id'],
+            'to' => ['@id' => 'as:to', '@type' => '@id'],
+            'url' => ['@id' => 'as:url', '@type' => '@id'],
+            'altitude' => ['@id' => 'as:altitude', '@type' => 'xsd:float'],
+            'content' => 'as:content',
+            'name' => 'as:name',
+            'duration' => ['@id' => 'as:duration', '@type' => 'xsd:duration'],
+            'endTime' => ['@id' => 'as:endTime', '@type' => 'xsd:dateTime'],
+            'height' => ['@id' => 'as:height', '@type' => 'xsd:nonNegativeInteger'],
+            'href' => ['@id' => 'as:href', '@type' => '@id'],
+            'hreflang' => 'as:hreflang',
+            'latitude' => ['@id' => 'as:latitude', '@type' => 'xsd:float'],
+            'longitude' => ['@id' => 'as:longitude', '@type' => 'xsd:float'],
+            'mediaType' => 'as:mediaType',
+            'published' => ['@id' => 'as:published', '@type' => 'xsd:dateTime'],
+            'radius' => ['@id' => 'as:radius', '@type' => 'xsd:float'],
+            'rel' => 'as:rel',
+            'startIndex' => ['@id' => 'as:startIndex', '@type' => 'xsd:nonNegativeInteger'],
+            'startTime' => ['@id' => 'as:startTime', '@type' => 'xsd:dateTime'],
+            'summary' => 'as:summary',
+            'totalItems' => ['@id' => 'as:totalItems', '@type' => 'xsd:nonNegativeInteger'],
+            'units' => 'as:units',
+            'updated' => ['@id' => 'as:updated', '@type' => 'xsd:dateTime'],
+            'width' => ['@id' => 'as:width', '@type' => 'xsd:nonNegativeInteger'],
+            'describes' => ['@id' => 'as:describes', '@type' => '@id'],
+            'formerType' => ['@id' => 'as:formerType', '@type' => '@id'],
+            'deleted' => ['@id' => 'as:deleted', '@type' => 'xsd:dateTime'],
+            'inbox' => ['@id' => 'ldp:inbox', '@type' => '@id'],
+            'outbox' => ['@id' => 'as:outbox', '@type' => '@id'],
+            'following' => ['@id' => 'as:following', '@type' => '@id'],
+            'followers' => ['@id' => 'as:followers', '@type' => '@id'],
+            'streams' => ['@id' => 'as:streams', '@type' => '@id'],
+            'preferredUsername' => 'as:preferredUsername',
+            'endpoints' => ['@id' => 'as:endpoints', '@type' => '@id'],
+            'uploadMedia' => ['@id' => 'as:uploadMedia', '@type' => '@id'],
+            'proxyUrl' => ['@id' => 'as:proxyUrl', '@type' => '@id'],
+            'liked' => ['@id' => 'as:liked', '@type' => '@id'],
+            'oauthAuthorizationEndpoint' => ['@id' => 'as:oauthAuthorizationEndpoint', '@type' => '@id'],
+            'oauthTokenEndpoint' => ['@id' => 'as:oauthTokenEndpoint', '@type' => '@id'],
+            'provideClientKey' => ['@id' => 'as:provideClientKey', '@type' => '@id'],
+            'signClientKey' => ['@id' => 'as:signClientKey', '@type' => '@id'],
+            'sharedInbox' => ['@id' => 'as:sharedInbox', '@type' => '@id'],
+            'Public' => ['@id' => 'as:Public', '@type' => '@id'],
+            'source' => 'as:source',
+            'likes' => ['@id' => 'as:likes', '@type' => '@id'],
+            'shares' => ['@id' => 'as:shares', '@type' => '@id'],
+            'alsoKnownAs' => ['@id' => 'as:alsoKnownAs', '@type' => '@id'],
+        ];
+
+        $c = [
+            'https://w3id.org/security/v1' => $sec,
+            'https://w3id.org/identity/v1' => $sec, // superset; security terms are identical
+            'https://www.w3.org/ns/activitystreams' => $as,
+        ];
+        return $c;
+    }
+
+    /**
+     * Resolve a @context value into a flat map of term → definition.
+     * Definitions are: '@id'/'@type' for keywords, string IRI for aliases,
+     * or array ['@id'=>IRI, '@type'=>IRI] for typed terms.
+     * Prefixes are stored as 'prefix' => 'http://...#' or 'http://.../' entries.
+     */
+    private static function ldResolveContext(mixed $ctxVal): array
+    {
+        if (is_string($ctxVal)) {
+            $known = self::ldKnownContextDefs();
+            return self::ldCompileCtx($known[$ctxVal] ?? []);
+        }
+        if (!is_array($ctxVal)) return [];
+
+        if (array_is_list($ctxVal)) {
+            $merged = [];
+            foreach ($ctxVal as $item) {
+                $resolved = self::ldResolveContext($item);
+                $merged = array_merge($merged, $resolved);
+            }
+            return $merged;
+        }
+
+        // Inline context object
+        return self::ldCompileCtx($ctxVal);
+    }
+
+    /**
+     * Compile a raw context definition into a resolved map with fully expanded IRIs.
+     */
+    private static function ldCompileCtx(array $raw): array
+    {
+        $prefixes = [];
+        $terms = [];
+
+        // First pass: extract prefixes (string values ending in # or /)
+        foreach ($raw as $k => $v) {
+            if (str_starts_with($k, '@')) {
+                $terms[$k] = $v;
+                continue;
+            }
+            if (is_string($v) && ($v === '@id' || $v === '@type')) {
+                $terms[$k] = $v;
+                continue;
+            }
+            if (is_string($v) && (str_ends_with($v, '#') || str_ends_with($v, '/'))) {
+                // Could be a prefix OR a term that expands to a namespace
+                // Check if it looks like a prefix (short name, value is a namespace URI)
+                if (!str_contains($v, ':') || str_starts_with($v, 'http://') || str_starts_with($v, 'https://')) {
+                    $prefixes[$k] = $v;
+                }
+            }
+        }
+
+        // Second pass: expand all terms using prefixes
+        foreach ($raw as $k => $v) {
+            if (str_starts_with($k, '@')) continue;
+            if (isset($prefixes[$k])) {
+                $terms[$k] = $prefixes[$k]; // prefix definition
+                continue;
+            }
+
+            if (is_string($v)) {
+                $expanded = self::ldExpandIri($v, $prefixes);
+                $terms[$k] = $expanded;
+            } elseif (is_array($v)) {
+                $def = [];
+                if (isset($v['@id'])) {
+                    $def['@id'] = self::ldExpandIri((string)$v['@id'], $prefixes);
+                }
+                if (isset($v['@type'])) {
+                    $t = (string)$v['@type'];
+                    $def['@type'] = ($t === '@id') ? '@id' : self::ldExpandIri($t, $prefixes);
+                }
+                if (isset($v['@container'])) {
+                    $def['@container'] = $v['@container'];
+                }
+                $terms[$k] = $def;
+            }
+        }
+
+        return $terms;
+    }
+
+    /** Expand a compact IRI (e.g. "as:Follow") using prefix map. */
+    private static function ldExpandIri(string $val, array $prefixes): string
+    {
+        if ($val === '@id' || $val === '@type') return $val;
+        if (str_starts_with($val, 'http://') || str_starts_with($val, 'https://')) return $val;
+        if (str_contains($val, ':')) {
+            $parts = explode(':', $val, 2);
+            if (isset($prefixes[$parts[0]])) {
+                return $prefixes[$parts[0]] . $parts[1];
+            }
+        }
+        return $val;
+    }
+
+    // ── JSON-LD expansion ────────────────────────────────────
+
+    /**
+     * Expand a JSON-LD node into its expanded form.
+     * Returns ['@id'=>..., '@type'=>[...], 'iri'=>[values...], ...] or null.
+     */
+    private static function ldExpandNode(array $node, array $ctx): ?array
+    {
+        // Merge local @context if present
+        if (isset($node['@context'])) {
+            $localCtx = self::ldResolveContext($node['@context']);
+            $ctx = array_merge($ctx, $localCtx);
+        }
+
+        $result = [];
+        $vocab = $ctx['@vocab'] ?? '';
+
+        foreach ($node as $key => $value) {
+            if ($key === '@context') continue;
+
+            // Resolve key to IRI
+            $iri = self::ldTermToIri($key, $ctx, $vocab);
+            if ($iri === null) continue; // unmappable term
+
+            if ($iri === '@id') {
+                $result['@id'] = self::ldExpandValueIri((string)$value, $ctx);
+                continue;
+            }
+            if ($iri === '@type') {
+                $types = is_array($value) ? $value : [$value];
+                $result['@type'] = array_map(fn($t) => self::ldExpandTypeIri((string)$t, $ctx, $vocab), $types);
+                continue;
+            }
+
+            // Skip blank-node predicates (_:xxx) — they're not valid RDF
+            if (str_starts_with($iri, '_:')) continue;
+
+            // Determine term type coercion
+            $termDef = $ctx[$key] ?? null;
+            $typeCoerce = null;
+            if (is_array($termDef) && isset($termDef['@type'])) {
+                $typeCoerce = $termDef['@type'];
+            }
+
+            // Expand value(s)
+            $values = is_array($value) && array_is_list($value) ? $value : [$value];
+            $expanded = [];
+            foreach ($values as $v) {
+                $ev = self::ldExpandValue($v, $ctx, $typeCoerce, $vocab);
+                if ($ev !== null) $expanded[] = $ev;
+            }
+            if ($expanded !== []) {
+                $result[$iri] = $expanded;
+            }
+        }
+
+        return $result ?: null;
+    }
+
+    /** Resolve a term name to its predicate IRI using context. */
+    private static function ldTermToIri(string $term, array $ctx, string $vocab): ?string
+    {
+        // Already a full IRI
+        if (str_starts_with($term, 'http://') || str_starts_with($term, 'https://')) return $term;
+
+        // Defined in context
+        if (isset($ctx[$term])) {
+            $def = $ctx[$term];
+            if (is_string($def)) return ($def === '@id' || $def === '@type') ? $def : $def;
+            if (is_array($def) && isset($def['@id'])) return $def['@id'];
+        }
+
+        // Compact IRI (prefix:suffix)
+        if (str_contains($term, ':')) {
+            [$prefix, $suffix] = explode(':', $term, 2);
+            if (isset($ctx[$prefix]) && is_string($ctx[$prefix])) {
+                return $ctx[$prefix] . $suffix;
+            }
+        }
+
+        // @vocab fallback
+        if ($vocab !== '') return $vocab . $term;
+
+        return null;
+    }
+
+    /** Expand a value IRI (used for @id values). */
+    private static function ldExpandValueIri(string $val, array $ctx): string
+    {
+        if (str_starts_with($val, 'http://') || str_starts_with($val, 'https://')) return $val;
+        if (str_contains($val, ':')) {
+            [$prefix, $suffix] = explode(':', $val, 2);
+            if (isset($ctx[$prefix]) && is_string($ctx[$prefix])) {
+                return $ctx[$prefix] . $suffix;
+            }
+        }
+        return $val;
+    }
+
+    /** Expand a @type value to its full IRI. */
+    private static function ldExpandTypeIri(string $val, array $ctx, string $vocab): string
+    {
+        if (str_starts_with($val, 'http://') || str_starts_with($val, 'https://')) return $val;
+        // Check if it's a defined type alias
+        if (isset($ctx[$val])) {
+            $def = $ctx[$val];
+            if (is_string($def) && $def !== '@id' && $def !== '@type') return $def;
+            if (is_array($def) && isset($def['@id'])) return $def['@id'];
+        }
+        // Compact IRI
+        if (str_contains($val, ':')) {
+            [$prefix, $suffix] = explode(':', $val, 2);
+            if (isset($ctx[$prefix]) && is_string($ctx[$prefix])) {
+                return $ctx[$prefix] . $suffix;
+            }
+        }
+        if ($vocab !== '' && !str_starts_with($vocab, '_:')) return $vocab . $val;
+        return $val;
+    }
+
+    /** Expand a single property value. Returns expanded value representation. */
+    private static function ldExpandValue(mixed $val, array $ctx, ?string $typeCoerce, string $vocab): ?array
+    {
+        if ($val === null) return null;
+
+        // Nested object
+        if (is_array($val) && !array_is_list($val)) {
+            $expanded = self::ldExpandNode($val, $ctx);
+            return $expanded;
+        }
+
+        // IRI coercion
+        if ($typeCoerce === '@id') {
+            if (is_string($val)) {
+                return ['@id' => self::ldExpandValueIri($val, $ctx)];
+            }
+            return null;
+        }
+
+        // Typed literal
+        if (is_string($val)) {
+            if ($typeCoerce !== null) {
+                return ['@value' => $val, '@type' => $typeCoerce];
+            }
+            return ['@value' => $val];
+        }
+
+        // Boolean/numeric
+        if (is_bool($val)) {
+            return ['@value' => $val ? 'true' : 'false', '@type' => 'http://www.w3.org/2001/XMLSchema#boolean'];
+        }
+        if (is_int($val)) {
+            return ['@value' => (string)$val, '@type' => 'http://www.w3.org/2001/XMLSchema#integer'];
+        }
+        if (is_float($val)) {
+            $s = sprintf('%E', $val);
+            // Normalize: 1.000000E+0 → 1.0E0, match xsd:double canonical form
+            $s = preg_replace('/(\.\d*?)0+(E[+-]?)0*(\d+)/', '$1$2$3', $s);
+            if (!str_contains($s, '.')) $s = str_replace('E', '.0E', $s);
+            return ['@value' => $s, '@type' => 'http://www.w3.org/2001/XMLSchema#double'];
+        }
+
+        return null;
+    }
+
+    // ── N-Quads generation ───────────────────────────────────
+
+    /**
+     * Convert an expanded JSON-LD node into N-Quads triples.
+     * Each quad: ['s'=>subject, 'p'=>predicate, 'o'=>objectMap]
+     * where objectMap has @id (IRI/bnode) or @value+optional @type/@language.
+     */
+    private static function ldToQuads(array $node, array &$quads, int &$bn, string $parentSubject = ''): string
+    {
+        $subject = $node['@id'] ?? ('_:b' . ($bn++));
+
+        // @type triples
+        foreach ($node['@type'] ?? [] as $typeIri) {
+            if (str_starts_with($typeIri, '_:')) continue; // skip blank-node types
+            $quads[] = ['s' => $subject, 'p' => 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', 'o' => ['@id' => $typeIri]];
+        }
+
+        // Property triples
+        foreach ($node as $pred => $values) {
+            if (str_starts_with($pred, '@')) continue; // skip keywords
+            if (!is_array($values)) continue;
+
+            foreach ($values as $val) {
+                if (!is_array($val)) continue;
+
+                if (isset($val['@id'])) {
+                    // IRI or nested node
+                    if (count($val) === 1) {
+                        // Simple IRI reference
+                        $quads[] = ['s' => $subject, 'p' => $pred, 'o' => ['@id' => $val['@id']]];
+                    } else {
+                        // Nested node — recurse
+                        $nestedSubject = self::ldToQuads($val, $quads, $bn, $subject);
+                        $quads[] = ['s' => $subject, 'p' => $pred, 'o' => ['@id' => $nestedSubject]];
+                    }
+                } elseif (array_key_exists('@value', $val)) {
+                    $quads[] = ['s' => $subject, 'p' => $pred, 'o' => $val];
+                } elseif (isset($val['@type']) || isset($val['http://www.w3.org/1999/02/22-rdf-syntax-ns#type'])) {
+                    // Nested blank node (has @type but no @id)
+                    $nestedSubject = self::ldToQuads($val, $quads, $bn, $subject);
+                    $quads[] = ['s' => $subject, 'p' => $pred, 'o' => ['@id' => $nestedSubject]];
+                } else {
+                    // Other nested object without @id
+                    $hasProps = false;
+                    foreach ($val as $k => $v) {
+                        if (!str_starts_with($k, '@')) { $hasProps = true; break; }
+                    }
+                    if ($hasProps) {
+                        $nestedSubject = self::ldToQuads($val, $quads, $bn, $subject);
+                        $quads[] = ['s' => $subject, 'p' => $pred, 'o' => ['@id' => $nestedSubject]];
+                    }
+                }
+            }
+        }
+
+        return $subject;
+    }
+
+    // ── URDNA2015 canonicalization ───────────────────────────
+
+    /**
+     * URDNA2015: Canonicalize a set of quads by assigning deterministic
+     * blank node labels. Returns sorted N-Quads string.
+     */
+    private static function urdna2015(array $quads): string
+    {
+        // 1. Identify all blank nodes and their quads
+        $bnodeQuads = []; // bnode_label => [quad_indices]
+        foreach ($quads as $i => $q) {
+            if (str_starts_with($q['s'], '_:')) {
+                $bnodeQuads[$q['s']][] = $i;
+            }
+            if (isset($q['o']['@id']) && str_starts_with($q['o']['@id'], '_:')) {
+                $bnodeQuads[$q['o']['@id']][] = $i;
+            }
+        }
+
+        if (empty($bnodeQuads)) {
+            // No blank nodes — just serialize and sort
+            return self::serializeAndSortQuads($quads, []);
+        }
+
+        // 2. Compute first-degree hash for each blank node
+        $hashToNodes = [];
+        $nodeHashes = [];
+        foreach ($bnodeQuads as $bnode => $indices) {
+            $nquadStrings = [];
+            foreach ($indices as $idx) {
+                $nquadStrings[] = self::serializeQuad($quads[$idx], [$bnode => '_:a']);
+            }
+            sort($nquadStrings);
+            $hash = hash('sha256', implode('', $nquadStrings));
+            $nodeHashes[$bnode] = $hash;
+            $hashToNodes[$hash][] = $bnode;
+        }
+
+        // 3. Assign canonical labels
+        $canonMap = [];
+        $canonCounter = 0;
+
+        // Sort hashes, process unique hashes first
+        ksort($hashToNodes);
+        foreach ($hashToNodes as $hash => $nodes) {
+            if (count($nodes) === 1) {
+                $canonMap[$nodes[0]] = '_:c14n' . ($canonCounter++);
+                continue;
+            }
+
+            // Multiple nodes with same first-degree hash — use N-degree hash
+            $hashPaths = [];
+            foreach ($nodes as $node) {
+                $pathHash = self::urdna2015NdegreeHash($quads, $bnodeQuads, $node, $nodeHashes, $canonMap);
+                $hashPaths[] = [$pathHash, $node];
+            }
+            usort($hashPaths, fn($a, $b) => strcmp($a[0], $b[0]));
+            foreach ($hashPaths as [$_, $node]) {
+                if (!isset($canonMap[$node])) {
+                    $canonMap[$node] = '_:c14n' . ($canonCounter++);
+                }
+            }
+        }
+
+        return self::serializeAndSortQuads($quads, $canonMap);
+    }
+
+    /**
+     * Compute N-degree hash for URDNA2015 tie-breaking.
+     * Simplified: uses connected component hash.
+     */
+    private static function urdna2015NdegreeHash(
+        array $quads, array $bnodeQuads, string $node,
+        array $nodeHashes, array $existing
+    ): string {
+        $visited = [$node => true];
+        $data = $nodeHashes[$node] ?? '';
+
+        foreach ($bnodeQuads[$node] ?? [] as $idx) {
+            $q = $quads[$idx];
+            $related = null;
+            if (str_starts_with($q['s'], '_:') && $q['s'] !== $node) $related = $q['s'];
+            if (isset($q['o']['@id']) && str_starts_with($q['o']['@id'], '_:') && $q['o']['@id'] !== $node) $related = $q['o']['@id'];
+
+            if ($related !== null && !isset($visited[$related]) && !isset($existing[$related])) {
+                $data .= ($nodeHashes[$related] ?? '') . $q['p'];
+                $visited[$related] = true;
+            }
+        }
+
+        return hash('sha256', $data);
+    }
+
+    /** Serialize a single quad as N-Quad string. */
+    private static function serializeQuad(array $q, array $bnodeMap): string
+    {
+        $s = $q['s'];
+        $s = $bnodeMap[$s] ?? $s;
+        $s = str_starts_with($s, '_:') ? $s : "<$s>";
+
+        $p = "<{$q['p']}>";
+
+        $o = $q['o'];
+        if (isset($o['@id'])) {
+            $oid = $bnodeMap[$o['@id']] ?? $o['@id'];
+            $oStr = str_starts_with($oid, '_:') ? $oid : "<$oid>";
+        } else {
+            $val = (string)($o['@value'] ?? '');
+            // Escape N-Quads string: \, newline, carriage return, double quote
+            $val = str_replace(['\\', "\n", "\r", '"'], ['\\\\', '\\n', '\\r', '\\"'], $val);
+            $oStr = '"' . $val . '"';
+            if (isset($o['@type']) && $o['@type'] !== 'http://www.w3.org/2001/XMLSchema#string') {
+                $oStr .= '^^<' . $o['@type'] . '>';
+            } elseif (isset($o['@language'])) {
+                $oStr .= '@' . $o['@language'];
+            }
+        }
+
+        return "$s $p $oStr .\n";
+    }
+
+    /** Serialize all quads with canonical bnode labels, sort, and join. */
+    private static function serializeAndSortQuads(array $quads, array $canonMap): string
+    {
+        $lines = [];
+        foreach ($quads as $q) {
+            $lines[] = self::serializeQuad($q, $canonMap);
+        }
+        sort($lines);
+        return implode('', $lines);
     }
 }

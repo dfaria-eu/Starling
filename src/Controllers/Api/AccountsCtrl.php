@@ -12,6 +12,7 @@ use App\ActivityPub\{Builder, Delivery};
     {
         $outboxUrl = $remote['outbox_url'] ?? '';
         if ($outboxUrl === '') return;
+        $noteTypes = ['Note', 'Article', 'Page', 'Question', 'Video', 'Audio', 'Event'];
 
         $accept = 'application/activity+json';
         $outbox = RemoteActorModel::httpGet($outboxUrl, $accept);
@@ -35,29 +36,52 @@ use App\ActivityPub\{Builder, Delivery};
             $obj = null;
             if (is_array($item)) {
                 $type = $item['type'] ?? '';
-                if ($type === 'Note') {
+                if (in_array($type, $noteTypes, true)) {
                     $obj = $item;
                 } elseif (in_array($type, ['Create', 'Update'], true) && is_array($item['object'] ?? null)) {
                     $obj = $item['object'];
                 }
             }
-            if (!is_array($obj) || ($obj['type'] ?? '') !== 'Note') continue;
+            if (!is_array($obj) || !in_array((string)($obj['type'] ?? ''), $noteTypes, true)) continue;
 
             $uri = (string)($obj['id'] ?? '');
             if ($uri === '' || StatusModel::byUri($uri)) continue;
+            $statusId = flake_id();
+            $replyToId = null;
+            $replyToUid = null;
+            $inReplyTo = $obj['inReplyTo'] ?? null;
+            if (is_string($inReplyTo) && $inReplyTo !== '') {
+                $parent = StatusModel::byUri($inReplyTo);
+                if ($parent) {
+                    $replyToId = $parent['id'];
+                    $replyToUid = $parent['user_id'];
+                } else {
+                    $replyToId = $inReplyTo;
+                }
+            }
+            $quoteOfId = null;
+            $quoteUri = $obj['quoteUri'] ?? $obj['quoteUrl'] ?? $obj['_misskey_quote'] ?? null;
+            if (is_string($quoteUri) && $quoteUri !== '') {
+                $quoted = StatusModel::byUri($quoteUri);
+                if ($quoted) {
+                    $quoteOfId = $quoted['id'];
+                }
+            }
 
             DB::insertIgnore('statuses', [
-                'id'              => flake_id(),
+                'id'              => $statusId,
                 'uri'             => $uri,
                 'user_id'         => $remote['id'],
-                'reply_to_id'     => null,
-                'reply_to_uid'    => null,
+                'reply_to_id'     => $replyToId,
+                'reply_to_uid'    => $replyToUid,
                 'reblog_of_id'    => null,
-                'quote_of_id'     => null,
-                'content'         => is_string($obj['content'] ?? null) ? $obj['content'] : '',
-                'cw'              => is_string($obj['summary'] ?? null) ? $obj['summary'] : '',
-                'visibility'      => 'public',
-                'language'        => is_string($obj['language'] ?? null) ? $obj['language'] : 'en',
+                'quote_of_id'     => $quoteOfId,
+                'content'         => self::apExtractContent($obj),
+                'cw'              => self::apStr($obj['summary'] ?? ''),
+                'visibility'      => self::apVisibility($obj['to'] ?? [], $obj['cc'] ?? []),
+                'language'        => is_array($obj['contentMap'] ?? null)
+                    ? (array_key_first((array)$obj['contentMap']) ?? 'en')
+                    : self::apStr($obj['language'] ?? 'en', 'en'),
                 'sensitive'       => (int)bool_val($obj['sensitive'] ?? false),
                 'local'           => 0,
                 'reply_count'     => 0,
@@ -66,7 +90,129 @@ use App\ActivityPub\{Builder, Delivery};
                 'created_at'      => is_string($obj['published'] ?? null) ? $obj['published'] : $now,
                 'updated_at'      => is_string($obj['updated'] ?? null) ? $obj['updated'] : (is_string($obj['published'] ?? null) ? $obj['published'] : $now),
             ]);
+
+            if ($replyToId && !str_starts_with((string)$replyToId, 'http')) {
+                DB::run('UPDATE statuses SET reply_count=reply_count+1 WHERE id=?', [$replyToId]);
+            }
+
+            foreach (self::apList($obj['attachment'] ?? []) as $pos => $att) {
+                if (!is_array($att)) continue;
+                $url = self::attachmentUrl($att);
+                if (!$url) continue;
+                $mime = self::apStr($att['mediaType'] ?? '');
+                $type = match (true) {
+                    str_starts_with($mime, 'video/') => 'video',
+                    str_starts_with($mime, 'audio/') => 'audio',
+                    str_starts_with($mime, 'image/') => 'image',
+                    default => 'unknown',
+                };
+                $mid = uuid();
+                DB::insertIgnore('media_attachments', [
+                    'id'          => $mid,
+                    'user_id'     => $remote['id'],
+                    'status_id'   => null,
+                    'type'        => $type,
+                    'url'         => $url,
+                    'preview_url' => $url,
+                    'description' => self::apStr($att['name'] ?? ''),
+                    'blurhash'    => self::apStr($att['blurhash'] ?? ''),
+                    'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
+                    'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                    'created_at'  => $now,
+                ]);
+                DB::insertIgnore('status_media', [
+                    'status_id' => $statusId,
+                    'media_id'  => $mid,
+                    'position'  => $pos,
+                ]);
+            }
+
+            foreach (self::apList($obj['tag'] ?? []) as $tag) {
+                if (!is_array($tag) || ($tag['type'] ?? '') !== 'Hashtag') continue;
+                $tagName = strtolower(ltrim((string)($tag['name'] ?? ''), '#'));
+                if ($tagName === '') continue;
+                DB::insertIgnore('hashtags', ['id' => uuid(), 'name' => $tagName, 'created_at' => $now]);
+                $ht = DB::one('SELECT id FROM hashtags WHERE name=?', [$tagName]);
+                if ($ht) {
+                    DB::insertIgnore('status_hashtags', ['status_id' => $statusId, 'hashtag_id' => $ht['id']]);
+                }
+            }
+
+            if (($obj['type'] ?? '') === 'Question') {
+                \App\Models\PollModel::syncRemoteQuestion($statusId, $obj);
+            }
         }
+    }
+
+    private static function apVisibility(mixed $to, mixed $cc): string
+    {
+        if (is_string($to)) $to = [$to];
+        if (is_string($cc)) $cc = [$cc];
+        if (!is_array($to)) $to = [];
+        if (!is_array($cc)) $cc = [];
+
+        $pubAliases = [
+            'https://www.w3.org/ns/activitystreams#Public',
+            'as:Public',
+            'Public',
+        ];
+        $isPublic = static fn(array $arr): bool => (bool)array_intersect($pubAliases, $arr);
+
+        if ($isPublic($to)) return 'public';
+        if ($isPublic($cc)) return 'unlisted';
+        foreach (array_merge($to, $cc) as $t) {
+            if (is_string($t) && str_ends_with($t, '/followers')) return 'private';
+        }
+        return 'direct';
+    }
+
+    private static function apStr(mixed $v, string $default = ''): string
+    {
+        if (is_string($v)) return $v;
+        if (is_array($v)) {
+            if (isset($v['@value'])) return (string)$v['@value'];
+            $first = reset($v);
+            return is_string($first) ? $first : $default;
+        }
+        return $default;
+    }
+
+    private static function apExtractContent(array $obj): string
+    {
+        $content = self::apStr($obj['content'] ?? '');
+        if ($content !== '') return $content;
+        if (is_array($obj['contentMap'] ?? null)) {
+            foreach ($obj['contentMap'] as $text) {
+                if (is_string($text) && $text !== '') return $text;
+            }
+        }
+        return self::apStr($obj['name'] ?? '');
+    }
+
+    private static function apList(mixed $value): array
+    {
+        if ($value === null || $value === '') return [];
+        if (is_array($value)) {
+            if (array_is_list($value)) return $value;
+            return [$value];
+        }
+        return [$value];
+    }
+
+    private static function attachmentUrl(array $att): string
+    {
+        $url = $att['url'] ?? '';
+        if (is_string($url)) return $url;
+        if (is_array($url)) {
+            foreach (self::apList($url) as $candidate) {
+                if (is_string($candidate) && $candidate !== '') return $candidate;
+                if (is_array($candidate)) {
+                    $href = self::apStr($candidate['href'] ?? $candidate['url'] ?? '');
+                    if ($href !== '') return $href;
+                }
+            }
+        }
+        return '';
     }
 
     // ── Registration ─────────────────────────────────────────
@@ -215,18 +361,24 @@ use App\ActivityPub\{Builder, Delivery};
      */
     public function lookup(array $p): void
     {
+        $viewer = authed_user();
+        $viewerId = $viewer['id'] ?? null;
         $acct = trim($_GET['acct'] ?? '');
         if (!$acct) err_out('Missing acct parameter', 422);
 
         if (str_contains($acct, '@')) {
             [$username, $domain] = explode('@', ltrim($acct, '@'), 2);
+            $domain = strtolower($domain);
             if (is_local($domain)) {
                 $u = UserModel::byUsername($username);
-                if ($u) json_out(UserModel::toMasto($u));
+                if ($u && !$this->isHiddenFromViewer($viewerId, $u['id'])) json_out(UserModel::toMasto($u));
+                err_out('Not found', 404);
+            }
+            if ($viewerId && in_array($domain, StatusModel::blockedDomains($viewerId), true)) {
                 err_out('Not found', 404);
             }
             // Remote: try cached first, then fetch via WebFinger
-            $ra = DB::one('SELECT * FROM remote_actors WHERE username=? AND domain=?', [strtolower($username), strtolower($domain)]);
+            $ra = DB::one('SELECT * FROM remote_actors WHERE username=? AND domain=?', [strtolower($username), $domain]);
             if (!$ra) {
                 $ra = \App\Models\RemoteActorModel::fetchByAcct($username, $domain);
             } elseif ((int)$ra['follower_count'] === 0 && (int)$ra['following_count'] === 0
@@ -238,21 +390,28 @@ use App\ActivityPub\{Builder, Delivery};
                     }
                 });
             }
-            if ($ra) json_out(UserModel::remoteToMasto($ra));
+            if ($ra && !$this->isHiddenFromViewer($viewerId, $ra['id'], $ra['domain'] ?? null)) json_out(UserModel::remoteToMasto($ra));
             err_out('Not found', 404);
         }
 
         // No domain → look up local user
         $u = UserModel::byUsername(ltrim($acct, '@'));
-        if ($u) json_out(UserModel::toMasto($u));
+        if ($u && !$this->isHiddenFromViewer($viewerId, $u['id'])) json_out(UserModel::toMasto($u));
         err_out('Not found', 404);
     }
 
     public function show(array $p): void
     {
+        $viewer = authed_user();
+        $viewerId = $viewer['id'] ?? null;
         [$local, $remote] = $this->resolve($p['id']);
-        if ($local)  { json_out(UserModel::toMasto($local)); return; }
+        if ($local)  {
+            if ($this->isHiddenFromViewer($viewerId, $local['id'])) err_out('Not found', 404);
+            json_out(UserModel::toMasto($local));
+            return;
+        }
         if ($remote) {
+            if ($this->isHiddenFromViewer($viewerId, $remote['id'], $remote['domain'] ?? null)) err_out('Not found', 404);
             // Never block profile rendering on remote refreshes. Refresh after the response
             // so iOS/web profile screens don't sit forever with the follow button spinning.
             $age = time() - (int)strtotime($remote['fetched_at']);
@@ -296,17 +455,29 @@ use App\ActivityPub\{Builder, Delivery};
 
             $pins = DB::all(
                 'SELECT s.* FROM statuses s JOIN status_pins sp ON sp.status_id=s.id
-                 WHERE sp.user_id=? ORDER BY sp.created_at DESC LIMIT ?',
-                [$userId, $limit]
+                 WHERE sp.user_id=?
+                   AND (s.expires_at IS NULL OR s.expires_at=\'\' OR s.expires_at>?)
+                 ORDER BY sp.created_at DESC LIMIT ?',
+                [$userId, now_iso(), $limit]
             );
-            json_out(array_values(array_filter(
-                array_map(fn($s) => StatusModel::toMasto($s, $viewer['id'] ?? null), $pins)
-            )));
+            $viewerId = $viewer['id'] ?? null;
+            json_out(array_values(array_filter(array_map(
+                static function (array $s) use ($viewerId): ?array {
+                    if (!StatusModel::canView($s, $viewerId)) return null;
+                    return StatusModel::toMasto($s, $viewerId);
+                },
+                $pins
+            ))));
             return;
         }
 
         // Verificar quantos posts temos localmente para esta conta
-        $localCount = (int)(DB::one('SELECT COUNT(*) AS n FROM statuses WHERE user_id=?', [$userId])['n'] ?? 0);
+        $localCount = (int)(DB::one(
+            "SELECT COUNT(*) AS n FROM statuses
+             WHERE user_id=?
+               AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+            [$userId, now_iso()]
+        )['n'] ?? 0);
 
         // Para contas remotas sem posts locais, prime o cache depois da resposta.
         // Bloquear aqui faz o perfil remoto parecer "preso" no iOS/web.
@@ -340,8 +511,8 @@ use App\ActivityPub\{Builder, Delivery};
             $visFilter = " AND s.visibility IN ('public','unlisted')";
         }
 
-        $sql = 'SELECT s.* FROM statuses s WHERE s.user_id=?' . $visFilter;
-        $par = [$userId];
+        $sql = 'SELECT s.* FROM statuses s WHERE s.user_id=? AND (s.expires_at IS NULL OR s.expires_at=\'\' OR s.expires_at>?)' . $visFilter;
+        $par = [$userId, now_iso()];
 
         // Paginação por (created_at, id) — cursor composto evita duplicados
         if ($maxId) {
@@ -395,12 +566,15 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function followers(array $p): void
     {
+        $viewer = authed_user();
+        $viewerId = $viewer['id'] ?? null;
         [$local, $remote] = $this->resolve($p['id']);
         if (!$local && !$remote) err_out('Not found', 404);
 
         // Remote account: fetch followers collection from their server
         if (!$local && $remote) {
-            json_out($this->remoteCollection($remote['followers_url'] ?? ''));
+            $limit = min((int)($_GET['limit'] ?? 40), 80);
+            json_out($this->remoteCollection($remote['followers_url'] ?? '', $limit, $viewerId));
             return;
         }
 
@@ -422,11 +596,15 @@ use App\ActivityPub\{Builder, Delivery};
         $out  = [];
         foreach ($rows as $r) {
             $u = UserModel::byId($r['follower_id']);
-            if ($u) { $out[] = UserModel::toMasto($u); continue; }
+            if ($u) {
+                if (!empty($u['is_suspended'])) continue;
+                if (!$this->isHiddenFromViewer($viewerId, $u['id'])) $out[] = UserModel::toMasto($u);
+                continue;
+            }
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$r['follower_id']]);
-            if ($ra) $out[] = UserModel::remoteToMasto($ra);
+            if ($ra && !$this->isHiddenFromViewer($viewerId, $ra['id'], $ra['domain'] ?? null)) $out[] = UserModel::remoteToMasto($ra);
         }
-        if ($out && count($rows) === $limit) {
+        if ($rows && count($rows) === $limit) {
             $base = ap_url("api/v1/accounts/{$p['id']}/followers");
             header(sprintf('Link: <%s?%s>; rel="next"', $base, http_build_query(['limit' => $limit, 'max_id' => end($rows)['id']])));
         }
@@ -435,12 +613,15 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function following(array $p): void
     {
+        $viewer = authed_user();
+        $viewerId = $viewer['id'] ?? null;
         [$local, $remote] = $this->resolve($p['id']);
         if (!$local && !$remote) err_out('Not found', 404);
 
         // Remote account: fetch following collection from their server
         if (!$local && $remote) {
-            json_out($this->remoteCollection($remote['following_url'] ?? ''));
+            $limit = min((int)($_GET['limit'] ?? 40), 80);
+            json_out($this->remoteCollection($remote['following_url'] ?? '', $limit, $viewerId));
             return;
         }
 
@@ -462,11 +643,15 @@ use App\ActivityPub\{Builder, Delivery};
         $out  = [];
         foreach ($rows as $r) {
             $u = UserModel::byId($r['following_id']);
-            if ($u) { $out[] = UserModel::toMasto($u); continue; }
+            if ($u) {
+                if (!empty($u['is_suspended'])) continue;
+                if (!$this->isHiddenFromViewer($viewerId, $u['id'])) $out[] = UserModel::toMasto($u);
+                continue;
+            }
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$r['following_id']]);
-            if ($ra) $out[] = UserModel::remoteToMasto($ra);
+            if ($ra && !$this->isHiddenFromViewer($viewerId, $ra['id'], $ra['domain'] ?? null)) $out[] = UserModel::remoteToMasto($ra);
         }
-        if ($out && count($rows) === $limit) {
+        if ($rows && count($rows) === $limit) {
             $base = ap_url("api/v1/accounts/{$p['id']}/following");
             header(sprintf('Link: <%s?%s>; rel="next"', $base, http_build_query(['limit' => $limit, 'max_id' => end($rows)['id']])));
         }
@@ -478,9 +663,10 @@ use App\ActivityPub\{Builder, Delivery};
      * resolve each actor URI to a Mastodon account object, and return the list.
      * Returns empty array if the collection is hidden or unreachable.
      */
-    private function remoteCollection(string $collectionUrl): array
+    private function remoteCollection(string $collectionUrl, int $limit = 80, ?string $viewerId = null): array
     {
         if (!$collectionUrl) return [];
+        $limit = max(1, min($limit, 80));
 
         $accept = 'application/activity+json';
 
@@ -502,7 +688,7 @@ use App\ActivityPub\{Builder, Delivery};
         if (!is_array($items)) return [];
 
         $out = [];
-        foreach (array_slice($items, 0, 80) as $item) {
+        foreach (array_slice($items, 0, $limit) as $item) {
             $actorUrl = is_string($item) ? $item : ($item['id'] ?? '');
             if (!$actorUrl) continue;
 
@@ -510,10 +696,30 @@ use App\ActivityPub\{Builder, Delivery};
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$actorUrl])
                ?? \App\Models\RemoteActorModel::fetch($actorUrl);
             if ($ra) {
+                if ($this->isHiddenFromViewer($viewerId, $ra['id'], $ra['domain'] ?? null)) {
+                    continue;
+                }
                 $out[] = UserModel::remoteToMasto($ra);
             }
         }
         return $out;
+    }
+
+    private function isHiddenFromViewer(?string $viewerId, string $targetId, ?string $domain = null): bool
+    {
+        if (!$viewerId) {
+            return false;
+        }
+        if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) {
+            return true;
+        }
+        if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) {
+            return true;
+        }
+        if ($domain !== null && in_array(strtolower($domain), StatusModel::blockedDomains($viewerId), true)) {
+            return true;
+        }
+        return false;
     }
 
     // ── Follow / unfollow ─────────────────────────────────────
@@ -633,7 +839,7 @@ use App\ActivityPub\{Builder, Delivery};
             $rows = DB::all(
                 'SELECT f1.follower_id FROM follows f1
                  JOIN follows f2 ON f2.following_id=f1.follower_id AND f2.follower_id=?
-                 WHERE f1.following_id=? AND f1.pending=0
+                 WHERE f1.following_id=? AND f1.pending=0 AND f2.pending=0
                  LIMIT 5',
                 [$viewer['id'], $internalId]
             );
@@ -642,11 +848,21 @@ use App\ActivityPub\{Builder, Delivery};
                 $followerId = $r['follower_id'];
                 $u = UserModel::byId($followerId);
                 if ($u) {
-                    $accounts[] = UserModel::toMasto($u, $viewer['id']);
+                    if (!empty($u['is_suspended'])) {
+                        continue;
+                    }
+                    if ($this->isHiddenFromViewer($viewer['id'], $u['id'])) {
+                        continue;
+                    }
+                    $masto = UserModel::toMasto($u, $viewer['id']);
+                    if ($masto) $accounts[] = $masto;
                     continue;
                 }
                 $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$followerId]);
                 if ($ra) {
+                    if ($this->isHiddenFromViewer($viewer['id'], $ra['id'], $ra['domain'] ?? null)) {
+                        continue;
+                    }
                     $accounts[] = UserModel::remoteToMasto($ra);
                 }
             }
@@ -685,6 +901,7 @@ use App\ActivityPub\{Builder, Delivery};
                 if ($local)  DB::run('UPDATE users SET following_count=MAX(0,following_count-1) WHERE id=?', [$targetId]);
             }
         }
+        DB::delete('notifications', 'user_id=? AND from_acct_id=? AND type IN (?, ?)', [$viewer['id'], $targetId, 'follow', 'follow_request']);
 
         if ($remote) {
             Delivery::queueToActor($viewer, $remote, Builder::block($viewer, $remote['id']));
@@ -732,40 +949,74 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function search(array $p): void
     {
+        $viewer = authed_user();
+        $viewerId = $viewer['id'] ?? null;
         $q = trim($_GET['q'] ?? '');
         if (!$q) { json_out([]); return; }
         $limit = max(1, min((int)($_GET['limit'] ?? 5), 40));
+        $blockedDomains = StatusModel::blockedDomains($viewerId);
 
         // Escape LIKE wildcards so literal '%' and '_' in the query don't match unintended rows
         $qLike = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
 
         // Local users
-        $local = DB::all(
-            "SELECT * FROM users WHERE (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\') AND is_suspended=0 LIMIT ?",
-            [$qLike, $qLike, $limit]
-        );
+        $localSql = "SELECT * FROM users WHERE (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\') AND is_suspended=0";
+        $localParams = [$qLike, $qLike];
+        if ($viewerId) {
+            $localSql .= " AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)";
+            $localSql .= " AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)";
+            $localParams[] = $viewerId;
+            $localParams[] = $viewerId;
+        }
+        $localSql .= ' LIMIT ?';
+        $localParams[] = $limit;
+        $local = DB::all($localSql, $localParams);
         $out = array_map(fn($u) => UserModel::toMasto($u), $local);
 
         // Remote actors in cache
         if (str_contains($q, '@')) {
             [$un, $dom] = array_pad(explode('@', ltrim($q, '@'), 2), 2, '');
             if ($un && $dom) {
+                $dom = strtolower($dom);
                 if (is_local($dom)) {
                     $u = UserModel::byUsername($un);
-                    if ($u) $out[] = UserModel::toMasto($u);
-                } else {
+                    if ($u) {
+                        $hidden = $viewerId && (
+                            DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $u['id']])
+                            || DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $u['id']])
+                        );
+                        if (!$hidden) $out[] = UserModel::toMasto($u);
+                    }
+                } elseif (!$viewerId || !in_array($dom, $blockedDomains, true)) {
                     $ra = RemoteActorModel::fetchByAcct($un, $dom);
-                    if ($ra) $out[] = UserModel::remoteToMasto($ra);
+                    if ($ra) {
+                        $hidden = $viewerId && (
+                            DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $ra['id']])
+                            || DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $ra['id']])
+                            || in_array(strtolower((string)($ra['domain'] ?? '')), $blockedDomains, true)
+                        );
+                        if (!$hidden) $out[] = UserModel::remoteToMasto($ra);
+                    }
                 }
             }
         } else {
-            $remote = DB::all(
-                "SELECT * FROM remote_actors
+            $remoteSql = "SELECT * FROM remote_actors
                  WHERE domain != ?
-                   AND (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\')
-                 LIMIT ?",
-                [AP_DOMAIN, $qLike, $qLike, $limit]
-            );
+                   AND (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\')";
+            $remoteParams = [AP_DOMAIN, $qLike, $qLike];
+            if ($viewerId) {
+                $remoteSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                $remoteSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
+                $remoteParams[] = $viewerId;
+                $remoteParams[] = $viewerId;
+            }
+            if ($blockedDomains) {
+                $remoteSql .= ' AND LOWER(domain) NOT IN (' . implode(',', array_fill(0, count($blockedDomains), '?')) . ')';
+                array_push($remoteParams, ...$blockedDomains);
+            }
+            $remoteSql .= ' LIMIT ?';
+            $remoteParams[] = $limit;
+            $remote = DB::all($remoteSql, $remoteParams);
             foreach ($remote as $ra) $out[] = UserModel::remoteToMasto($ra);
         }
 
@@ -787,7 +1038,10 @@ use App\ActivityPub\{Builder, Delivery};
     {
         // Try local user by UUID
         $local = UserModel::byId($id);
-        if ($local) return [$local, null];
+        if ($local) {
+            if (!empty($local['is_suspended'])) return [null, null];
+            return [$local, null];
+        }
 
         // Try remote actor by masto_id (md5 of AP URL, stored at upsert time)
         $remote = DB::one('SELECT * FROM remote_actors WHERE masto_id=?', [$id]);
@@ -813,7 +1067,10 @@ use App\ActivityPub\{Builder, Delivery};
         if (str_starts_with((string)$internalId, 'http')) {
             $ra = DB::one('SELECT domain FROM remote_actors WHERE id=?', [$internalId]);
             if ($ra) {
-                $domainBlocking = (bool)DB::one('SELECT 1 FROM user_domain_blocks WHERE user_id=? AND domain=?', [$vid, $ra['domain']]);
+                $domainBlocking = (bool)DB::one(
+                    'SELECT 1 FROM user_domain_blocks WHERE user_id=? AND domain=?',
+                    [$vid, strtolower((string)$ra['domain'])]
+                );
             }
         }
 

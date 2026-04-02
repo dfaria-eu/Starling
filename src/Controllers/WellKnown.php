@@ -54,11 +54,29 @@ class WellKnown
     public function nodeinfoDoc(array $p): void
     {
         $users      = DB::count('users', 'is_suspended=0');
-        $posts      = DB::count('statuses', 'local=1');
+        $posts      = (int)(DB::one(
+            "SELECT COUNT(*) c FROM statuses
+             WHERE local=1
+               AND user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
+               AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+            [now_iso()]
+        )['c'] ?? 0);
         $month      = gmdate('Y-m-d\TH:i:s\Z', strtotime('-30 days'));
         $halfyear   = gmdate('Y-m-d\TH:i:s\Z', strtotime('-180 days'));
-        $active     = (int)(DB::one('SELECT COUNT(DISTINCT user_id) c FROM statuses WHERE local=1 AND created_at>?', [$month])['c'] ?? 0);
-        $activeHalf = (int)(DB::one('SELECT COUNT(DISTINCT user_id) c FROM statuses WHERE local=1 AND created_at>?', [$halfyear])['c'] ?? 0);
+        $active     = (int)(DB::one(
+            "SELECT COUNT(DISTINCT user_id) c FROM statuses
+             WHERE local=1 AND created_at>?
+               AND user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
+               AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+            [$month, now_iso()]
+        )['c'] ?? 0);
+        $activeHalf = (int)(DB::one(
+            "SELECT COUNT(DISTINCT user_id) c FROM statuses
+             WHERE local=1 AND created_at>?
+               AND user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
+               AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+            [$halfyear, now_iso()]
+        )['c'] ?? 0);
 
         json_out([
             'version'  => '2.0',

@@ -273,14 +273,14 @@ HTML;
 
         // Helper: resolve a user_id to @user@domain
         $getHandle = static function(string $userId): string {
-            $local = DB::one('SELECT username FROM users WHERE id=?', [$userId]);
+            $local = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$userId]);
             if ($local) return '@' . $local['username'] . '@' . AP_DOMAIN;
             $remote = DB::one('SELECT username, domain FROM remote_actors WHERE id=?', [$userId]);
             if ($remote) return '@' . $remote['username'] . '@' . $remote['domain'];
             return '';
         };
         $getProfileUrl = static function(string $userId): string {
-            $local = DB::one('SELECT username FROM users WHERE id=?', [$userId]);
+            $local = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$userId]);
             if ($local) return ap_url('@' . $local['username']);
             $remote = DB::one('SELECT username, domain, url, id FROM remote_actors WHERE id=?', [$userId]);
             if ($remote) return (string)($remote['url'] ?: (($remote['domain'] && $remote['username']) ? 'https://' . $remote['domain'] . '/@' . ltrim((string)$remote['username'], '@') : ($remote['id'] ?? '')));
@@ -300,7 +300,7 @@ HTML;
                 $orig = DB::one('SELECT * FROM statuses WHERE id=?', [$s['reblog_of_id']]);
                 $content = $orig ? ((int)($orig['local'] ?? 0) ? text_to_html($orig['content']) : ensure_html($orig['content'])) : '';
                 if ($orig && (int)($orig['local'] ?? 0)) {
-                    $origAuthor = DB::one('SELECT username FROM users WHERE id=?', [$orig['user_id']]);
+                    $origAuthor = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$orig['user_id']]);
                     $postUrl = $origAuthor
                         ? htmlspecialchars(ap_url('@' . $origAuthor['username'] . '/' . $orig['id']))
                         : htmlspecialchars(ap_url('@' . $u['username'] . '/' . $s['id']));
@@ -323,7 +323,7 @@ HTML;
 
             // Determine avatar/name
             if ($kind === 'boost' && $orig) {
-                $postAuthor = DB::one('SELECT username, display_name, avatar FROM users WHERE id=?', [$orig['user_id']]);
+                $postAuthor = DB::one('SELECT username, display_name, avatar FROM users WHERE id=? AND is_suspended=0', [$orig['user_id']]);
                 if ($postAuthor) {
                     $postAvatar = htmlspecialchars(local_media_url_or_fallback($postAuthor['avatar'] ?? '', '/img/avatar.svg'));
                     $postName   = htmlspecialchars($postAuthor['display_name'] ?: $postAuthor['username']);
@@ -860,17 +860,34 @@ HTML;
 
         $coll = actor_url($u['username']) . '/followers';
         $page = $this->collectionPageParam();
-        if (!$page) { ap_json_out(Builder::collection($coll, (int)$u['follower_count'])); }
+        $total = (int)(DB::one(
+            'SELECT COUNT(*) AS c
+               FROM follows f
+          LEFT JOIN users lu ON lu.id=f.follower_id
+              WHERE f.following_id=? AND f.pending=0
+                AND (lu.id IS NULL OR lu.is_suspended=0)',
+            [$u['id']]
+        )['c'] ?? 0);
+        if (!$page) { ap_json_out(Builder::collection($coll, $total)); }
 
-        $rows  = DB::all('SELECT follower_id FROM follows WHERE following_id=? AND pending=0 ORDER BY created_at DESC LIMIT 20 OFFSET ?', [$u['id'], ($page-1)*20]);
+        $rows  = DB::all(
+            'SELECT f.follower_id
+               FROM follows f
+          LEFT JOIN users lu ON lu.id=f.follower_id
+              WHERE f.following_id=? AND f.pending=0
+                AND (lu.id IS NULL OR lu.is_suspended=0)
+           ORDER BY f.created_at DESC
+              LIMIT 20 OFFSET ?',
+            [$u['id'], ($page-1)*20]
+        );
         $items = array_values(array_filter(array_map(function($id) {
             if (!str_starts_with($id, 'http')) {
-                $lu = \App\Models\DB::one('SELECT username FROM users WHERE id=?', [$id]);
+                $lu = \App\Models\DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$id]);
                 return $lu ? actor_url($lu['username']) : null;
             }
             return $id; // remote actor — already an AP URL
         }, array_column($rows, 'follower_id'))));
-        ap_json_out(Builder::collectionPage($coll, $page, $items, (int)$u['follower_count']));
+        ap_json_out(Builder::collectionPage($coll, $page, $items, $total));
     }
 
     public function following(array $p): void
@@ -880,17 +897,34 @@ HTML;
 
         $coll = actor_url($u['username']) . '/following';
         $page = $this->collectionPageParam();
-        if (!$page) { ap_json_out(Builder::collection($coll, (int)$u['following_count'])); }
+        $total = (int)(DB::one(
+            'SELECT COUNT(*) AS c
+               FROM follows f
+          LEFT JOIN users lu ON lu.id=f.following_id
+              WHERE f.follower_id=? AND f.pending=0
+                AND (lu.id IS NULL OR lu.is_suspended=0)',
+            [$u['id']]
+        )['c'] ?? 0);
+        if (!$page) { ap_json_out(Builder::collection($coll, $total)); }
 
-        $rows  = DB::all('SELECT following_id FROM follows WHERE follower_id=? AND pending=0 ORDER BY created_at DESC LIMIT 20 OFFSET ?', [$u['id'], ($page-1)*20]);
+        $rows  = DB::all(
+            'SELECT f.following_id
+               FROM follows f
+          LEFT JOIN users lu ON lu.id=f.following_id
+              WHERE f.follower_id=? AND f.pending=0
+                AND (lu.id IS NULL OR lu.is_suspended=0)
+           ORDER BY f.created_at DESC
+              LIMIT 20 OFFSET ?',
+            [$u['id'], ($page-1)*20]
+        );
         $items = array_values(array_filter(array_map(function($id) {
             if (!str_starts_with($id, 'http')) {
-                $lu = \App\Models\DB::one('SELECT username FROM users WHERE id=?', [$id]);
+                $lu = \App\Models\DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$id]);
                 return $lu ? actor_url($lu['username']) : null;
             }
             return $id; // remote actor — already an AP URL
         }, array_column($rows, 'following_id'))));
-        ap_json_out(Builder::collectionPage($coll, $page, $items, (int)$u['following_count']));
+        ap_json_out(Builder::collectionPage($coll, $page, $items, $total));
     }
 
     public function outbox(array $p): void
@@ -932,8 +966,9 @@ HTML;
              JOIN status_pins sp ON sp.status_id=s.id
              WHERE sp.user_id=?
                AND s.visibility IN (\'public\',\'unlisted\')
+               AND (s.expires_at IS NULL OR s.expires_at=\'\' OR s.expires_at>?)
              ORDER BY sp.created_at DESC',
-            [$u['id']]
+            [$u['id'], now_iso()]
         );
 
         $items = array_map(fn($s) => Builder::note($s, $u), $pins);
@@ -966,7 +1001,7 @@ HTML;
 
         defer_after_response(static function (): void {
             if (throttle_allow('delivery_retry_queue', 10)) {
-                \App\ActivityPub\Delivery::processRetryQueue(10);
+                \App\ActivityPub\Delivery::processRetryQueue(\App\ActivityPub\Delivery::INBOX_DRAIN_BATCH);
             }
         });
 

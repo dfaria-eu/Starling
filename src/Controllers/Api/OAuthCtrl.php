@@ -225,7 +225,11 @@ class OAuthCtrl
     public function revoke(array $p): void
     {
         $d = req_body();
-        OAuthModel::revoke($d['token'] ?? bearer() ?? '');
+        $ctx = auth_context();
+        $currentToken = (string)(($ctx['token']['token'] ?? '') ?: '');
+        $token = (string)($d['token'] ?? bearer() ?? $currentToken);
+        if ($token === '') err_out('invalid_request', 400);
+        OAuthModel::revoke($token);
         json_out([]);
     }
 

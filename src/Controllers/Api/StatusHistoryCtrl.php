@@ -32,15 +32,17 @@ class StatusHistoryCtrl
         );
         $poll = PollModel::byStatusId($s['id']);
 
-        $fmt = fn(array $row) => [
+        $fmt = fn(array $row, bool $isCurrent) => [
             'created_at'      => best_iso_timestamp($row['created_at'] ?? null, $s['updated_at'] ?? $s['created_at'] ?? null, $s['id'] ?? null),
             'content'         => (int)($s['local'] ?? 1) ? text_to_html($row['content']) : ensure_html($row['content']),
             'spoiler_text'    => $row['cw'],
             'sensitive'       => (bool)$row['sensitive'],
             'account'         => $accountOut,
-            'media_attachments'=> array_map([\App\Models\MediaModel::class, 'toMasto'], $media),
+            // We only persist textual edit snapshots. Returning current media/poll for
+            // older revisions makes history lie after attachment or poll changes.
+            'media_attachments'=> $isCurrent ? array_map([\App\Models\MediaModel::class, 'toMasto'], $media) : [],
             'emojis'          => [],
-            'poll'            => $poll ? PollModel::toMasto($poll, $viewer['id'] ?? null) : null,
+            'poll'            => $isCurrent && $poll ? PollModel::toMasto($poll, $viewer['id'] ?? null) : null,
         ];
 
         $history = [[
@@ -53,11 +55,11 @@ class StatusHistoryCtrl
             $history[] = $edit;
         }
 
-        json_out(array_map(function(array $row) use ($fmt, $s) {
-            $out = $fmt($row);
+        json_out(array_map(function(array $row, int $idx) use ($fmt, $s) {
+            $out = $fmt($row, $idx === 0);
             $out['created_at'] = best_iso_timestamp($row['created_at'] ?? null, $s['updated_at'] ?? $s['created_at'] ?? null, $s['id'] ?? null);
             return $out;
-        }, $history));
+        }, $history, array_keys($history)));
     }
 
     /**
@@ -70,6 +72,10 @@ class StatusHistoryCtrl
         $s    = StatusModel::byId($p['id']);
         if (!$s) err_out('Not found', 404);
         if ($s['user_id'] !== $user['id']) err_out('Forbidden', 403);
+        $media = DB::all(
+            'SELECT ma.* FROM media_attachments ma JOIN status_media sm ON sm.media_id=ma.id WHERE sm.status_id=? ORDER BY sm.position',
+            [$s['id']]
+        );
 
         json_out([
             'id'           => $s['id'],
@@ -77,6 +83,8 @@ class StatusHistoryCtrl
             'spoiler_text' => $s['cw'],
             'visibility'   => $s['visibility'] ?? 'public',
             'expires_at'   => iso_z($s['expires_at'] ?? null),
+            'media_ids'    => array_column($media, 'id'),
+            'media_attachments' => array_map([\App\Models\MediaModel::class, 'toMasto'], $media),
             'poll'         => (($poll = PollModel::byStatusId($s['id'])) ? [
                 'options'     => array_map(fn(array $o) => $o['title'], PollModel::options($poll['id'])),
                 'expires_at'  => iso_z($poll['expires_at']) ?? null,

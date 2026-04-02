@@ -482,6 +482,7 @@ class WebClientCtrl
         <input class="compose-poll-option" type="text" placeholder="Option 1" maxlength="50">
         <input class="compose-poll-option" type="text" placeholder="Option 2" maxlength="50">
       </div>
+      <div id="compose-poll-note" style="display:none"></div>
       <div id="compose-poll-controls">
         <button id="compose-poll-add" type="button">+ option</button>
         <label><input id="compose-poll-multiple" type="checkbox"> multiple choice</label>
@@ -1310,6 +1311,8 @@ button{font-family:inherit}
 }
 #compose-poll{padding:0 1rem .65rem}
 #compose-poll-options{display:grid;gap:.45rem}
+.compose-poll-option:disabled{opacity:.75;cursor:not-allowed}
+#compose-poll-note{font-size:.82rem;color:var(--text2);margin:.55rem 0 .2rem}
 .compose-poll-option{
   width:100%;border:1px solid var(--border);border-radius:10px;padding:.55rem .7rem;
   font-size:.9rem;background:var(--surface);color:var(--text)
@@ -2513,6 +2516,7 @@ function renderProfileHeader(account, rel) {
     const banner     = account.header && !account.header.includes('missing.png')
         ? `<img src="${esc(account.header)}" alt="" loading="lazy">` : '';
     const isFollowing = rel?.following ?? false;
+    const isRequested = rel?.requested ?? false;
     const isNotifying = rel?.notifying ?? false;
     const dmBtn = !isOwn
         ? `<button class="profile-dm-btn" onclick="Compose.openDM('${esc(account.acct)}')" title="Enviar mensagem direta">
@@ -2535,13 +2539,14 @@ function renderProfileHeader(account, rel) {
            </button>` : '';
     const actionBtn  = isOwn
         ? `<button class="follow-btn" onclick="navigate('EDIT_PROFILE')">Edit profile</button>`
-        : `<button class="follow-btn${isFollowing ? ' following' : ''}"
+        : `<button class="follow-btn${isFollowing ? ' following' : ''}${isRequested && !isFollowing ? ' following' : ''}"
             data-following="${isFollowing ? '1' : '0'}"
+            data-requested="${isRequested ? '1' : '0'}"
             data-account-id="${esc(account.id)}"
             onclick="toggleFollow('${esc(account.id)}',this)"
             onmouseenter="if(this.dataset.following==='1')this.textContent='Unfollow'"
             onmouseleave="if(this.dataset.following==='1')this.textContent='Following'">
-            ${isFollowing ? 'Following' : 'Follow'}
+            ${isFollowing ? 'Following' : (isRequested ? 'Requested' : 'Follow')}
         </button>`;
     const bio            = account.note || '';
     const postsCount     = account.statuses_count ?? 0;
@@ -2980,7 +2985,10 @@ async function markNotificationsReadUpTo(lastId) {
 async function showNotifications(filter) {
     if (filter !== undefined) _notifFilter = filter;
     setColHeader('Notifications'); clearContent(); _currentRenderFn = renderNotification;
-    _pendingNotifs = 0; updateNotifBadge();
+    if (_notifFilter === 'all') {
+        _pendingNotifs = 0;
+        updateNotifBadge();
+    }
     const content = document.getElementById('col-content');
     // Render notification tabs
     content.insertAdjacentHTML('beforeend', `
@@ -2993,13 +3001,15 @@ async function showNotifications(filter) {
     _currentEndpointParams = params;
     await loadFeed('/api/v1/notifications', renderNotification, params);
 
-    // Update read marker so badge doesn't reappear on reload or after SSE reconnects.
-    try {
-        const latest = await Api.get('/api/v1/notifications', {limit: 1});
-        if (latest[0]?.id) {
-            await markNotificationsReadUpTo(latest[0].id);
-        }
-    } catch {}
+    // Only the full notifications view should advance the global read marker.
+    if (_notifFilter === 'all') {
+        try {
+            const latest = await Api.get('/api/v1/notifications', {limit: 1});
+            if (latest[0]?.id) {
+                await markNotificationsReadUpTo(latest[0].id);
+            }
+        } catch {}
+    }
 }
 
 async function showThread(id) {
@@ -3179,10 +3189,12 @@ async function toggleRightFollow(btn) {
     btn.disabled = true;
     try {
         const r = await Api.post('/api/v1/accounts/' + id + (following ? '/unfollow' : '/follow'), {});
-        const now = r.following ?? !following;
+        const now = !!r.following;
+        const requested = !!r.requested && !now;
         btn.dataset.following  = now ? '1' : '0';
-        btn.textContent        = now ? 'Following' : 'Follow';
-        btn.classList.toggle('following', now);
+        btn.dataset.requested  = requested ? '1' : '0';
+        btn.textContent        = now ? 'Following' : (requested ? 'Requested' : 'Follow');
+        btn.classList.toggle('following', now || requested);
     } catch (e) { Toast.err('Error: ' + e.message); }
     btn.disabled = false;
 }
@@ -4646,11 +4658,13 @@ async function showExplore(tab) {
         if (!people.length) { trendingArea.insertAdjacentHTML('beforeend', '<p style="padding:2rem;color:var(--text2);text-align:center">No trending people</p>'); return; }
         const ids = people.map(a => a.id);
         const rels = await Api.get('/api/v1/accounts/relationships', {'id[]': ids}).catch(() => []);
-        const followMap = {};
-        rels.forEach(r => { if (r) followMap[r.id] = r.following ?? false; });
+        const relMap = {};
+        rels.forEach(r => { if (r) relMap[r.id] = r; });
 
         const html = people.map(a => {
-            const following = followMap[a.id] ?? false;
+            const rel = relMap[a.id] || {};
+            const following = !!rel.following;
+            const requested = !!rel.requested && !following;
             const bio = a.note ? a.note.replace(/<[^>]+>/g, '').trim() : '';
             return `<div class="explore-people-item">
                 <img class="explore-people-avatar" src="${esc(a.avatar)}" alt="" loading="lazy" onclick="navigate('PROFILE','${esc(a.id)}')">
@@ -4659,10 +4673,11 @@ async function showExplore(tab) {
                     <div class="explore-people-acct">@${esc(a.acct)}</div>
                     ${bio ? `<div class="explore-people-bio">${esc(bio)}</div>` : ''}
                 </div>
-                <button class="right-suggest-follow${following ? ' following' : ''}"
+                <button class="right-suggest-follow${following || requested ? ' following' : ''}"
                     data-account-id="${esc(a.id)}"
                     data-following="${following ? '1' : '0'}"
-                    onclick="toggleRightFollow(this)">${following ? 'Following' : 'Follow'}</button>
+                    data-requested="${requested ? '1' : '0'}"
+                    onclick="toggleRightFollow(this)">${following ? 'Following' : (requested ? 'Requested' : 'Follow')}</button>
             </div>`;
         }).join('');
         trendingArea.insertAdjacentHTML('beforeend', html);
@@ -5228,10 +5243,14 @@ async function checkUnreadNotifications() {
             Api.get('/api/v1/markers', {'timeline[]': 'notifications'}).catch(() => ({})),
             Api.get('/api/v1/notifications', {limit: 1}).catch(() => []),
         ]);
-        if (!notifs.length) return;
         const lastRead  = String(markers?.notifications?.last_read_id ?? '0');
-        const latestId  = notifs[0].id;
         _notifLastReadId = lastRead;
+        if (!notifs.length) {
+            _pendingNotifs = 0;
+            updateNotifBadge();
+            return;
+        }
+        const latestId  = notifs[0].id;
         if (notifIdGt(latestId, _notifSeenMaxId)) _notifSeenMaxId = latestId;
         if (WCFG.view === 'NOTIFICATIONS') {
             _pendingNotifs = 0;
@@ -5241,7 +5260,10 @@ async function checkUnreadNotifications() {
         if (lastRead === '0' || notifIdGt(latestId, lastRead)) {
             _pendingNotifs = 1; // at least 1 unread — exact count not critical
             updateNotifBadge();
+            return;
         }
+        _pendingNotifs = 0;
+        updateNotifBadge();
     } catch {}
 }
 
@@ -5530,13 +5552,16 @@ async function toggleFollow(accountId, btn) {
     btn.disabled = true;
     try {
         const rel = await Api.post('/api/v1/accounts/' + accountId + (following ? '/unfollow' : '/follow'));
-        btn.dataset.following = rel.following ? '1' : '0';
-        btn.textContent = rel.following ? 'Following' : 'Follow';
-        btn.classList.toggle('following', !!rel.following);
+        const isFollowing = !!rel.following;
+        const isRequested = !!rel.requested && !isFollowing;
+        btn.dataset.following = isFollowing ? '1' : '0';
+        btn.dataset.requested = isRequested ? '1' : '0';
+        btn.textContent = isFollowing ? 'Following' : (isRequested ? 'Requested' : 'Follow');
+        btn.classList.toggle('following', isFollowing || isRequested);
         // Hide/show notify & lists buttons depending on follow state
         const actions = btn.closest('.profile-actions');
         actions?.querySelectorAll('.profile-follow-only').forEach(el => {
-            el.style.display = rel.following ? '' : 'none';
+            el.style.display = isFollowing ? '' : 'none';
         });
     } catch (e) { Toast.err('Error following'); }
     btn.disabled = false;
@@ -5689,7 +5714,16 @@ async function rejectFollowRequest(accountId, btn) {
 async function editStatus(id) {
     try {
         const s = await Api.get('/api/v1/statuses/' + id + '/source');
-        Compose.openEdit(id, s.text, s.spoiler_text || '', s.visibility || 'public', s.poll || null, s.expires_at || null);
+        Compose.openEdit(
+            id,
+            s.text,
+            s.spoiler_text || '',
+            s.visibility || 'public',
+            s.poll || null,
+            s.expires_at || null,
+            s.media_ids || [],
+            s.media_attachments || []
+        );
     } catch (e) { Toast.err('Error loading post: ' + e.message); }
 }
 
@@ -5698,6 +5732,7 @@ const Compose = {
     _replyToId: null,
     _editId:    null,
     _editExpiresAt: null,
+    _editHasPoll: false,
     _mediaIds:  [],
     _prevFocus: null,
 
@@ -5710,6 +5745,7 @@ const Compose = {
     open(replyToId = null, replyToAcct = null, prefillText = null) {
         this._editId    = null;
         this._editExpiresAt = null;
+        this._editHasPoll = false;
         this._replyToId = replyToId;
         this._mediaIds  = [];
         this._prevFocus = document.activeElement;
@@ -5725,17 +5761,19 @@ const Compose = {
         document.getElementById('cw-input').value            = '';
         document.getElementById('cw-input').style.display    = 'none';
         this.resetPoll();
+        this.updatePollToggle();
         document.getElementById('compose-avatar').src = WCFG.myAvatar || '';
         document.getElementById('compose-modal').classList.add('open');
         setTimeout(() => document.getElementById('compose-text').focus(), 50);
         this.updateCount();
     },
 
-    openEdit(id, text, cw, visibility = 'public', poll = null, expiresAt = null) {
+    openEdit(id, text, cw, visibility = 'public', poll = null, expiresAt = null, mediaIds = [], mediaAttachments = []) {
         this._editId    = id;
         this._editExpiresAt = expiresAt || null;
+        this._editHasPoll = !!poll;
         this._replyToId = null;
-        this._mediaIds  = [];
+        this._mediaIds  = Array.isArray(mediaIds) ? [...mediaIds] : [];
         this._prevFocus = document.activeElement;
         document.getElementById('compose-text').value        = text;
         document.getElementById('cw-input').value            = cw;
@@ -5745,8 +5783,29 @@ const Compose = {
         this.syncExpireSelectOptions();
         document.getElementById('expire-select').value       = expiresAt ? '__keep__' : '';
         document.getElementById('reply-preview').style.display = 'none';
-        document.getElementById('media-previews').innerHTML  = '';
+        document.getElementById('media-previews').innerHTML  = (Array.isArray(mediaAttachments) ? mediaAttachments : []).map(media => {
+            const url = esc(media.preview_url || media.url || '');
+            const mid = esc(media.id || '');
+            return `<div class="media-thumb" data-media-id="${mid}"><img src="${url}" alt=""><button onclick="Compose.removeMedia('${mid}',this)" type="button" aria-label="Remove">✕</button></div>`;
+        }).join('');
         this.resetPoll();
+        if (poll) {
+            const box = document.getElementById('compose-poll');
+            const opts = Array.isArray(poll.options) ? poll.options : [];
+            box.style.display = '';
+            this.setPollOptions(opts.map(opt => ({title: opt})));
+            document.getElementById('compose-poll-multiple').checked = !!poll.multiple;
+            const note = document.getElementById('compose-poll-note');
+            if (note) {
+                note.style.display = '';
+                note.textContent = 'Poll editing is not supported. You can review the current options, but changes will not be saved.';
+            }
+            box.querySelectorAll('.compose-poll-option').forEach(input => input.disabled = true);
+            document.getElementById('compose-poll-multiple').disabled = true;
+            document.getElementById('compose-poll-expiration').disabled = true;
+            document.getElementById('compose-poll-add').disabled = true;
+        }
+        this.updatePollToggle();
         document.getElementById('compose-avatar').src = WCFG.myAvatar || '/img/avatar.svg';
         document.getElementById('compose-modal').classList.add('open');
         setTimeout(() => document.getElementById('compose-text').focus(), 50);
@@ -5794,6 +5853,7 @@ const Compose = {
         this._replyToId = null;
         this._editId    = null;
         this._editExpiresAt = null;
+        this._editHasPoll = false;
         this._mediaIds  = [];
         document.getElementById('compose-text').value         = '';
         document.getElementById('cw-input').value             = '';
@@ -5802,6 +5862,7 @@ const Compose = {
         document.getElementById('expire-select').value        = USERPREFS.defaultExpireAfter ? String(USERPREFS.defaultExpireAfter) : '';
         document.getElementById('media-previews').innerHTML   = '';
         this.resetPoll();
+        this.updatePollToggle();
         this._prevFocus?.focus();
         this._prevFocus = null;
     },
@@ -5842,7 +5903,23 @@ const Compose = {
         btn.closest('.media-thumb')?.remove();
     },
 
+    updatePollToggle() {
+        const btn = document.getElementById('poll-toggle-btn');
+        if (!btn) return;
+        const disabled = !!this._editId;
+        btn.disabled = disabled;
+        btn.title = disabled
+            ? (this._editHasPoll ? 'Poll editing is not supported' : 'Polls cannot be added while editing')
+            : 'Add poll';
+        btn.style.opacity = disabled ? '.45' : '';
+        btn.style.cursor = disabled ? 'not-allowed' : '';
+    },
+
     togglePoll() {
+        if (this._editId) {
+            Toast.err(this._editHasPoll ? 'Editing polls is not supported' : 'Polls cannot be added while editing');
+            return;
+        }
         const box = document.getElementById('compose-poll');
         const next = box.style.display === 'none' ? '' : 'none';
         box.style.display = next;
@@ -5854,7 +5931,15 @@ const Compose = {
     resetPoll() {
         document.getElementById('compose-poll').style.display = 'none';
         document.getElementById('compose-poll-multiple').checked = false;
+        document.getElementById('compose-poll-multiple').disabled = false;
         document.getElementById('compose-poll-expiration').value = '86400';
+        document.getElementById('compose-poll-expiration').disabled = false;
+        document.getElementById('compose-poll-add').disabled = false;
+        const note = document.getElementById('compose-poll-note');
+        if (note) {
+            note.style.display = 'none';
+            note.textContent = '';
+        }
         this.setPollOptions([{title:''},{title:''}]);
     },
 

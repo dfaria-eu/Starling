@@ -7,6 +7,11 @@ class UserModel
 {
     private static array $countSyncCache = [];
 
+    private static function activeLocalStatusCond(): string
+    {
+        return 'user_id=? AND local=1 AND (expires_at IS NULL OR expires_at="" OR expires_at>?)';
+    }
+
     private static function byActorUrl(string $actorUrl): ?array
     {
         $host = strtolower((string)(parse_url($actorUrl, PHP_URL_HOST) ?? ''));
@@ -130,9 +135,19 @@ class UserModel
         if ($userId === '') return $user;
         if (!$force && isset(self::$countSyncCache[$userId])) return self::$countSyncCache[$userId];
 
-        $actualFollowers = DB::count('follows', 'following_id=? AND pending=0', [$userId]);
-        $actualFollowing = DB::count('follows', 'follower_id=? AND pending=0', [$userId]);
-        $actualStatuses  = DB::count('statuses', 'user_id=? AND local=1', [$userId]);
+        $actualFollowers = (int)(DB::one(
+            "SELECT COUNT(*) c FROM follows
+             WHERE following_id=? AND pending=0
+               AND (follower_id LIKE 'http%' OR follower_id NOT IN (SELECT id FROM users WHERE is_suspended=1))",
+            [$userId]
+        )['c'] ?? 0);
+        $actualFollowing = (int)(DB::one(
+            "SELECT COUNT(*) c FROM follows
+             WHERE follower_id=? AND pending=0
+               AND (following_id LIKE 'http%' OR following_id NOT IN (SELECT id FROM users WHERE is_suspended=1))",
+            [$userId]
+        )['c'] ?? 0);
+        $actualStatuses  = DB::count('statuses', self::activeLocalStatusCond(), [$userId, now_iso()]);
 
         $updates = [];
         if ((int)($user['follower_count'] ?? 0) !== $actualFollowers) $updates['follower_count'] = $actualFollowers;
@@ -161,7 +176,10 @@ class UserModel
     {
         static $cache = [];
         if (!array_key_exists($userId, $cache)) {
-            $row = DB::one('SELECT created_at FROM statuses WHERE user_id=? ORDER BY created_at DESC LIMIT 1', [$userId]);
+            $row = DB::one(
+                'SELECT created_at FROM statuses WHERE ' . self::activeLocalStatusCond() . ' ORDER BY created_at DESC LIMIT 1',
+                [$userId, now_iso()]
+            );
             $cache[$userId] = ($row && $row['created_at']) ? substr($row['created_at'], 0, 10) : null;
         }
         return $cache[$userId];
@@ -246,7 +264,9 @@ class UserModel
         ]);
         $html     = (string)curl_exec($ch);
         $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-        curl_close($ch);
+        if (PHP_VERSION_ID < 80000) {
+            curl_close($ch);
+        }
 
         if (!$html) return null;
 
@@ -310,20 +330,20 @@ class UserModel
 
     // ── Mastodon Account serialisation ──────────────────────
 
-    public static function toMasto(array $u, ?string $viewerId = null, bool $includePrivate = false): array
+    public static function toMasto(array $u, ?string $viewerId = null, bool $includePrivate = false, int $_depth = 0): array
     {
         $base     = AP_BASE_URL;
         $actorUrl = actor_url($u['username']);
 
         // Resolve moved_to to account object if set
         $movedTo = null;
-        if (!empty($u['moved_to'])) {
+        if ($_depth < 1 && !empty($u['moved_to'])) {
             $movedLocal = self::byActorUrl($u['moved_to']);
             if ($movedLocal) {
-                $movedTo = self::toMasto($movedLocal);
+                $movedTo = self::toMasto($movedLocal, $viewerId, false, $_depth + 1);
             } else {
                 $movedActor = DB::one('SELECT * FROM remote_actors WHERE id=?', [$u['moved_to']]);
-                if ($movedActor) $movedTo = self::remoteToMasto($movedActor);
+                if ($movedActor) $movedTo = self::remoteToMasto($movedActor, $_depth + 1);
             }
         }
 

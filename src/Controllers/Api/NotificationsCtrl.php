@@ -133,8 +133,8 @@ class NotificationsCtrl
         if ($local) {
             $createdAt = $local['created_at'] ?? null;
         } else {
-            $remote = DB::one('SELECT published_at, fetched_at FROM remote_actors WHERE id=?', [$fromId]);
-            $createdAt = $remote['published_at'] ?? ($remote['fetched_at'] ?? null);
+            $remote = DB::one('SELECT published_at FROM remote_actors WHERE id=?', [$fromId]);
+            $createdAt = $remote['published_at'] ?? null;
         }
         if ($createdAt) {
             $flags['new_account'] = strtotime((string)$createdAt) >= strtotime('-30 days');
@@ -142,6 +142,24 @@ class NotificationsCtrl
 
         $cache[$cacheKey] = $flags;
         return $flags;
+    }
+
+    private function isHiddenFromViewer(string $viewerId, string $fromId): bool
+    {
+        if ($fromId === '' || $fromId === $viewerId) return false;
+        if (!str_starts_with($fromId, 'http')) {
+            $local = UserModel::byId($fromId);
+            if ($local && !empty($local['is_suspended'])) return true;
+        }
+        if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $fromId])) return true;
+        if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $fromId])) return true;
+        if (!str_starts_with($fromId, 'http')) return false;
+        $ra = DB::one('SELECT domain FROM remote_actors WHERE id=?', [$fromId]);
+        if (!$ra || ($ra['domain'] ?? '') === '') return false;
+        return (bool)DB::one(
+            'SELECT 1 FROM user_domain_blocks WHERE user_id=? AND domain=?',
+            [$viewerId, strtolower((string)$ra['domain'])]
+        );
     }
 
     private function isPrivateMentionRequest(array $n): bool
@@ -167,6 +185,22 @@ class NotificationsCtrl
         return false;
     }
 
+    private function hasRenderableStatus(array $n, string $viewerId): bool
+    {
+        $statusTypes = ['mention', 'reblog', 'favourite', 'poll', 'update', 'status', 'direct'];
+        if (!in_array((string)($n['type'] ?? ''), $statusTypes, true)) {
+            return true;
+        }
+        if (empty($n['status_id'])) {
+            return false;
+        }
+        $status = StatusModel::byId((string)$n['status_id']);
+        if (!$status) {
+            return false;
+        }
+        return StatusModel::toMasto($status, $viewerId) !== null;
+    }
+
     private function requestRows(array $user, int $limit, ?string $maxId, ?string $sinceId, ?string $minId, ?array $types, array $excl): array
     {
         $scanLimit = max(200, min(5000, $limit * 20));
@@ -178,10 +212,31 @@ class NotificationsCtrl
         $filtered = [];
         foreach ($rows as $row) {
             if (!$this->notificationRequiresRequest($row, $user['id'], $policy)) continue;
+            if ($this->isHiddenFromViewer($user['id'], (string)($row['from_acct_id'] ?? ''))) continue;
+            if (!$this->hasRenderableStatus($row, $user['id'])) continue;
             $filtered[] = $row;
             if (count($filtered) >= $limit) break;
         }
         return $filtered;
+    }
+
+    private function visibleRows(array $user, int $limit, ?string $maxId, ?string $sinceId, ?string $minId, ?array $types, array $excl): array
+    {
+        $scanLimit = max(200, min(5000, $limit * 20));
+        [$sql, $par] = $this->buildQuery($user['id'], $scanLimit, $maxId, $sinceId, $minId, $types, $excl);
+        $rows = DB::all($sql, $par);
+        if ($minId) $rows = array_reverse($rows);
+
+        $policy = $this->loadPolicy($user);
+        $visible = [];
+        foreach ($rows as $row) {
+            if ($this->notificationRequiresRequest($row, $user['id'], $policy)) continue;
+            if ($this->isHiddenFromViewer($user['id'], (string)($row['from_acct_id'] ?? ''))) continue;
+            if (!$this->hasRenderableStatus($row, $user['id'])) continue;
+            $visible[] = $row;
+            if (count($visible) >= $limit) break;
+        }
+        return $visible;
     }
 
     private function pendingRequestCount(array $user): int
@@ -191,6 +246,8 @@ class NotificationsCtrl
         $policy = $this->loadPolicy($user);
         $count = 0;
         foreach ($rows as $row) {
+            if ($this->isHiddenFromViewer($user['id'], (string)($row['from_acct_id'] ?? ''))) continue;
+            if (!$this->hasRenderableStatus($row, $user['id'])) continue;
             if ($this->notificationRequiresRequest($row, $user['id'], $policy)) {
                 $count++;
             }
@@ -339,9 +396,7 @@ class NotificationsCtrl
         $minId   = $_GET['min_id']   ?? null;
         [$types, $excl] = $this->parseTypeFilters();
 
-        [$sql, $par] = $this->buildQuery($user['id'], $limit, $maxId, $sinceId, $minId, $types, $excl);
-        $rows = DB::all($sql, $par);
-        if ($minId) $rows = array_reverse($rows);
+        $rows = $this->visibleRows($user, $limit, $maxId, $sinceId, $minId, $types, $excl);
 
         $out = array_values(array_filter(array_map(fn($n) => $this->fmtPublic($n, $user), $rows)));
 
@@ -402,9 +457,7 @@ class NotificationsCtrl
         $minId   = $_GET['min_id']   ?? null;
         [$types, $excl] = $this->parseTypeFilters();
 
-        [$sql, $par] = $this->buildQuery($user['id'], $limit, $maxId, $sinceId, $minId, $types, $excl);
-        $rows = DB::all($sql, $par);
-        if ($minId) $rows = array_reverse($rows);
+        $rows = $this->visibleRows($user, $limit, $maxId, $sinceId, $minId, $types, $excl);
 
         if ($rows) {
             $base       = ap_url('api/v2/notifications');
@@ -536,6 +589,10 @@ class NotificationsCtrl
         $fromId  = $n['from_acct_id'];
         $fromAcc = null;
 
+        if ($this->isHiddenFromViewer($me['id'], (string)$fromId)) {
+            return null;
+        }
+
         // Per-request cache: avoid duplicate HTTP fetches for the same actor
         // when multiple notifications arrive from the same account.
         static $actorCache = [];
@@ -596,5 +653,10 @@ class NotificationsCtrl
         $out['status'] = $s ? StatusModel::toMasto($s, $me['id']) : null;
 
         return $out;
+    }
+
+    public function shouldAppearInMainList(array $n, array $user): bool
+    {
+        return !$this->notificationRequiresRequest($n, $user['id'], $this->loadPolicy($user));
     }
 }

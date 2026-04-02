@@ -64,13 +64,12 @@ class TrendsCtrl
     }
 
     /** Build 7-day history for a set of hashtag IDs. Returns [hashtag_id => history_array]. */
-    private static function tagHistoryBatch(array $ids): array
+    private static function tagHistoryBatch(array $ids, array $blockedDomains = []): array
     {
         if (!$ids) return [];
         $ph    = implode(',', array_fill(0, count($ids), '?'));
         $since = gmdate('Y-m-d', strtotime('-7 days'));
-        $blocked      = StatusModel::blockedDomains();
-        $domainFilter = StatusModel::domainBlockSql('s.user_id', $blocked);
+        $domainFilter = StatusModel::domainBlockSql('s.user_id', $blockedDomains);
         $rows  = DB::all(
             "SELECT sh.hashtag_id,
                     CAST(strftime('%s', date(s.created_at)) AS TEXT) AS day,
@@ -81,10 +80,12 @@ class TrendsCtrl
              WHERE sh.hashtag_id IN ($ph)
                AND date(s.created_at) >= ?
                AND s.visibility = 'public'
+               AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+               AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                $domainFilter
              GROUP BY sh.hashtag_id, day
              ORDER BY day DESC",
-            array_merge($ids, [$since])
+            array_merge($ids, [$since, now_iso()])
         );
 
         $map = array_fill_keys($ids, []);
@@ -104,7 +105,7 @@ class TrendsCtrl
         $limit  = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId  = $_GET['max_id'] ?? null;
 
-        $blocked      = StatusModel::blockedDomains();
+        $blocked      = StatusModel::blockedDomains($viewer['id'] ?? null);
         $domainFilter = StatusModel::domainBlockSql('s.user_id', $blocked);
         $reblogDomainFilter = StatusModel::domainBlockSql('r.user_id', $blocked);
 
@@ -114,7 +115,7 @@ class TrendsCtrl
         // cost of this endpoint and quickly becomes the slowest public API query.
         $outerFilter = '';
         $since = gmdate('Y-m-d\TH:i:s\Z', strtotime('-2 days'));
-        $params = [$since, $since];
+        $params = [$since, now_iso(), $since, now_iso()];
 
         // Cursor paging must follow the same ordering as the endpoint: trend_score DESC, id DESC.
         // Filtering only by id is wrong here and can skip or repeat statuses with higher/lower scores.
@@ -126,6 +127,8 @@ class TrendsCtrl
                     WHERE s.visibility = 'public'
                       AND s.reblog_of_id IS NULL
                       AND s.created_at > ?
+                      AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                      AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                       {$domainFilter}
                  ),
                  public_reblogs AS (
@@ -134,6 +137,8 @@ class TrendsCtrl
                     WHERE r.visibility = 'public'
                       AND r.reblog_of_id IS NOT NULL
                       AND r.created_at > ?
+                      AND (r.expires_at IS NULL OR r.expires_at='' OR r.expires_at>?)
+                      AND (r.user_id LIKE 'http%' OR r.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                       {$reblogDomainFilter}
                     GROUP BY r.reblog_of_id
                  ),
@@ -147,7 +152,7 @@ class TrendsCtrl
                     LEFT JOIN public_reblogs pr ON pr.status_id = c.id
                  )
                  SELECT trend_score, id FROM scored WHERE id=? LIMIT 1",
-                [$since, $since, $maxId]
+                [$since, now_iso(), $since, now_iso(), $maxId]
             );
             if ($ref) {
                 $outerFilter = ' WHERE (trend_score < ? OR (trend_score = ? AND id < ?))';
@@ -165,6 +170,8 @@ class TrendsCtrl
                 WHERE s.visibility = 'public'
                   AND s.reblog_of_id IS NULL
                   AND s.created_at > ?
+                  AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                  AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                   {$domainFilter}
             ),
             public_reblogs AS (
@@ -173,6 +180,8 @@ class TrendsCtrl
                 WHERE r.visibility = 'public'
                   AND r.reblog_of_id IS NOT NULL
                   AND r.created_at > ?
+                  AND (r.expires_at IS NULL OR r.expires_at='' OR r.expires_at>?)
+                  AND (r.user_id LIKE 'http%' OR r.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                   {$reblogDomainFilter}
                 GROUP BY r.reblog_of_id
             ),
@@ -206,7 +215,7 @@ class TrendsCtrl
         $since  = gmdate('Y-m-d\TH:i:s\Z', strtotime('-2 days'));
         $viewer = authed_user();
         $userId = $viewer['id'] ?? null;
-        $blocked      = StatusModel::blockedDomains();
+        $blocked      = StatusModel::blockedDomains($userId);
         $domainFilter = StatusModel::domainBlockSql('s.user_id', $blocked);
 
         $rows = DB::all(
@@ -219,16 +228,18 @@ class TrendsCtrl
              JOIN status_hashtags sh ON sh.hashtag_id = h.id
              JOIN statuses s ON s.id = sh.status_id
              WHERE s.created_at > ? AND s.visibility = 'public'
+               AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+               AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                $domainFilter
              GROUP BY h.id
              HAVING COUNT(*) >= 1
              ORDER BY trend_score DESC, h.name ASC
              LIMIT ? OFFSET ?",
-            [$since, $limit, $offset]
+            [$since, now_iso(), $limit, $offset]
         );
 
         $ids     = array_column($rows, 'id');
-        $history = self::tagHistoryBatch($ids);
+        $history = self::tagHistoryBatch($ids, $blocked);
 
         json_out(array_map(function ($r) use ($userId, $history) {
             $following = $userId
@@ -314,7 +325,7 @@ class TrendsCtrl
         $viewer = authed_user();
         $uid    = $viewer['id'] ?? null;
         $limit  = max(1, min((int)($_GET['limit'] ?? 5), 20));
-        $blocked = array_map('strtolower', StatusModel::blockedDomains());
+        $blocked = StatusModel::blockedDomains($uid);
 
         if ($uid) {
             $rows = DB::all(
@@ -323,13 +334,15 @@ class TrendsCtrl
                  JOIN follows f2 ON f2.follower_id = f1.following_id AND f2.pending = 0
                  WHERE f1.follower_id = ? AND f1.pending = 0
                    AND f2.following_id != ?
+                   AND f2.following_id NOT IN (SELECT target_id FROM blocks WHERE user_id = ?)
+                   AND f2.following_id NOT IN (SELECT target_id FROM mutes WHERE user_id = ?)
                    AND f2.following_id NOT IN (
                        SELECT following_id FROM follows WHERE follower_id = ? AND pending = 0
                    )
                  GROUP BY f2.following_id
                  ORDER BY mutual_count DESC
                  LIMIT ?",
-                [$uid, $uid, $uid, $limit * 3]
+                [$uid, $uid, $uid, $uid, $uid, $limit * 3]
             );
         } else {
             $rows = [];
@@ -343,6 +356,10 @@ class TrendsCtrl
             $localParams = [];
             if ($uid) {
                 $localSql .= ' AND id != ? AND id NOT IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)';
+                $localSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                $localSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
+                $localParams[] = $uid;
+                $localParams[] = $uid;
                 $localParams[] = $uid;
                 $localParams[] = $uid;
             }
@@ -361,6 +378,10 @@ class TrendsCtrl
                 $remoteParams = [];
                 if ($uid) {
                     $remoteSql .= ' AND id != ? AND id NOT IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)';
+                    $remoteParams[] = $uid;
+                    $remoteParams[] = $uid;
+                    $remoteSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                    $remoteSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
                     $remoteParams[] = $uid;
                     $remoteParams[] = $uid;
                 }
@@ -398,6 +419,13 @@ class TrendsCtrl
 
         $out = [];
         foreach ($accountIds as $id) {
+            if ($uid) {
+                $hidden = DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$uid, $id])
+                    || DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$uid, $id]);
+                if ($hidden) {
+                    continue;
+                }
+            }
             $local = DB::one('SELECT is_suspended, is_bot, discoverable FROM users WHERE id=?', [$id]);
             if ($local) {
                 if ((int)$local['is_suspended'] !== 0 || (int)$local['is_bot'] !== 0 || (int)$local['discoverable'] === 0) {

@@ -12,12 +12,49 @@ class Delivery
     private const PROCESSING_LEASE_SECONDS = 120;
     private const ATTEMPT_LOG_RETENTION_DAYS = 14;
     private const ATTEMPT_LOG_MAX_ROWS = 5000;
+    public const INTERNAL_WAKE_BATCH = 15;
+    public const REQUEST_DRAIN_BATCH = 3;
+    public const INBOX_DRAIN_BATCH = 5;
+    private const WAKE_FALLBACK_BATCH = 10;
+    private const WAKE_FALLBACK_MAX_CYCLES = 2;
 
     private static function closeCurlHandle($ch): void
     {
         if (PHP_VERSION_ID < 80000) {
             curl_close($ch);
         }
+    }
+
+    private static function logQueue(string $event, array $context = [], string $throttleKey = '', int $windowSeconds = 60): void
+    {
+        try {
+            if ($throttleKey !== '' && !throttle_allow('delivery_queue_log:' . $throttleKey, 1, $windowSeconds)) {
+                return;
+            }
+            $parts = [];
+            foreach ($context as $key => $value) {
+                if ($value === '' || $value === null) continue;
+                if (is_bool($value)) {
+                    $value = $value ? 'true' : 'false';
+                } elseif (is_float($value)) {
+                    $value = number_format($value, 3, '.', '');
+                } elseif (is_array($value)) {
+                    $value = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                }
+                $parts[] = $key . '=' . $value;
+            }
+            error_log('[Starling][delivery_queue] ' . $event . ($parts ? ' ' . implode(' ', $parts) : ''));
+        } catch (\Throwable) {
+        }
+    }
+
+    private static function drainWakeFallback(): void
+    {
+        $cycles = 0;
+        do {
+            self::processRetryQueue(self::WAKE_FALLBACK_BATCH);
+            $cycles++;
+        } while ($cycles < self::WAKE_FALLBACK_MAX_CYCLES && self::hasDueRetries());
     }
 
     private static function isQueueableUrl(string $url): bool
@@ -346,7 +383,12 @@ class Delivery
         // fall back to draining a small local slice after the response instead of leaving
         // the queue stuck until the next incoming request.
         if ($ok === false || $code >= 400 || $code === 0) {
-            self::processRetryQueue(5);
+            self::logQueue('wake_fallback', [
+                'http_code' => $code,
+                'curl_ok' => $ok !== false,
+                'mode' => 'local_drain',
+            ], 'wake_fallback', 30);
+            self::drainWakeFallback();
         }
     }
 
@@ -474,7 +516,12 @@ class Delivery
                     self::nudgeQueue();
                 });
             }
-        } catch (\Throwable) {}
+        } catch (\Throwable $e) {
+            self::logQueue('enqueue_exception', [
+                'inbox' => parse_url($inboxUrl, PHP_URL_HOST) ?? $inboxUrl,
+                'error' => mb_substr($e->getMessage(), 0, 180),
+            ], 'enqueue_exception', 60);
+        }
     }
 
     /**
@@ -602,6 +649,12 @@ class Delivery
      */
     public static function processRetryQueue(int $limit = 20): void
     {
+        $startedAt = microtime(true);
+        $leased = 0;
+        $successes = 0;
+        $retryFailures = 0;
+        $terminalFailures = 0;
+        $skipped = 0;
         try {
             self::ensureQueueTable();
             self::pruneFailedQueueRows();
@@ -638,6 +691,7 @@ class Delivery
                 }
             }
             if (!$rows) return;
+            $leased = count($rows);
 
             // Build one signed cURL handle per row; skip rows with invalid actor/payload.
             $mh      = curl_multi_init();
@@ -654,18 +708,20 @@ class Delivery
 
             foreach ($rows as $row) {
                 $actor = $actorsById[$row['actor_id']] ?? null;
-                if (!$actor) { DB::delete('delivery_queue', 'id=?', [$row['id']]); continue; }
+                if (!$actor) { DB::delete('delivery_queue', 'id=?', [$row['id']]); $skipped++; continue; }
 
                 $activity = json_decode($row['payload'], true);
-                if (!$activity) { DB::delete('delivery_queue', 'id=?', [$row['id']]); continue; }
+                if (!$activity) { DB::delete('delivery_queue', 'id=?', [$row['id']]); $skipped++; continue; }
 
                 $urlState = self::classifyInboxUrl($row['inbox_url']);
                 if ($urlState['state'] === 'terminal') {
                     self::markFailedRow($row, 0, $urlState['error'], '', true, [], $activity);
+                    $terminalFailures++;
                     continue;
                 }
                 if ($urlState['state'] === 'retry') {
                     self::markFailedRow($row, 0, $urlState['error'], '', false, [], $activity);
+                    $retryFailures++;
                     continue;
                 }
 
@@ -729,17 +785,50 @@ class Delivery
                 if ($ok) {
                     self::recordAttemptLog($row, $activity, (int)$row['attempts'] + 1, $code, 'success', 'success', '', $rawBody);
                     DB::delete('delivery_queue', 'id=?', [$row['id']]);
+                    $successes++;
                 } else {
                     $lastError = $curlErr !== ''
                         ? ('network: ' . mb_substr($curlErr, 0, 180))
                         : ($code > 0 ? ('http_' . $code) : 'network: unknown');
+                    $failure = self::classifyDeliveryFailure($code, $lastError, $rawBody, is_array($responseHeaders) ? $responseHeaders : []);
+                    if ($failure['terminal']) {
+                        $terminalFailures++;
+                    } else {
+                        $retryFailures++;
+                    }
                     self::markFailedRow($row, $code, $lastError, $rawBody, false, is_array($responseHeaders) ? $responseHeaders : [], $activity);
                 }
             }
 
             curl_multi_close($mh);
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
             // Non-fatal — retry processing should never break inbox handling
+            self::logQueue('process_exception', [
+                'limit' => $limit,
+                'leased' => $leased,
+                'duration_s' => microtime(true) - $startedAt,
+                'error' => mb_substr($e->getMessage(), 0, 180),
+            ], 'process_exception', 30);
+            return;
+        }
+
+        $duration = microtime(true) - $startedAt;
+        $processed = $successes + $retryFailures + $terminalFailures + $skipped;
+        if (
+            $processed > 0 &&
+            ($retryFailures > 0 || $terminalFailures > 0 || $duration >= 5.0)
+        ) {
+            self::logQueue('batch', [
+                'limit' => $limit,
+                'leased' => $leased,
+                'processed' => $processed,
+                'success' => $successes,
+                'retry' => $retryFailures,
+                'terminal' => $terminalFailures,
+                'skipped' => $skipped,
+                'due_remaining' => self::hasDueRetries(),
+                'duration_s' => $duration,
+            ], 'batch_summary', 20);
         }
     }
 

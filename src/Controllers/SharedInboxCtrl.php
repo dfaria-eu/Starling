@@ -17,7 +17,7 @@ class SharedInboxCtrl {
         // gets an immediate response and we deliver in the background.
         defer_after_response(static function (): void {
             if (throttle_allow('delivery_retry_queue', 10)) {
-                \App\ActivityPub\Delivery::processRetryQueue(10);
+                \App\ActivityPub\Delivery::processRetryQueue(\App\ActivityPub\Delivery::INBOX_DRAIN_BATCH);
             }
         });
         json_out(['status' => 'accepted'], 202);

@@ -154,7 +154,12 @@ class StatusModel
 
         // Record tombstone so we can return 410 Gone for future fetches
         if (!empty($s['uri'])) {
-            DB::insertIgnore('tombstones', ['uri' => $s['uri'], 'deleted_at' => now_iso()]);
+            DB::insertIgnore('tombstones', [
+                'uri'        => $s['uri'],
+                'user_id'    => (string)($s['user_id'] ?? ''),
+                'visibility' => (string)($s['visibility'] ?? 'public'),
+                'deleted_at' => now_iso(),
+            ]);
         }
 
         // Cascade: delete any local reblog statuses pointing at this status
@@ -165,6 +170,9 @@ class StatusModel
 
         if ($s['reply_to_id']) {
             DB::run('UPDATE statuses SET reply_count=MAX(0,reply_count-1) WHERE id=?', [$s['reply_to_id']]);
+        }
+        if (!empty($s['reblog_of_id'])) {
+            DB::run('UPDATE statuses SET reblog_count=MAX(0,reblog_count-1) WHERE id=?', [$s['reblog_of_id']]);
         }
         // Null-out quote references so posts quoting this one don't break
         DB::run('UPDATE statuses SET quote_of_id=NULL WHERE quote_of_id=?', [$id]);
@@ -195,7 +203,12 @@ class StatusModel
         if (!$s) return;
         // Record tombstone so we can return 410 Gone for future fetches
         if (!empty($s['uri'])) {
-            DB::insertIgnore('tombstones', ['uri' => $s['uri'], 'deleted_at' => now_iso()]);
+            DB::insertIgnore('tombstones', [
+                'uri'        => $s['uri'],
+                'user_id'    => (string)($s['user_id'] ?? ''),
+                'visibility' => (string)($s['visibility'] ?? 'public'),
+                'deleted_at' => now_iso(),
+            ]);
         }
         // Cascade reblogs
         $reblogRows = DB::all('SELECT id, user_id FROM statuses WHERE reblog_of_id=?', [$id]);
@@ -204,6 +217,9 @@ class StatusModel
         }
         if ($s['reply_to_id']) {
             DB::run('UPDATE statuses SET reply_count=MAX(0,reply_count-1) WHERE id=?', [$s['reply_to_id']]);
+        }
+        if (!empty($s['reblog_of_id'])) {
+            DB::run('UPDATE statuses SET reblog_count=MAX(0,reblog_count-1) WHERE id=?', [$s['reblog_of_id']]);
         }
         // Null-out quote references so posts quoting this one don't break
         DB::run('UPDATE statuses SET quote_of_id=NULL WHERE quote_of_id=?', [$id]);
@@ -241,15 +257,16 @@ class StatusModel
     {
         // public timeline = posts públicos locais + remotos.
         // O filtro local=true transforma-o em local timeline; remote=true mostra apenas remotos.
-        $blockedDomains = self::blockedDomains();
+        $blockedDomains = self::blockedDomains($viewerId);
         $domainFilter   = self::domainBlockSql('s.user_id', $blockedDomains);
 
         $blockFilter = '';
-        $p = [];
+        $p = [now_iso()];
         if ($viewerId) {
             $blockFilter  = " AND s.user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)";
             $blockFilter .= " AND s.user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)";
-            $p = [$viewerId, $viewerId];
+            $p[] = $viewerId;
+            $p[] = $viewerId;
         }
 
         $scopeFilter = '';
@@ -260,7 +277,11 @@ class StatusModel
         }
         $mediaFilter = $onlyMedia ? ' AND EXISTS (SELECT 1 FROM status_media sm WHERE sm.status_id=s.id)' : '';
 
-        $sql = "SELECT s.* FROM statuses s WHERE s.visibility='public'{$scopeFilter}{$mediaFilter}{$blockFilter}{$domainFilter}";
+        $sql = "SELECT s.* FROM statuses s
+                WHERE s.visibility='public'
+                  AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                  AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
+                  {$scopeFilter}{$mediaFilter}{$blockFilter}{$domainFilter}";
         if ($maxId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$maxId]);
             if (!$ref && ctype_digit($maxId)) {
@@ -305,7 +326,7 @@ class StatusModel
 
     public static function homeTimeline(string $userId, int $limit = 20, ?string $maxId = null, ?string $sinceId = null, ?string $minId = null): array
     {
-        $blockedDomains = self::blockedDomains();
+        $blockedDomains = self::blockedDomains($userId);
         $domainFilter   = self::domainBlockSql('s.user_id', $blockedDomains);
 
         $sql = "SELECT s.* FROM statuses s
@@ -324,10 +345,12 @@ class StatusModel
                     )
                 )
                 AND s.visibility IN ('public','unlisted','private')
+                AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                 AND s.user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
                 AND s.user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)
                 {$domainFilter}";
-        $p = [$userId, $userId, $userId, $userId, $userId];
+        $p = [$userId, $userId, $userId, now_iso(), $userId, $userId];
 
         // Paginação por (created_at, id) — cursor composto evita posts duplicados
         // quando há timestamps iguais.
@@ -389,6 +412,9 @@ class StatusModel
     {
         if (self::isExpiredLocalStatus($s)) {
             self::delete($s['id'], $s['user_id']);
+            return null;
+        }
+        if (!self::canView($s, $viewerId)) {
             return null;
         }
 
@@ -546,6 +572,12 @@ class StatusModel
         }
 
         $poll = PollModel::byStatusId($s['id']);
+        $quotesCount = (int)(DB::one(
+            "SELECT COUNT(*) c FROM statuses
+             WHERE quote_of_id=?
+               AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+            [$s['id'], now_iso()]
+        )['c'] ?? 0);
 
         return [
             'id'                     => $s['id'],
@@ -561,7 +593,7 @@ class StatusModel
             'replies_count'          => (int)$s['reply_count'],
             'reblogs_count'          => (int)$s['reblog_count'],
             'favourites_count'       => (int)$s['favourite_count'],
-            'quotes_count'           => 0,
+            'quotes_count'           => $quotesCount,
             'edited_at'              => $editedAt ? (iso_z($editedAt) ?? best_iso_timestamp($s['updated_at'] ?? null, $s['created_at'] ?? null, $s['id'] ?? null)) : null,
             'expires_at'             => iso_z($s['expires_at'] ?? null),
             'content'                => $content,
@@ -625,7 +657,7 @@ class StatusModel
     private static function statusWebUrl(array $s): string
     {
         $user = UserModel::byId($s['user_id']);
-        if ($user) return ap_url('@' . $user['username'] . '/' . $s['id']);
+        if ($user && empty($user['is_suspended'])) return ap_url('@' . $user['username'] . '/' . $s['id']);
         return $s['uri'];
     }
 
@@ -636,7 +668,10 @@ class StatusModel
     {
         // Local user: UUID format
         $local = UserModel::byId($userId);
-        if ($local) return UserModel::toMasto($local, $viewerId);
+        if ($local) {
+            if (!empty($local['is_suspended'])) return null;
+            return UserModel::toMasto($local, $viewerId);
+        }
 
         // Remote actor: user_id is an AP URL
         $remote = DB::one('SELECT * FROM remote_actors WHERE id=?', [$userId]);
@@ -761,6 +796,7 @@ class StatusModel
                     if (is_local($domain)) {
                         $u = UserModel::byUsername($uname);
                         if ($u) {
+                            if (!empty($u['is_suspended'])) continue;
                             $key = $seenKey('local', $u['id']);
                             if (isset($seen[$key])) continue;
                             $seen[$key] = true;
@@ -795,6 +831,7 @@ class StatusModel
             } else {
                 $u = UserModel::byUsername($m['username']);
                 if ($u) {
+                    if (!empty($u['is_suspended'])) continue;
                     $key = $seenKey('local', $u['id']);
                     if (isset($seen[$key])) continue;
                     $seen[$key] = true;
@@ -811,6 +848,16 @@ class StatusModel
      */
     public static function canView(array $s, ?string $viewerId): bool
     {
+        $expiresAt = (string)($s['expires_at'] ?? '');
+        if ($expiresAt !== '' && $expiresAt <= now_iso()) {
+            return false;
+        }
+        if (!str_starts_with((string)($s['user_id'] ?? ''), 'http')) {
+            $owner = UserModel::byId((string)$s['user_id']);
+            if ($owner && !empty($owner['is_suspended'])) {
+                return false;
+            }
+        }
         $v = $s['visibility'] ?? 'public';
         if ($v === 'public' || $v === 'unlisted') return true;
         if (!$viewerId) return false;
@@ -860,18 +907,25 @@ class StatusModel
      * Return list of blocked domains.
      * Cached per-request in a static variable.
      */
-    public static function blockedDomains(): array
+    public static function blockedDomains(?string $userId = null): array
     {
-        static $cache = null;
-        if ($cache === null) {
+        static $cache = [];
+        $cacheKey = $userId ?? '__global__';
+        if (!array_key_exists($cacheKey, $cache)) {
             try {
-                $rows  = DB::all('SELECT domain FROM domain_blocks');
-                $cache = array_column($rows, 'domain');
+                $globalRows = DB::all('SELECT domain FROM domain_blocks');
+                $domains = array_map('strtolower', array_column($globalRows, 'domain'));
+                if ($userId) {
+                    $userRows = DB::all('SELECT domain FROM user_domain_blocks WHERE user_id=?', [$userId]);
+                    $domains = array_merge($domains, array_map('strtolower', array_column($userRows, 'domain')));
+                }
+                $domains = array_values(array_unique(array_filter($domains, fn($d) => $d !== '')));
+                $cache[$cacheKey] = $domains;
             } catch (\Throwable) {
-                $cache = [];
+                $cache[$cacheKey] = [];
             }
         }
-        return $cache;
+        return $cache[$cacheKey];
     }
 
     /**

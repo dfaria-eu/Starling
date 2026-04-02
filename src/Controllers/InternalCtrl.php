@@ -13,7 +13,7 @@ class InternalCtrl
             err_out('Not Found', 404);
         }
 
-        \App\ActivityPub\Delivery::processRetryQueue(50);
+        \App\ActivityPub\Delivery::processRetryQueue(\App\ActivityPub\Delivery::INTERNAL_WAKE_BATCH);
 
         if (\App\ActivityPub\Delivery::hasDueRetries()) {
             defer_after_response(static function (): void {

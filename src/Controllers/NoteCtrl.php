@@ -23,7 +23,9 @@ class NoteCtrl {
         // Only serve public and unlisted posts — private/direct posts must not be
         // accessible without authentication and are not federatable via this endpoint.
         if (!in_array($s['visibility'], ['public', 'unlisted'])) err_out('Not found', 404);
+        if (!StatusModel::canView($s, null)) err_out('Not found', 404);
         $u = UserModel::byId($s['user_id']);
+        if ($u && !empty($u['is_suspended'])) $u = null;
         if (!$u) err_out('Not found', 404);
         $note = Builder::note($s, $u);
         $note = ['@context' => Builder::getContext()] + $note;

@@ -13,16 +13,20 @@ class TagCtrl {
              JOIN status_hashtags sh ON sh.status_id=s.id
              JOIN hashtags h ON h.id=sh.hashtag_id
              WHERE h.name=? AND s.visibility='public'
+               AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+               AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
              ORDER BY s.created_at DESC
              LIMIT 20 OFFSET ?",
-            [$tag, ($page - 1) * 20]
+            [$tag, now_iso(), ($page - 1) * 20]
         );
         $total = (int)(DB::one(
             "SELECT COUNT(*) c FROM statuses s
              JOIN status_hashtags sh ON sh.status_id=s.id
              JOIN hashtags h ON h.id=sh.hashtag_id
-             WHERE h.name=? AND s.visibility='public'",
-            [$tag]
+             WHERE h.name=? AND s.visibility='public'
+               AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+               AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))",
+            [$tag, now_iso()]
         )['c'] ?? 0);
 
         if (!isset($_GET['page'])) {

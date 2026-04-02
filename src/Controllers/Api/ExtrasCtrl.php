@@ -32,7 +32,7 @@ class SessionsCtrl
     public function index(array $p): void
     {
         $user = require_auth('read');
-        $currentToken = bearer();
+        $currentToken = (string)((auth_context()['token']['token'] ?? '') ?: '');
         $rows = DB::all(
             'SELECT t.token, t.scopes, t.created_at, t.last_used, a.name AS app_name, a.website AS app_website
                FROM oauth_tokens t
@@ -60,7 +60,7 @@ class SessionsCtrl
     public function delete(array $p): void
     {
         $user = require_auth('write');
-        $currentToken = bearer();
+        $currentToken = (string)((auth_context()['token']['token'] ?? '') ?: '');
         $tokenId = (string)($p['id'] ?? '');
         $body = req_body();
         $scope = (string)($body['scope'] ?? '');
@@ -73,12 +73,18 @@ class SessionsCtrl
         }
 
         if ($scope === 'others') {
-            $count = DB::count('oauth_tokens', 'user_id=? AND token<>?', [$user['id'], $currentToken]);
-            DB::delete('oauth_tokens', 'user_id=? AND token<>?', [$user['id'], $currentToken]);
+            if ($currentToken !== '') {
+                $count = DB::count('oauth_tokens', 'user_id=? AND token<>?', [$user['id'], $currentToken]);
+                DB::delete('oauth_tokens', 'user_id=? AND token<>?', [$user['id'], $currentToken]);
+            } else {
+                $count = DB::count('oauth_tokens', 'user_id=?', [$user['id']]);
+                DB::delete('oauth_tokens', 'user_id=?', [$user['id']]);
+            }
             json_out(['revoked' => $count, 'current' => false]);
         }
 
         if ($scope === 'current') {
+            if ($currentToken === '') err_out('No current token', 422);
             DB::delete('oauth_tokens', 'token=? AND user_id=?', [$currentToken, $user['id']]);
             json_out(['revoked' => 1, 'current' => true]);
         }
@@ -196,12 +202,12 @@ class FollowsCsvCtrl
 
         if ($type === 'following') {
             $rows = DB::all(
-                'SELECT following_id AS target_id FROM follows WHERE follower_id=? AND pending=0 ORDER BY created_at DESC',
+                'SELECT following_id AS target_id, notify FROM follows WHERE follower_id=? AND pending=0 ORDER BY created_at DESC',
                 [$user['id']]
             );
         } else {
             $rows = DB::all(
-                'SELECT follower_id AS target_id FROM follows WHERE following_id=? AND pending=0 ORDER BY created_at DESC',
+                'SELECT follower_id AS target_id, 0 AS notify FROM follows WHERE following_id=? AND pending=0 ORDER BY created_at DESC',
                 [$user['id']]
             );
         }
@@ -212,13 +218,15 @@ class FollowsCsvCtrl
             if ($targetId === '') continue;
             $local = UserModel::byId($targetId);
             if ($local) {
+                if (!empty($local['is_suspended'])) continue;
                 $acct = $local['username'] . '@' . AP_DOMAIN;
             } else {
                 $remote = DB::one('SELECT username, domain FROM remote_actors WHERE id=?', [$targetId]);
                 if (!$remote) continue;
                 $acct = $remote['username'] . '@' . $remote['domain'];
             }
-            $lines[] = '"' . str_replace('"', '""', $acct) . '",true,false,';
+            $notify = !empty($row['notify']) ? 'true' : 'false';
+            $lines[] = '"' . str_replace('"', '""', $acct) . '",true,' . $notify . ',';
         }
 
         header('Content-Type: text/csv; charset=utf-8');
@@ -264,10 +272,33 @@ class AnnouncementsCtrl
 
 class FiltersCtrl
 {
+    private const ALLOWED_CONTEXTS = ['home', 'notifications', 'public', 'thread', 'account'];
+    private const ALLOWED_ACTIONS  = ['warn', 'hide'];
+
     private function isV1(): bool
     {
         $path = (string)parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
         return str_starts_with($path, '/api/v1/filters');
+    }
+
+    private function normalizeContext(mixed $context): array
+    {
+        $items = is_array($context) ? $context : [];
+        $out = [];
+        foreach ($items as $item) {
+            $value = strtolower(trim((string)$item));
+            if ($value === '' || !in_array($value, self::ALLOWED_CONTEXTS, true)) continue;
+            if (!in_array($value, $out, true)) $out[] = $value;
+        }
+        return $out;
+    }
+
+    private function normalizeAction(array $d): string
+    {
+        $action = isset($d['filter_action'])
+            ? strtolower(trim((string)$d['filter_action']))
+            : (bool_val($d['irreversible'] ?? false) ? 'hide' : 'warn');
+        return in_array($action, self::ALLOWED_ACTIONS, true) ? $action : 'warn';
     }
 
     private function fmt(array $f): array
@@ -306,7 +337,22 @@ class FiltersCtrl
     private function normalizeKeywords(array $d): array
     {
         if (!empty($d['keywords_attributes']) && is_array($d['keywords_attributes'])) {
-            return $d['keywords_attributes'];
+            $seen = [];
+            $out = [];
+            foreach ($d['keywords_attributes'] as $kw) {
+                if (!is_array($kw)) continue;
+                $keyword = trim((string)($kw['keyword'] ?? ''));
+                if ($keyword === '') continue;
+                $key = mb_strtolower($keyword, 'UTF-8');
+                if (isset($seen[$key])) continue;
+                $seen[$key] = true;
+                $out[] = [
+                    'keyword'    => $keyword,
+                    'whole_word' => bool_val($kw['whole_word'] ?? false),
+                    '_destroy'   => bool_val($kw['_destroy'] ?? false),
+                ];
+            }
+            return $out;
         }
 
         $phrase = trim((string)($d['phrase'] ?? ''));
@@ -339,15 +385,16 @@ class FiltersCtrl
         $d    = req_body();
         $id   = uuid(); $now = now_iso();
         $keywords = $this->normalizeKeywords($d);
-        $action = isset($d['filter_action'])
-            ? (string)$d['filter_action']
-            : (bool_val($d['irreversible'] ?? false) ? 'hide' : 'warn');
+        $action = $this->normalizeAction($d);
+        $context = $this->normalizeContext($d['context'] ?? []);
+        if (!$keywords) err_out('At least one keyword required', 422);
+        if (!$context) err_out('At least one valid context required', 422);
 
         DB::insert('filters', [
             'id'        => $id,
             'user_id'   => $user['id'],
             'title'     => $d['title'] ?? ($keywords[0]['keyword'] ?? ''),
-            'context'   => json_encode($d['context'] ?? []),
+            'context'   => json_encode($context),
             'action'    => $action,
             'expires_at'=> ($d['expires_in'] ?? null) ? gmdate('Y-m-d\TH:i:s\Z', time() + (int)$d['expires_in']) : null,
             'created_at'=> $now,
@@ -375,17 +422,24 @@ class FiltersCtrl
 
         $upd = [];
         if (isset($d['title']))         $upd['title']   = $d['title'];
-        if (isset($d['context']))       $upd['context']  = json_encode($d['context']);
-        if (isset($d['filter_action'])) $upd['action']   = $d['filter_action'];
-        elseif (array_key_exists('irreversible', $d)) $upd['action'] = bool_val($d['irreversible']) ? 'hide' : 'warn';
+        if (isset($d['context'])) {
+            $context = $this->normalizeContext($d['context']);
+            if (!$context) err_out('At least one valid context required', 422);
+            $upd['context'] = json_encode($context);
+        }
+        if (isset($d['filter_action']) || array_key_exists('irreversible', $d)) {
+            $upd['action'] = $this->normalizeAction($d);
+        }
         if (isset($d['expires_in']))    $upd['expires_at'] = $d['expires_in']
             ? gmdate('Y-m-d\TH:i:s\Z', time() + (int)$d['expires_in']) : null;
         if ($upd) DB::update('filters', $upd, 'id=?', [$p['id']]);
 
         // Replace keywords if provided
         if (isset($d['keywords_attributes']) || array_key_exists('phrase', $d)) {
+            $keptKeywords = array_values(array_filter($keywords, fn(array $kw) => empty($kw['_destroy'])));
+            if (!$keptKeywords) err_out('At least one keyword required', 422);
             DB::delete('filter_keywords', 'filter_id=?', [$p['id']]);
-            foreach ($keywords as $kw) {
+            foreach ($keptKeywords as $kw) {
                 if (!empty($kw['_destroy'])) continue;
                 DB::insert('filter_keywords', [
                     'id'         => uuid(),
@@ -454,15 +508,17 @@ class SuggestionsCtrl
     {
         $user = require_auth('read');
         $uid  = $user['id'];
-        $blocked = array_map('strtolower', StatusModel::blockedDomains());
+        $blocked = StatusModel::blockedDomains($uid);
 
         // Local users (excluding self and already-followed)
         $locals = DB::all(
             "SELECT *, 'local' AS _src FROM users
              WHERE id != ? AND is_suspended = 0 AND is_bot = 0 AND discoverable = 1
                AND id NOT IN (SELECT following_id FROM follows WHERE follower_id=?)
+               AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
+               AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)
              ORDER BY follower_count DESC LIMIT ?",
-            [$uid, $uid, $limit]
+            [$uid, $uid, $uid, $uid, $limit]
         );
 
         $need = $limit - count($locals);
@@ -471,8 +527,10 @@ class SuggestionsCtrl
             // Remote actors not yet followed, ordered by follower_count
             $sql = "SELECT *, 'remote' AS _src FROM remote_actors
                     WHERE id NOT IN (SELECT following_id FROM follows WHERE follower_id=?)
+                      AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
+                      AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)
                       AND username != '' AND domain != '' AND is_bot = 0";
-            $params = [$uid];
+            $params = [$uid, $uid, $uid];
             if ($blocked) {
                 $sql .= ' AND LOWER(domain) NOT IN (' . implode(',', array_fill(0, count($blocked), '?')) . ')';
                 array_push($params, ...$blocked);
@@ -490,12 +548,13 @@ class SuggestionsCtrl
     {
         $limit = min((int)($_GET['limit'] ?? 40), 40);
         $rows  = $this->suggest($limit);
-        json_out(array_map(function ($u) {
+        json_out(array_values(array_filter(array_map(function ($u) {
             $account = ($u['_src'] ?? 'local') === 'remote'
                 ? UserModel::remoteToMasto($u)
                 : UserModel::toMasto($u);
+            if (!$account) return null;
             return ['source' => 'global', 'account' => $account];
-        }, $rows));
+        }, $rows))));
     }
 
     // GET /api/v1/follow_suggestions — returns [account] (formato v1)
@@ -503,11 +562,12 @@ class SuggestionsCtrl
     {
         $limit = min((int)($_GET['limit'] ?? 40), 40);
         $rows  = $this->suggest($limit);
-        json_out(array_map(function ($u) {
-            return ($u['_src'] ?? 'local') === 'remote'
+        json_out(array_values(array_filter(array_map(function ($u) {
+            $account = ($u['_src'] ?? 'local') === 'remote'
                 ? UserModel::remoteToMasto($u)
                 : UserModel::toMasto($u);
-        }, $rows));
+            return $account ?: null;
+        }, $rows))));
     }
 
     public function delete(array $p): void
@@ -523,6 +583,8 @@ class AccountLookupCtrl
 {
     public function show(array $p): void
     {
+        $viewer = authed_user();
+        $viewerId = $viewer['id'] ?? null;
         $acct = trim($_GET['acct'] ?? '');
         if (!$acct) err_out('acct required', 422);
 
@@ -532,18 +594,38 @@ class AccountLookupCtrl
             [$username, $domain] = explode('@', $acct, 2);
             if (is_local($domain)) {
                 $u = UserModel::byUsername($username);
-                if ($u) { json_out(UserModel::toMasto($u)); }
+                if ($u && !$this->isHiddenFromViewer($viewerId, $u['id'])) { json_out(UserModel::toMasto($u)); }
                 err_out('Not found', 404); // Don't attempt remote lookup for our own domain
+            }
+            if ($viewerId && in_array(strtolower($domain), StatusModel::blockedDomains($viewerId), true)) {
+                err_out('Not found', 404);
             }
             // Remote lookup
             $ra = \App\Models\RemoteActorModel::fetchByAcct($username, $domain);
-            if ($ra) json_out(UserModel::remoteToMasto($ra));
+            if ($ra && !$this->isHiddenFromViewer($viewerId, $ra['id'], $ra['domain'] ?? null)) json_out(UserModel::remoteToMasto($ra));
         } else {
             $u = UserModel::byUsername($acct);
-            if ($u) json_out(UserModel::toMasto($u));
+            if ($u && !$this->isHiddenFromViewer($viewerId, $u['id'])) json_out(UserModel::toMasto($u));
         }
 
         err_out('Not found', 404);
+    }
+
+    private function isHiddenFromViewer(?string $viewerId, string $targetId, ?string $domain = null): bool
+    {
+        if (!$viewerId) {
+            return false;
+        }
+        if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) {
+            return true;
+        }
+        if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) {
+            return true;
+        }
+        if ($domain !== null && in_array(strtolower($domain), StatusModel::blockedDomains($viewerId), true)) {
+            return true;
+        }
+        return false;
     }
 }
 
@@ -587,15 +669,17 @@ class FeaturedTagsCtrl
         $since = gmdate('Y-m-d\TH:i:s\Z', strtotime('-7 days'));
         $count = DB::count(
             'status_hashtags sh JOIN hashtags h ON h.id=sh.hashtag_id JOIN statuses s ON s.id=sh.status_id',
-            "h.name=? AND s.user_id=? AND s.created_at>? AND s.visibility IN ('public','unlisted')",
-            [$r['name'], $r['user_id'], $since]
+            "h.name=? AND s.user_id=? AND s.created_at>? AND s.visibility IN ('public','unlisted')
+             AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)",
+            [$r['name'], $r['user_id'], $since, now_iso()]
         );
         $last = DB::one(
             'SELECT MAX(s.created_at) last FROM status_hashtags sh
              JOIN hashtags h ON h.id=sh.hashtag_id
              JOIN statuses s ON s.id=sh.status_id
-             WHERE h.name=? AND s.user_id=? AND s.visibility IN (\'public\',\'unlisted\')',
-            [$r['name'], $r['user_id']]
+             WHERE h.name=? AND s.user_id=? AND s.visibility IN (\'public\',\'unlisted\')
+               AND (s.expires_at IS NULL OR s.expires_at=\'\' OR s.expires_at>?)',
+            [$r['name'], $r['user_id'], now_iso()]
         );
         return [
             'id'              => $r['id'],
@@ -615,21 +699,27 @@ class AccountFeaturedTagsCtrl
     public function show(array $p): void
     {
         // Public featured tags for any account (no auth required)
+        $owner = UserModel::byId((string)$p['id']);
+        if (!$owner || !empty($owner['is_suspended'])) {
+            err_out('Not found', 404);
+        }
         $rows = DB::all('SELECT * FROM featured_tags WHERE user_id=?', [$p['id']]);
         // p['id'] could be local user id — map directly
         json_out(array_map(function ($r) {
             $since = gmdate('Y-m-d\\TH:i:s\\Z', strtotime('-7 days'));
             $count = DB::count(
                 'status_hashtags sh JOIN hashtags h ON h.id=sh.hashtag_id JOIN statuses s ON s.id=sh.status_id',
-                "h.name=? AND s.user_id=? AND s.created_at>? AND s.visibility IN ('public','unlisted')",
-                [$r['name'], $r['user_id'], $since]
+                "h.name=? AND s.user_id=? AND s.created_at>? AND s.visibility IN ('public','unlisted')
+                 AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)",
+                [$r['name'], $r['user_id'], $since, now_iso()]
             );
             $last = DB::one(
                 'SELECT MAX(s.created_at) last FROM status_hashtags sh
                  JOIN hashtags h ON h.id=sh.hashtag_id
                  JOIN statuses s ON s.id=sh.status_id
-                 WHERE h.name=? AND s.user_id=? AND s.visibility IN (\'public\',\'unlisted\')',
-                [$r['name'], $r['user_id']]
+                 WHERE h.name=? AND s.user_id=? AND s.visibility IN (\'public\',\'unlisted\')
+                   AND (s.expires_at IS NULL OR s.expires_at=\'\' OR s.expires_at>?)',
+                [$r['name'], $r['user_id'], now_iso()]
             );
             return [
                 'id'             => $r['id'],
@@ -652,7 +742,7 @@ class FeaturedTagsSuggestionsCtrl
         // Suggest hashtags the user has used most in last 30 days
         $since = gmdate('Y-m-d\\TH:i:s\\Z', strtotime('-30 days'));
         $rows = DB::all(
-            'SELECT h.id,
+            "SELECT h.id,
                     h.name,
                     COUNT(*) as cnt,
                     MAX(CASE WHEN tf.user_id IS NOT NULL THEN 1 ELSE 0 END) AS following
@@ -662,9 +752,10 @@ class FeaturedTagsSuggestionsCtrl
              LEFT JOIN tag_follows tf ON tf.hashtag_id=h.id AND tf.user_id=?
              LEFT JOIN featured_tags ft ON ft.user_id=? AND ft.name=h.name
              WHERE s.user_id=? AND s.created_at>?
+               AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
                AND ft.id IS NULL
-             GROUP BY h.id, h.name ORDER BY cnt DESC LIMIT 10',
-            [$user['id'], $user['id'], $user['id'], $since]
+             GROUP BY h.id, h.name ORDER BY cnt DESC LIMIT 10",
+            [$user['id'], $user['id'], $user['id'], $since, now_iso()]
         );
         json_out(array_map(fn($r) => [
             'id'        => $r['id'],
@@ -697,14 +788,15 @@ class TagsApiCtrl
             'id'        => $tagId,
             'name'      => $name,
             'url'       => $url,
-            'history'   => self::tagHistory($name),
+            'history'   => self::tagHistory($name, $userId),
             'following' => $following,
         ];
     }
 
-    private static function tagHistory(string $name): array
+    private static function tagHistory(string $name, ?string $userId = null): array
     {
         $since = gmdate('Y-m-d', strtotime('-6 days')) . 'T00:00:00Z';
+        $domainFilter = StatusModel::domainBlockSql('s.user_id', StatusModel::blockedDomains($userId));
         $rows  = DB::all(
             "SELECT strftime('%Y-%m-%d', s.created_at) day,
                     COUNT(*) uses,
@@ -713,6 +805,8 @@ class TagsApiCtrl
              JOIN hashtags h ON h.id = sh.hashtag_id
              JOIN statuses s ON s.id = sh.status_id
             WHERE h.name = ? AND s.created_at >= ? AND s.visibility IN ('public','unlisted')
+              AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
+              $domainFilter
              GROUP BY day",
             [mb_strtolower($name, 'UTF-8'), $since]
         );

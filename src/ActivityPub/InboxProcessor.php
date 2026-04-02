@@ -7,6 +7,45 @@ use App\Models\{DB, UserModel, StatusModel, RemoteActorModel, CryptoModel, PollM
 
 class InboxProcessor
 {
+    private static function isLegacyGhostBodySignatureCompatible(array $activity, string $actorId, string $type): bool
+    {
+        if (!in_array($type, ['Follow', 'Accept', 'Reject'], true)) return false;
+        if ($actorId === '') return false;
+
+        $signature = $activity['signature'] ?? null;
+        if (!is_array($signature)) return false;
+        if (($signature['type'] ?? '') !== 'RsaSignature2017') return false;
+
+        $creator = trim((string)($signature['creator'] ?? ''));
+        $created = trim((string)($signature['created'] ?? ''));
+        $value   = trim((string)($signature['signatureValue'] ?? ''));
+        if ($creator === '' || $created === '' || $value === '') return false;
+
+        $expectedCreator = rtrim($actorId, '/') . '#main-key';
+        if ($creator !== $expectedCreator) return false;
+
+        $actorHost = strtolower((string)(parse_url($actorId, PHP_URL_HOST) ?? ''));
+        $creatorHost = strtolower((string)(parse_url($creator, PHP_URL_HOST) ?? ''));
+        if ($actorHost === '' || $actorHost !== $creatorHost) return false;
+
+        $actorPath = (string)(parse_url($actorId, PHP_URL_PATH) ?? '');
+        if (!str_contains($actorPath, '/.ghost/activitypub/')) return false;
+
+        // Try to fetch the actor, but don't hard-fail if the fetch fails.
+        // The HTTP Signature verification already attempted a forced fetch; if the
+        // Ghost server was temporarily unreachable both attempts would fail, causing
+        // valid Ghost activities to be rejected. Since we already confirmed this is
+        // a Ghost instance via the path check, accept the activity even when the
+        // actor can't be fetched — it will be fetched later when needed.
+        $actor = RemoteActorModel::fetch($actorId);
+        if ($actor && trim((string)($actor['public_key'] ?? '')) === '') return false;
+
+        $createdTs = strtotime($created);
+        if ($createdTs === false || abs(time() - $createdTs) > 43200) return false;
+
+        return true;
+    }
+
     private static function findRemoteNotification(string $userId, string $fromAcctId, string $type, ?string $statusId = null): ?array
     {
         return DB::one(
@@ -91,7 +130,10 @@ class InboxProcessor
         $isAccountDelete = ($type === 'Delete' && $objId !== '' && $objId === $actorId);
 
         $hasHttpSignature = !empty($headers['signature']);
-        $httpSigOk        = $hasHttpSignature ? CryptoModel::verifyIncoming($headers, $method, $path, $rawBody) : false;
+        $httpSigResult    = $hasHttpSignature
+            ? CryptoModel::verifyIncomingDetailed($headers, $method, $path, $rawBody)
+            : ['ok' => false, 'error' => '', 'key_id' => '', 'actor_url' => '', 'algorithm' => '', 'headers' => ''];
+        $httpSigOk        = (bool)$httpSigResult['ok'];
         $proofSigOk       = false;
 
         if ($hasHttpSignature) {
@@ -99,34 +141,60 @@ class InboxProcessor
                 $proofSigOk = CryptoModel::verifyObjectSignature($activity, $actorId);
                 if ($proofSigOk) {
                     $sigError = 'Verified via DataIntegrityProof fallback';
-                } elseif ($isAccountDelete) {
+                } else {
+                    $rsaSigResult = CryptoModel::verifyRsaSignature2017Detailed($activity, $actorId);
+                    if ($rsaSigResult['ok']) {
+                    $proofSigOk = true;
+                    $sigError = 'Verified via RsaSignature2017 body signature';
+                    } elseif (self::isLegacyGhostBodySignatureCompatible($activity, $actorId, (string)$type)) {
+                    $sigError = 'Accepted via Ghost legacy body signature compatibility';
+                    } elseif ($isAccountDelete) {
                     // Verification failed because the actor is gone — accept anyway.
                     // Log without error so it doesn't flood the error list.
                     $sigError = '';
-                } elseif ($type === 'Delete' && !CryptoModel::fetchPublicKey($actorId)) {
+                    } elseif ($type === 'Delete' && !CryptoModel::fetchPublicKey($actorId)) {
                     // Post-Delete from an actor whose key can no longer be fetched
                     // (account deleted on their server). Mastodon sends individual post
                     // Tombstones after the account Delete, by which point the key is gone.
                     // Accepting is safe — worst case a cached post is removed.
                     $sigError = '';
-                } else {
+                    } else {
+                    $detail = trim((string)($httpSigResult['error'] ?? ''));
+                    $algo = trim((string)($httpSigResult['algorithm'] ?? ''));
+                    $headersList = trim((string)($httpSigResult['headers'] ?? ''));
                     $sigError = 'HTTP Signature verification failed';
+                    if ($detail !== '') $sigError .= ' [' . $detail . ']';
+                    $rsaDetail = trim((string)($rsaSigResult['error'] ?? ''));
+                    if ($rsaDetail !== '') $sigError .= ' rsa=' . $rsaDetail;
+                    if ($algo !== '') $sigError .= ' alg=' . $algo;
+                    if ($headersList !== '') $sigError .= ' headers=' . $headersList;
                     self::log($actorId, $type, $activity, $sigError);
                     return false;
+                    }
                 }
             }
         } else {
             $proofSigOk = CryptoModel::verifyObjectSignature($activity, $actorId);
             if ($proofSigOk) {
                 $sigError = 'Verified via DataIntegrityProof';
-            } elseif (!$isAccountDelete) {
+            } else {
+                $rsaSigResult = CryptoModel::verifyRsaSignature2017Detailed($activity, $actorId);
+                if ($rsaSigResult['ok']) {
+                $proofSigOk = true;
+                $sigError = 'Verified via RsaSignature2017 body signature';
+                } elseif (self::isLegacyGhostBodySignatureCompatible($activity, $actorId, (string)$type)) {
+                $sigError = 'Accepted via Ghost legacy body signature compatibility';
+                } elseif (!$isAccountDelete) {
                 // Unsigned requests are only tolerated for actor tombstones. Accepting unsigned
                 // post Deletes would let anyone forge a cache purge for arbitrary remote content.
                 $sigError = 'Missing HTTP Signature — rejected';
+                $rsaDetail = trim((string)($rsaSigResult['error'] ?? ''));
+                if ($rsaDetail !== '') $sigError .= ' rsa=' . $rsaDetail;
                 self::log($actorId, $type, $activity, $sigError);
                 return false;
-            } else {
+                } else {
                 $sigError = 'No HTTP Signature (Delete exempted)';
+                }
             }
         }
 
@@ -178,6 +246,30 @@ class InboxProcessor
             // Threads (and some servers) re-send Create with the same id for edits
             $now = now_iso();
             $newContent = self::apExtractContent($obj);
+            $oldParent = null;
+            $oldReplyToId = (string)($existing['reply_to_id'] ?? '');
+            if ($oldReplyToId !== '') {
+                $oldParent = StatusModel::byId($oldReplyToId);
+                if (!$oldParent && str_starts_with($oldReplyToId, 'http')) {
+                    $oldParent = StatusModel::byUri($oldReplyToId);
+                }
+            }
+
+            $replyToId  = null;
+            $replyToUid = null;
+            $inReplyTo  = $obj['inReplyTo'] ?? null;
+            if ($inReplyTo && is_string($inReplyTo)) {
+                $parent = StatusModel::byUri($inReplyTo);
+                if (!$parent && !is_local(parse_url($inReplyTo, PHP_URL_HOST) ?? '')) {
+                    $parent = self::fetchRemoteNote($inReplyTo, false, 2);
+                }
+                if ($parent) {
+                    $replyToId  = $parent['id'];
+                    $replyToUid = $parent['user_id'];
+                } else {
+                    $replyToId = $inReplyTo;
+                }
+            }
 
             // Record previous version in edit history
             DB::insertIgnore('status_edits', [
@@ -192,9 +284,95 @@ class InboxProcessor
             DB::update('statuses', [
                 'content'    => $newContent !== '' ? $newContent : $existing['content'],
                 'cw'         => self::apStr($obj['summary'] ?? '', $existing['cw']),
+                'visibility' => self::apVisibility($obj['to'] ?? [], $obj['cc'] ?? []),
+                'language'   => is_array($obj['contentMap'] ?? null)
+                                    ? (array_key_first((array)$obj['contentMap']) ?? ($existing['language'] ?? 'en'))
+                                    : self::apStr($obj['language'] ?? ($existing['language'] ?? 'en'), $existing['language'] ?? 'en'),
                 'sensitive'  => (int)($obj['sensitive'] ?? $existing['sensitive']),
+                'reply_to_id' => $replyToId,
+                'reply_to_uid' => $replyToUid,
                 'updated_at' => self::apTimestamp($obj['updated'] ?? null, $now),
             ], 'uri=? AND user_id=?', [$uri, $actorId]);
+
+            $quoteId = null;
+            $quoteUri  = $obj['quoteUri'] ?? $obj['quoteUrl'] ?? $obj['_misskey_quote'] ?? null;
+            if ($quoteUri && is_string($quoteUri)) {
+                $quotedStatus = StatusModel::byUri($quoteUri);
+                if (!$quotedStatus) {
+                    $quotedStatus = self::fetchRemoteNote($quoteUri, true, 0);
+                }
+                $quoteId = $quotedStatus ? $quotedStatus['id'] : null;
+            }
+            DB::run('UPDATE statuses SET quote_of_id=? WHERE id=?', [$quoteId, $existing['id']]);
+
+            if (array_key_exists('attachment', $obj)) {
+                DB::run(
+                    'DELETE FROM media_attachments WHERE status_id IS NULL AND id IN (SELECT media_id FROM status_media WHERE status_id=?)',
+                    [$existing['id']]
+                );
+                DB::delete('status_media', 'status_id=?', [$existing['id']]);
+                foreach (self::apList($obj['attachment'] ?? []) as $pos => $att) {
+                    if (!is_array($att)) continue;
+                    $url  = self::attachmentUrl($att);
+                    $mime = self::apStr($att['mediaType'] ?? '');
+                    if (!$url) continue;
+                    $type = match(true) {
+                        str_starts_with($mime, 'video/') => 'video',
+                        str_starts_with($mime, 'audio/') => 'audio',
+                        str_starts_with($mime, 'image/') => 'image',
+                        default => 'unknown',
+                    };
+                    $mid  = uuid();
+                    DB::insertIgnore('media_attachments', [
+                        'id'          => $mid,
+                        'user_id'     => $existing['user_id'],
+                        'status_id'   => null,
+                        'type'        => $type,
+                        'url'         => $url,
+                        'preview_url' => $url,
+                        'description' => self::apStr($att['name'] ?? ''),
+                        'blurhash'    => self::apStr($att['blurhash'] ?? ''),
+                        'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
+                        'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                        'created_at'  => $now,
+                    ]);
+                    DB::insertIgnore('status_media', [
+                        'status_id' => $existing['id'],
+                        'media_id'  => $mid,
+                        'position'  => $pos,
+                    ]);
+                }
+            }
+
+            if (isset($obj['tag'])) {
+                DB::delete('status_hashtags', 'status_id=?', [$existing['id']]);
+                foreach (self::apList($obj['tag'] ?? []) as $tag) {
+                    if (!is_array($tag) || ($tag['type'] ?? '') !== 'Hashtag') continue;
+                    $tagName = strtolower(ltrim((string)($tag['name'] ?? ''), '#'));
+                    if ($tagName === '') continue;
+                    DB::insertIgnore('hashtags', ['id' => uuid(), 'name' => $tagName, 'created_at' => $now]);
+                    $ht = DB::one('SELECT id FROM hashtags WHERE name=?', [$tagName]);
+                    if ($ht) DB::insertIgnore('status_hashtags', ['status_id' => $existing['id'], 'hashtag_id' => $ht['id']]);
+                }
+            }
+
+            if (($obj['type'] ?? '') === 'Question') {
+                \App\Models\PollModel::syncRemoteQuestion($existing['id'], $obj);
+            }
+
+            if ($oldParent && (string)($oldParent['id'] ?? '') !== '') {
+                self::reconcileRepliesForParent((string)$oldParent['id'], (string)($oldParent['uri'] ?? ''), (string)$oldParent['user_id']);
+            }
+            if ($replyToId !== '' && $replyToId !== null) {
+                $newParent = StatusModel::byId((string)$replyToId);
+                if (!$newParent && str_starts_with((string)$replyToId, 'http')) {
+                    $newParent = StatusModel::byUri((string)$replyToId);
+                }
+                if ($newParent) {
+                    self::reconcileRepliesForParent((string)$newParent['id'], (string)($newParent['uri'] ?? ''), (string)$newParent['user_id']);
+                }
+            }
+            self::reconcileRepliesForParent($existing['id'], $uri, (string)$existing['user_id']);
             return true;
         }
 
@@ -419,7 +597,8 @@ class InboxProcessor
         $choices = PollModel::choicePositionsByTitles($poll, $titles);
         if (!$choices) return true;
 
-        PollModel::vote($poll, $actorId, array_map('strval', $choices), true);
+        $votedPoll = PollModel::tryVote($poll, $actorId, array_map('strval', $choices), true);
+        if (!$votedPoll) return true;
 
         $owner = UserModel::byId($status['user_id']);
         if ($owner) {
@@ -458,17 +637,115 @@ class InboxProcessor
             if (!$refreshExisting) return $existing;
 
             $now = now_iso();
+            $oldParent = null;
+            $oldReplyToId = (string)($existing['reply_to_id'] ?? '');
+            if ($oldReplyToId !== '') {
+                $oldParent = StatusModel::byId($oldReplyToId);
+                if (!$oldParent && str_starts_with($oldReplyToId, 'http')) {
+                    $oldParent = StatusModel::byUri($oldReplyToId);
+                }
+            }
+
+            $replyToId  = null;
+            $replyToUid = null;
+            $inReplyTo  = $data['inReplyTo'] ?? null;
+            if ($inReplyTo && is_string($inReplyTo)) {
+                $parent = StatusModel::byUri($inReplyTo);
+                if (!$parent && $ancestorDepth > 0 && !is_local(parse_url($inReplyTo, PHP_URL_HOST) ?? '')) {
+                    $parent = self::fetchRemoteNote($inReplyTo, false, $ancestorDepth - 1);
+                }
+                if ($parent) {
+                    $replyToId  = $parent['id'];
+                    $replyToUid = $parent['user_id'];
+                } else {
+                    $replyToId = $inReplyTo;
+                }
+            }
+
             DB::update('statuses', [
                 'content'    => self::apExtractContent($data) ?: $existing['content'],
                 'cw'         => self::apStr($data['summary'] ?? '', $existing['cw']),
+                'visibility' => self::apVisibility($data['to'] ?? [], $data['cc'] ?? []),
+                'language'   => is_array($data['contentMap'] ?? null)
+                                    ? (array_key_first((array)$data['contentMap']) ?? ($existing['language'] ?? 'en'))
+                                    : self::apStr($data['language'] ?? ($existing['language'] ?? 'en'), $existing['language'] ?? 'en'),
                 'sensitive'  => (int)($data['sensitive'] ?? $existing['sensitive']),
+                'reply_to_id' => $replyToId,
+                'reply_to_uid' => $replyToUid,
                 'updated_at' => self::apTimestamp($data['updated'] ?? null, $now),
             ], 'id=?', [$existing['id']]);
+
+            $quoteId = null;
+            $qUri = $data['quoteUri'] ?? $data['quoteUrl'] ?? $data['_misskey_quote'] ?? null;
+            if ($qUri && is_string($qUri) && $qUri !== $noteUri) {
+                $qStatus = StatusModel::byUri($qUri)
+                    ?? self::fetchRemoteNote($qUri, false, 0);
+                $quoteId = $qStatus['id'] ?? null;
+            }
+            DB::run('UPDATE statuses SET quote_of_id=? WHERE id=?', [$quoteId, $existing['id']]);
+
+            DB::run(
+                'DELETE FROM media_attachments WHERE status_id IS NULL AND id IN (SELECT media_id FROM status_media WHERE status_id=?)',
+                [$existing['id']]
+            );
+            DB::delete('status_media', 'status_id=?', [$existing['id']]);
+            foreach (self::apList($data['attachment'] ?? []) as $pos => $att) {
+                if (!is_array($att)) continue;
+                $url = self::attachmentUrl($att);
+                if (!$url) continue;
+                $mime = self::apStr($att['mediaType'] ?? '');
+                $type = match(true) {
+                    str_starts_with($mime, 'video/') => 'video',
+                    str_starts_with($mime, 'audio/') => 'audio',
+                    str_starts_with($mime, 'image/') => 'image',
+                    default => 'unknown',
+                };
+                $mid  = uuid();
+                DB::insertIgnore('media_attachments', [
+                    'id'          => $mid,
+                    'user_id'     => $existing['user_id'],
+                    'status_id'   => null,
+                    'type'        => $type,
+                    'url'         => $url,
+                    'preview_url' => $url,
+                    'description' => self::apStr($att['name'] ?? ''),
+                    'blurhash'    => self::apStr($att['blurhash'] ?? ''),
+                    'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
+                    'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                    'created_at'  => $now,
+                ]);
+                DB::insertIgnore('status_media', ['status_id' => $existing['id'], 'media_id' => $mid, 'position' => $pos]);
+            }
+
+            DB::delete('status_hashtags', 'status_id=?', [$existing['id']]);
+            foreach (self::apList($data['tag'] ?? []) as $tag) {
+                if (!is_array($tag) || ($tag['type'] ?? '') !== 'Hashtag') continue;
+                $tagName = strtolower(ltrim((string)($tag['name'] ?? ''), '#'));
+                if ($tagName === '') continue;
+                $ht = DB::one('SELECT id FROM hashtags WHERE name=?', [$tagName]);
+                if (!$ht) {
+                    DB::insertIgnore('hashtags', ['id' => uuid(), 'name' => $tagName, 'created_at' => $now]);
+                    $ht = DB::one('SELECT id FROM hashtags WHERE name=?', [$tagName]);
+                }
+                if ($ht) DB::insertIgnore('status_hashtags', ['status_id' => $existing['id'], 'hashtag_id' => $ht['id']]);
+            }
 
             if (($data['type'] ?? '') === 'Question') {
                 \App\Models\PollModel::syncRemoteQuestion($existing['id'], $data);
             }
 
+            if ($oldParent && (string)($oldParent['id'] ?? '') !== '') {
+                self::reconcileRepliesForParent((string)$oldParent['id'], (string)($oldParent['uri'] ?? ''), (string)$oldParent['user_id']);
+            }
+            if ($replyToId !== '' && $replyToId !== null) {
+                $newParent = StatusModel::byId((string)$replyToId);
+                if (!$newParent && str_starts_with((string)$replyToId, 'http')) {
+                    $newParent = StatusModel::byUri((string)$replyToId);
+                }
+                if ($newParent) {
+                    self::reconcileRepliesForParent((string)$newParent['id'], (string)($newParent['uri'] ?? ''), (string)$newParent['user_id']);
+                }
+            }
             self::reconcileRepliesForParent($existing['id'], $noteUri, (string)$existing['user_id']);
 
             return StatusModel::byUri($noteUri);
@@ -522,7 +799,7 @@ class InboxProcessor
         ]);
 
         // Store media attachments of the fetched note (images, videos)
-        foreach ($data['attachment'] ?? [] as $pos => $att) {
+        foreach (self::apList($data['attachment'] ?? []) as $pos => $att) {
             if (!is_array($att)) continue;
             $url = self::attachmentUrl($att);
             if (!$url) continue;
@@ -570,6 +847,15 @@ class InboxProcessor
             \App\Models\PollModel::syncRemoteQuestion($sid, $data);
         }
 
+        foreach (self::apList($data['tag'] ?? []) as $tag) {
+            if (!is_array($tag) || ($tag['type'] ?? '') !== 'Hashtag') continue;
+            $tagName = strtolower(ltrim($tag['name'] ?? '', '#'));
+            if (!$tagName) continue;
+            DB::insertIgnore('hashtags', ['id' => uuid(), 'name' => $tagName, 'created_at' => $now]);
+            $ht = DB::one('SELECT id FROM hashtags WHERE name=?', [$tagName]);
+            if ($ht) DB::insertIgnore('status_hashtags', ['status_id' => $sid, 'hashtag_id' => $ht['id']]);
+        }
+
         self::reconcileRepliesForParent($sid, $noteUri, $actorId ?: $noteUri);
 
         return StatusModel::byUri($noteUri);
@@ -612,6 +898,9 @@ class InboxProcessor
             DB::update('statuses', [
                 'content'    => $newContent !== '' ? $newContent : $existing['content'],
                 'cw'         => self::apStr($obj['summary'] ?? '', $existing['cw']),
+                'language'   => is_array($obj['contentMap'] ?? null)
+                                    ? (array_key_first((array)$obj['contentMap']) ?? ($existing['language'] ?? 'en'))
+                                    : self::apStr($obj['language'] ?? ($existing['language'] ?? 'en'), $existing['language'] ?? 'en'),
                 'sensitive'  => (int)($obj['sensitive'] ?? $existing['sensitive']),
                 'updated_at' => self::apTimestamp($obj['updated'] ?? null, $now),
             ], 'uri=?', [$uri]);
@@ -620,10 +909,56 @@ class InboxProcessor
                 \App\Models\PollModel::syncRemoteQuestion($existing['id'], $obj);
             }
 
+            if (array_key_exists('quoteUri', $obj) || array_key_exists('quoteUrl', $obj) || array_key_exists('_misskey_quote', $obj)) {
+                $qUri = $obj['quoteUri'] ?? $obj['quoteUrl'] ?? $obj['_misskey_quote'] ?? null;
+                $quoteId = null;
+                if ($qUri && is_string($qUri)) {
+                    $quotedStatus = StatusModel::byUri($qUri)
+                        ?? self::fetchRemoteNote($qUri, true, 0);
+                    $quoteId = $quotedStatus['id'] ?? null;
+                }
+                DB::run('UPDATE statuses SET quote_of_id=? WHERE id=?', [$quoteId, $existing['id']]);
+            }
+
+            if (array_key_exists('attachment', $obj)) {
+                DB::run(
+                    'DELETE FROM media_attachments WHERE status_id IS NULL AND id IN (SELECT media_id FROM status_media WHERE status_id=?)',
+                    [$existing['id']]
+                );
+                DB::delete('status_media', 'status_id=?', [$existing['id']]);
+                foreach (self::apList($obj['attachment'] ?? []) as $pos => $att) {
+                    if (!is_array($att)) continue;
+                    $url = self::attachmentUrl($att);
+                    if (!$url) continue;
+                    $mime = self::apStr($att['mediaType'] ?? '');
+                    $type = match (true) {
+                        str_starts_with($mime, 'video/') => 'video',
+                        str_starts_with($mime, 'audio/') => 'audio',
+                        str_starts_with($mime, 'image/') => 'image',
+                        default => 'unknown',
+                    };
+                    $mid = uuid();
+                    DB::insertIgnore('media_attachments', [
+                        'id'          => $mid,
+                        'user_id'     => $existing['user_id'],
+                        'status_id'   => null,
+                        'type'        => $type,
+                        'url'         => $url,
+                        'preview_url' => $url,
+                        'description' => self::apStr($att['name'] ?? ''),
+                        'blurhash'    => self::apStr($att['blurhash'] ?? ''),
+                        'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
+                        'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                        'created_at'  => $now,
+                    ]);
+                    DB::insertIgnore('status_media', ['status_id' => $existing['id'], 'media_id' => $mid, 'position' => $pos]);
+                }
+            }
+
             // Re-index hashtags if tag array is present in the Update
             if (isset($obj['tag'])) {
                 DB::delete('status_hashtags', 'status_id=?', [$existing['id']]);
-                foreach ($obj['tag'] as $tag) {
+                foreach (self::apList($obj['tag'] ?? []) as $tag) {
                     if (!is_array($tag) || ($tag['type'] ?? '') !== 'Hashtag') continue;
                     $tagName = strtolower(ltrim($tag['name'] ?? '', '#'));
                     if (!$tagName) continue;
@@ -667,8 +1002,17 @@ class InboxProcessor
             foreach ($localFollowers as $row) {
                 DB::run('UPDATE users SET following_count=MAX(0,following_count-1) WHERE id=?', [$row['follower_id']]);
             }
+            $localTargets = DB::all(
+                'SELECT following_id FROM follows WHERE follower_id=? AND pending=0
+                 AND following_id IN (SELECT id FROM users)',
+                [$actorId]
+            );
+            foreach ($localTargets as $row) {
+                DB::run('UPDATE users SET follower_count=MAX(0,follower_count-1) WHERE id=?', [$row['following_id']]);
+            }
             DB::delete('remote_actors', 'id=?', [$actorId]);
             DB::delete('follows', 'follower_id=? OR following_id=?', [$actorId, $actorId]);
+            DB::delete('notifications', 'from_acct_id=?', [$actorId]);
         }
 
         return true;
@@ -735,6 +1079,7 @@ class InboxProcessor
                 if (!$row['pending']) {
                     DB::run('UPDATE users SET follower_count=MAX(0,follower_count-1) WHERE id=?', [$target['id']]);
                 }
+                DB::delete('notifications', 'user_id=? AND from_acct_id=? AND type IN (?, ?)', [$target['id'], $actorId, 'follow', 'follow_request']);
             }
             return true;
         }
@@ -747,6 +1092,7 @@ class InboxProcessor
                 DB::delete('favourites', 'user_id=? AND status_id=?', [$actorId, $s['id']]);
                 if ($wasFavourited) {
                     DB::run('UPDATE statuses SET favourite_count=MAX(0,favourite_count-1) WHERE id=?', [$s['id']]);
+                    DB::delete('notifications', 'user_id=? AND from_acct_id=? AND status_id=? AND type=?', [$s['user_id'], $actorId, $s['id'], 'favourite']);
                 }
             }
             return true;
@@ -761,10 +1107,14 @@ class InboxProcessor
                 $boostUri = is_string($inner['id'] ?? null) ? $inner['id'] : '';
                 if ($boostUri) {
                     $boost = StatusModel::byUri($boostUri);
-                    if ($boost) DB::delete('statuses', 'id=?', [$boost['id']]);
+                    if ($boost) StatusModel::deleteRemote($boost['id']);
                 }
                 // Fallback: delete any remaining boost rows for this actor+post
-                DB::delete('statuses', 'user_id=? AND reblog_of_id=?', [$actorId, $s['id']]);
+                $boostRows = DB::all('SELECT id FROM statuses WHERE user_id=? AND reblog_of_id=?', [$actorId, $s['id']]);
+                foreach ($boostRows as $boostRow) {
+                    StatusModel::deleteRemote((string)$boostRow['id']);
+                }
+                DB::delete('notifications', 'user_id=? AND from_acct_id=? AND status_id=? AND type=?', [$s['user_id'], $actorId, $s['id'], 'reblog']);
             }
             return true;
         }
@@ -824,6 +1174,8 @@ class InboxProcessor
             // Match only the specific pending Follow referenced by the URI.
             $follower = self::resolveLocalFollowerFromFollowId($inner, $actorId);
             if (!$follower) return false;
+            $row = DB::one('SELECT pending FROM follows WHERE follower_id=? AND following_id=?', [$follower['id'], $actorId]);
+            if (!$row || !(int)$row['pending']) return true;
             DB::delete('follows', 'follower_id=? AND following_id=?', [$follower['id'], $actorId]);
             return true;
         }
@@ -834,6 +1186,8 @@ class InboxProcessor
         $follower    = self::resolveLocalUser($followerUrl);
         if (!$follower) return false;
 
+        $row = DB::one('SELECT pending FROM follows WHERE follower_id=? AND following_id=?', [$follower['id'], $actorId]);
+        if (!$row || !(int)$row['pending']) return true;
         DB::delete('follows', 'follower_id=? AND following_id=?', [$follower['id'], $actorId]);
         return true;
     }
@@ -993,12 +1347,27 @@ class InboxProcessor
                     RemoteActorModel::fetch($origActorId);
                     $origId = flake_id();
                     $now2   = now_iso();
+                    $replyToId  = null;
+                    $replyToUid = null;
+                    $inReplyTo  = $data['inReplyTo'] ?? null;
+                    if ($inReplyTo && is_string($inReplyTo)) {
+                        $parent = StatusModel::byUri($inReplyTo);
+                        if (!$parent && !is_local(parse_url($inReplyTo, PHP_URL_HOST) ?? '')) {
+                            $parent = self::fetchRemoteNote($inReplyTo, false, 2);
+                        }
+                        if ($parent) {
+                            $replyToId  = $parent['id'];
+                            $replyToUid = $parent['user_id'];
+                        } else {
+                            $replyToId = $inReplyTo;
+                        }
+                    }
                     DB::insertIgnore('statuses', [
                         'id'          => $origId,
                         'uri'         => $objUri,
                         'user_id'     => $origActorId,
-                        'reply_to_id' => null,
-                        'reply_to_uid'=> null,
+                        'reply_to_id' => $replyToId,
+                        'reply_to_uid'=> $replyToUid,
                         'reblog_of_id'=> null,
                         'quote_of_id' => null,
                         'content'     => self::apExtractContent($data),
@@ -1016,7 +1385,7 @@ class InboxProcessor
                         'updated_at'  => self::apTimestamp($data['updated'] ?? null, self::apTimestamp($data['published'] ?? null, $now2)),
                     ]);
                     // Guardar attachments do post original
-                    foreach ($data['attachment'] ?? [] as $pos => $att) {
+                    foreach (self::apList($data['attachment'] ?? []) as $pos => $att) {
                         if (!is_array($att)) continue;
                         $url = self::attachmentUrl($att);
                         if (!$url) continue;
@@ -1038,6 +1407,18 @@ class InboxProcessor
                             'created_at' => $now2,
                         ]);
                         DB::insertIgnore('status_media', ['status_id' => $origId, 'media_id' => $mid, 'position' => $pos]);
+                    }
+                    if ($replyToId && !str_starts_with((string)$replyToId, 'http')) {
+                        DB::run('UPDATE statuses SET reply_count=reply_count+1 WHERE id=?', [$replyToId]);
+                    }
+                    self::reconcileRepliesForParent($origId, $objUri, $origActorId);
+                    foreach (self::apList($data['tag'] ?? []) as $tag) {
+                        if (!is_array($tag) || ($tag['type'] ?? '') !== 'Hashtag') continue;
+                        $tagName = strtolower(ltrim($tag['name'] ?? '', '#'));
+                        if (!$tagName) continue;
+                        DB::insertIgnore('hashtags', ['id' => uuid(), 'name' => $tagName, 'created_at' => $now2]);
+                        $ht = DB::one('SELECT id FROM hashtags WHERE name=?', [$tagName]);
+                        if ($ht) DB::insertIgnore('status_hashtags', ['status_id' => $origId, 'hashtag_id' => $ht['id']]);
                     }
                     $orig = StatusModel::byUri($objUri);
 
@@ -1089,7 +1470,7 @@ class InboxProcessor
                     'quote_of_id'     => null,
                     'content'         => '',
                     'cw'              => '',
-                    'visibility'      => 'public',
+                    'visibility'      => $orig['visibility'],
                     'language'        => $orig['language'] ?? 'en', // NOT NULL — não pode ser null
                     'sensitive'       => 0,
                     'local'           => 0,
@@ -1151,7 +1532,7 @@ class InboxProcessor
             );
 
             $alreadyFollows = DB::one(
-                'SELECT 1 FROM follows WHERE follower_id=? AND following_id=?',
+                'SELECT pending, notify FROM follows WHERE follower_id=? AND following_id=?',
                 [$localUser['id'], $newUrl]
             );
             if (!$alreadyFollows) {
@@ -1171,6 +1552,13 @@ class InboxProcessor
                     DB::run('UPDATE users SET following_count=following_count+1 WHERE id=?', [$localUser['id']]);
                 }
                 Delivery::queueToActor($localUser, $newActor, Builder::follow($localUser, $newUrl));
+            } elseif ($oldFollow && (int)$oldFollow['notify'] && !(int)($alreadyFollows['notify'] ?? 0)) {
+                DB::update(
+                    'follows',
+                    ['notify' => 1],
+                    'follower_id=? AND following_id=?',
+                    [$localUser['id'], $newUrl]
+                );
             }
 
             // Unfollow old actor

@@ -343,14 +343,15 @@ class Builder
     public static function announce(array $boost, array $target, array $u): array
     {
         $actorUrl = actor_url($u['username']);
+        [$to, $cc] = self::visibility((string)($target['visibility'] ?? 'public'), $actorUrl);
         return [
             '@context' => self::CTX,
             'type'     => 'Announce',
             'id'       => $actorUrl . '#announce/' . $boost['id'],
             'actor'    => $actorUrl,
             'published'=> best_iso_timestamp($boost['created_at'] ?? null, null, $boost['id'] ?? null),
-            'to'       => ['https://www.w3.org/ns/activitystreams#Public'],
-            'cc'       => ["$actorUrl/followers"],
+            'to'       => $to,
+            'cc'       => $cc,
             'object'   => $target['uri'],
         ];
     }
@@ -365,8 +366,8 @@ class Builder
             'type'     => 'Undo',
             'id'       => $actorUrl . '#undo-announce/' . $boost['id'],
             'actor'    => $actorUrl,
-            'to'       => ['https://www.w3.org/ns/activitystreams#Public'],
-            'cc'       => ["$actorUrl/followers"],
+            'to'       => $inner['to'] ?? [],
+            'cc'       => $inner['cc'] ?? [],
             'object'   => $inner,
         ];
     }
@@ -453,7 +454,7 @@ class Builder
             'totalItems'   => $total,
             'orderedItems' => $items,
         ];
-        if (count($items) >= $limit) $out['next'] = $id . '?page=' . ($page + 1);
+        if (($page * $limit) < $total) $out['next'] = $id . '?page=' . ($page + 1);
         if ($page > 1)               $out['prev'] = $id . '?page=' . ($page - 1);
         return $out;
     }

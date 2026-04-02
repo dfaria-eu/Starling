@@ -70,7 +70,7 @@ class MigrationCtrl
         $apUrl = $ra['id'];
         $aka   = json_decode($user['also_known_as'] ?? '[]', true) ?: [];
 
-        if (!in_array($apUrl, $aka)) {
+        if (!in_array($apUrl, $aka, true)) {
             $aka[] = $apUrl;
             DB::update('users', ['also_known_as' => json_encode($aka)], 'id=?', [$user['id']]);
 
@@ -136,7 +136,7 @@ class MigrationCtrl
         // CRITICAL: verify new account lists us in alsoKnownAs
         $theirAka = json_decode($newActor['also_known_as'] ?? '[]', true) ?: [];
         $ourUrl   = actor_url($user['username']);
-        if (!in_array($ourUrl, $theirAka)) {
+        if (!in_array($ourUrl, $theirAka, true)) {
             err_out(
                 'New account has not listed this account as an alias. ' .
                 'Add ' . $ourUrl . ' to alsoKnownAs on ' . $newDomain . ' first.',

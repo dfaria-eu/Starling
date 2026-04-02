@@ -7,6 +7,18 @@ use App\Models\DB;
 
 class MarkersCtrl
 {
+    private function maxMarkerId(string $current, string $incoming): string
+    {
+        if ($current === '') return $incoming;
+        if ($incoming === '') return $current;
+        if (ctype_digit($current) && ctype_digit($incoming)) {
+            $lenCmp = strlen($current) <=> strlen($incoming);
+            if ($lenCmp !== 0) return $lenCmp > 0 ? $current : $incoming;
+            return strcmp($current, $incoming) >= 0 ? $current : $incoming;
+        }
+        return strcmp($current, $incoming) >= 0 ? $current : $incoming;
+    }
+
     /**
      * GET /api/v1/markers?timeline[]=home&timeline[]=notifications
      */
@@ -59,17 +71,21 @@ class MarkersCtrl
             $lastReadId = (string)($d[$tl]['last_read_id'] ?? '');
             if (!$lastReadId) continue;
             $existing = DB::one(
-                'SELECT version FROM markers WHERE user_id=? AND timeline=?',
+                'SELECT last_read_id, version FROM markers WHERE user_id=? AND timeline=?',
                 [$user['id'], $tl]
             );
             // Mastodon clients can send stale marker versions from multiple tabs/devices.
             // Rejecting those with 409 causes noisy failures during perfectly valid
-            // read-position updates, so accept the latest write and bump the version.
+            // read-position updates. Accept the write, but never let the marker move
+            // backwards when an older tab/device submits a stale last_read_id.
+            $effectiveLastReadId = $existing
+                ? $this->maxMarkerId((string)($existing['last_read_id'] ?? ''), $lastReadId)
+                : $lastReadId;
             $version = $existing ? (int)$existing['version'] + 1 : 1;
 
             if ($existing) {
                 DB::update('markers', [
-                    'last_read_id' => $lastReadId,
+                    'last_read_id' => $effectiveLastReadId,
                     'version'      => $version,
                     'updated_at'   => $now,
                 ], 'user_id=? AND timeline=?', [$user['id'], $tl]);
@@ -78,7 +94,7 @@ class MarkersCtrl
                     'id'           => uuid(),
                     'user_id'      => $user['id'],
                     'timeline'     => $tl,
-                    'last_read_id' => $lastReadId,
+                    'last_read_id' => $effectiveLastReadId,
                     'version'      => $version,
                     'updated_at'   => $now,
                 ]);
@@ -92,12 +108,12 @@ class MarkersCtrl
                     'UPDATE notifications
                      SET read_at=COALESCE(read_at, ?)
                      WHERE user_id=? AND read_at IS NULL AND CAST(id AS INTEGER) <= CAST(? AS INTEGER)',
-                    [$now, $user['id'], $lastReadId]
+                    [$now, $user['id'], $effectiveLastReadId]
                 );
             }
 
             $out->$tl = [
-                'last_read_id' => $lastReadId,
+                'last_read_id' => $effectiveLastReadId,
                 'version'      => $version,
                 'updated_at'   => iso_z($now),
             ];

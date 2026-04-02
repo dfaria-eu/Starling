@@ -7,14 +7,14 @@ use App\Models\{DB, StatusModel, UserModel};
 
 class TimelinesCtrl
 {
-    // Emite header Link: com next/prev para paginação (Mastodon-compatible)
-    // Recebe $out (statuses serializados enviados ao cliente) para garantir que
-    // os IDs no Link header correspondem ao que o cliente recebeu.
-    private function paginationLinks(array $out, string $baseUrl, array $query = []): void
+    // Emite header Link: com next/prev para paginação (Mastodon-compatible).
+    // Usa as rows cruas para evitar perder cursores quando a serialização filtra
+    // a página inteira por visibilidade/expiração.
+    private function paginationLinks(array $rows, string $baseUrl, array $query = [], bool $ascending = false): void
     {
-        if (!$out) return;
-        $oldest = end($out);
-        $newest = reset($out);
+        if (!$rows) return;
+        $oldest = $ascending ? reset($rows) : end($rows);
+        $newest = $ascending ? end($rows) : reset($rows);
 
         $nextParams = http_build_query(array_merge($query, ['max_id' => $oldest['id']]));
         $prevParams = http_build_query(array_merge($query, ['min_id' => $newest['id']]));
@@ -37,6 +37,8 @@ class TimelinesCtrl
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
+        $minId   = $_GET['min_id']   ?? null;
+        $minId   = $_GET['min_id']   ?? null;
         $rows = StatusModel::homeTimeline($user['id'], $limit, $maxId, $sinceId, $minId);
         $out  = array_values(array_filter(array_map(
             fn($s) => StatusModel::toMasto($s, $user['id']),
@@ -44,11 +46,12 @@ class TimelinesCtrl
         )));
         // min_id returns ASC from DB (to get the gap); reverse to newest-first before sending
         if ($minId && $out) $out = array_reverse($out);
-        if ($out) {
+        if ($rows) {
             $this->paginationLinks(
-                $out,
+                $rows,
                 ap_url('api/v1/timelines/home'),
-                array_filter(['limit' => $limit])
+                array_filter(['limit' => $limit]),
+                (bool)$minId
             );
         }
         json_out($out);
@@ -71,11 +74,12 @@ class TimelinesCtrl
             $rows
         )));
         if ($minId && $out) $out = array_reverse($out);
-        if ($out) {
+        if ($rows) {
             $this->paginationLinks(
-                $out,
+                $rows,
                 ap_url('api/v1/timelines/public'),
-                array_filter(['limit' => $limit, 'local' => $localOnly ? 'true' : null, 'remote' => $remoteOnly ? 'true' : null, 'only_media' => $onlyMedia ? 'true' : null])
+                array_filter(['limit' => $limit, 'local' => $localOnly ? 'true' : null, 'remote' => $remoteOnly ? 'true' : null, 'only_media' => $onlyMedia ? 'true' : null]),
+                (bool)$minId
             );
         }
         json_out($out);
@@ -90,14 +94,17 @@ class TimelinesCtrl
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
 
-        $blocked      = StatusModel::blockedDomains();
+        $blocked      = StatusModel::blockedDomains($viewer['id'] ?? null);
         $domainFilter = StatusModel::domainBlockSql('s.user_id', $blocked);
 
         $sql = "SELECT s.* FROM statuses s
                 JOIN status_hashtags sh ON sh.status_id=s.id
                 JOIN hashtags h ON h.id=sh.hashtag_id
-                WHERE h.name=? AND s.visibility='public'{$domainFilter}";
-        $par = [$tag];
+                WHERE h.name=? AND s.visibility='public'
+                  AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                  AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
+                  {$domainFilter}";
+        $par = [$tag, now_iso()];
         if ($maxId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$maxId]);
             if ($ref) { $sql .= ' AND (s.created_at < ? OR (s.created_at = ? AND s.id < ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
@@ -123,11 +130,12 @@ class TimelinesCtrl
             $rows
         )));
         if ($minId && $out) $out = array_reverse($out);
-        if ($out) {
+        if ($rows) {
             $this->paginationLinks(
-                $out,
+                $rows,
                 ap_url('api/v1/timelines/tag/' . rawurlencode($tag)),
-                array_filter(['limit' => $limit])
+                array_filter(['limit' => $limit]),
+                (bool)$minId
             );
         }
         json_out($out);
@@ -149,16 +157,18 @@ class TimelinesCtrl
         );
         if (!$acctIds) { json_out([]); return; }
 
-        $blockedDomains = StatusModel::blockedDomains();
+        $blockedDomains = StatusModel::blockedDomains($user['id']);
         $domainFilter   = StatusModel::domainBlockSql('user_id', $blockedDomains);
 
         $phs = implode(',', array_fill(0, count($acctIds), '?'));
         $sql = "SELECT * FROM statuses WHERE user_id IN ($phs)"
              . " AND (visibility IN ('public','unlisted') OR (visibility='private' AND user_id IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)))"
+             . " AND (expires_at IS NULL OR expires_at='' OR expires_at>?)"
+             . " AND (user_id LIKE 'http%' OR user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))"
              . " AND user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)"
              . " AND user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)"
              . $domainFilter;
-        $par = array_merge($acctIds, [$user['id'], $user['id'], $user['id']]);
+        $par = array_merge($acctIds, [$user['id'], now_iso(), $user['id'], $user['id']]);
         if ($maxId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$maxId]);
             if (!$ref && ctype_digit($maxId)) {
@@ -175,18 +185,32 @@ class TimelinesCtrl
             }
             if ($ref) { $sql .= ' AND (created_at > ? OR (created_at = ? AND id > ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
         }
-        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT ?'; $par[] = $limit;
+        if ($minId) {
+            $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$minId]);
+            if (!$ref && ctype_digit($minId)) {
+                $ms  = ((int)$minId >> 16) + 1262304000000;
+                $ref = ['created_at' => gmdate('Y-m-d\TH:i:s.000\Z', (int)($ms / 1000)), 'id' => $minId];
+            }
+            if ($ref) {
+                $sql .= ' AND (created_at > ? OR (created_at = ? AND id > ?))';
+                $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id'];
+            }
+        }
+        $sql .= $minId ? ' ORDER BY created_at ASC, id ASC LIMIT ?' : ' ORDER BY created_at DESC, id DESC LIMIT ?';
+        $par[] = $limit;
 
         $rows = DB::all($sql, $par);
         $out  = array_values(array_filter(array_map(
             fn($s) => StatusModel::toMasto($s, $user['id']),
             $rows
         )));
-        if ($out) {
+        if ($minId && $out) $out = array_reverse($out);
+        if ($rows) {
             $this->paginationLinks(
-                $out,
+                $rows,
                 ap_url('api/v1/timelines/list/' . $p['id']),
-                array_filter(['limit' => $limit])
+                array_filter(['limit' => $limit]),
+                (bool)$minId
             );
         }
         json_out($out);

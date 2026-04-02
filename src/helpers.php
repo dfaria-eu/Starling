@@ -678,9 +678,9 @@ function text_to_html(string $text): string
         '<a href="$0" rel="nofollow noopener noreferrer" target="_blank">$0</a>',
         $s
     );
-    // hashtags — negative lookbehind prevents matching URL fragments like #section
+    // hashtags — avoid matching URL fragments like #section or mid-word #tokens
     $s = preg_replace_callback(
-        '/(?<!["\'\\/])#([\p{L}\p{N}_]+)/u',
+        '/(?<![\p{L}\p{N}_\/:&?=%.\-])#([\p{L}\p{N}_]+)/u',
         static function (array $m): string {
             $tag = $m[1];
             return '<a href="' . AP_BASE_URL . '/tags/' . rawurlencode($tag) . '" class="mention hashtag" rel="tag">#<span>'
@@ -729,7 +729,7 @@ function extract_mentions(string $text): array
 
 function extract_tags(string $text): array
 {
-    preg_match_all('/#([\p{L}\p{N}_]+)/u', $text, $m);
+    preg_match_all('/(?<![\p{L}\p{N}_\/:&?=%.\-])#([\p{L}\p{N}_]+)/u', $text, $m);
     return array_unique(array_map(static fn($t) => mb_strtolower($t, 'UTF-8'), $m[1] ?? []));
 }
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace App\Controllers\Api;
 
 use App\Models\{DB, StatusModel};
+use App\ActivityPub\{Builder, Delivery};
 
 class PinsCtrl
 {
@@ -31,6 +32,11 @@ class PinsCtrl
             'created_at' => now_iso(),
         ]);
 
+        $updatedUser = \App\Models\UserModel::byId($user['id']);
+        if ($updatedUser) {
+            Delivery::queueToFollowers($updatedUser, Builder::updateActor($updatedUser));
+        }
+
         json_out(StatusModel::toMasto(StatusModel::byId($s['id']), $user['id']));
     }
 
@@ -39,7 +45,14 @@ class PinsCtrl
         $user = require_auth('write');
         $s    = StatusModel::byId($p['id']);
         if (!$s) err_out('Not found', 404);
+        if ($s['user_id'] !== $user['id']) err_out('Forbidden', 403);
         DB::delete('status_pins', 'user_id=? AND status_id=?', [$user['id'], $s['id']]);
+
+        $updatedUser = \App\Models\UserModel::byId($user['id']);
+        if ($updatedUser) {
+            Delivery::queueToFollowers($updatedUser, Builder::updateActor($updatedUser));
+        }
+
         json_out(StatusModel::toMasto(StatusModel::byId($s['id']), $user['id']));
     }
 }

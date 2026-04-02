@@ -28,10 +28,9 @@ class AppsCtrl
      */
     public function verifyCredentials(array $p): void
     {
-        $tok = bearer() ?? ($_GET['access_token'] ?? null);
-        if (!$tok) err_out('Unauthorized', 401);
-
-        $row = DB::one('SELECT * FROM oauth_tokens WHERE token=?', [$tok]);
+        $ctx = auth_context();
+        if (!$ctx) err_out('Unauthorized', 401);
+        $row = $ctx['token'] ?? null;
         if (!$row) err_out('Unauthorized', 401);
 
         $app = DB::one('SELECT * FROM oauth_apps WHERE id=?', [$row['app_id']]);

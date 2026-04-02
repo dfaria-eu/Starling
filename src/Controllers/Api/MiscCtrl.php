@@ -27,6 +27,22 @@ class SearchCtrl
         $wantAccounts = $type === '' || $type === 'accounts';
         $wantStatuses = $type === '' || $type === 'statuses';
         $wantHashtags = $type === '' || $type === 'hashtags';
+        $blockedDomains = StatusModel::blockedDomains($vid);
+        $isHiddenAccount = static function (string $targetId, ?string $domain = null) use ($vid, $blockedDomains): bool {
+            if (!$vid) return false;
+            if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$vid, $targetId])) return true;
+            if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$vid, $targetId])) return true;
+            return $domain !== null && in_array(strtolower($domain), $blockedDomains, true);
+        };
+        $isHiddenStatus = static function (array $s) use ($isHiddenAccount): bool {
+            $userId = (string)($s['user_id'] ?? '');
+            if ($userId === '') return false;
+            $domain = null;
+            if (str_starts_with($userId, 'http://') || str_starts_with($userId, 'https://')) {
+                $domain = parse_url($userId, PHP_URL_HOST) ?: null;
+            }
+            return $isHiddenAccount($userId, $domain ?: null);
+        };
 
         // ── Accounts ─────────────────────────────────────────
         $qLike = '%' . str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q) . '%';
@@ -37,26 +53,56 @@ class SearchCtrl
                 $domain   = strtolower($m[2]);
                 if (is_local($domain)) {
                     $u = UserModel::byUsername($username);
-                    if ($u) $accounts[] = UserModel::toMasto($u);
+                    if ($u) {
+                        $hidden = $vid && (
+                            DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$vid, $u['id']])
+                            || DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$vid, $u['id']])
+                        );
+                        if (!$hidden) $accounts[] = UserModel::toMasto($u);
+                    }
                 } elseif ($resolve) {
                     $ra = RemoteActorModel::fetchByAcct($username, $domain);
-                    if ($ra) $accounts[] = UserModel::remoteToMasto($ra);
+                    if ($ra) {
+                        $hidden = $vid && (
+                            DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$vid, $ra['id']])
+                            || DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$vid, $ra['id']])
+                            || in_array(strtolower((string)($ra['domain'] ?? '')), $blockedDomains, true)
+                        );
+                        if (!$hidden) $accounts[] = UserModel::remoteToMasto($ra);
+                    }
                 }
             }
 
-            $local = DB::all(
-                "SELECT * FROM users WHERE (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\') AND is_suspended=0 LIMIT ?",
-                [$qLike, $qLike, $limit]
-            );
+            $localSql = "SELECT * FROM users WHERE (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\') AND is_suspended=0";
+            $localParams = [$qLike, $qLike];
+            if ($vid) {
+                $localSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                $localSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
+                $localParams[] = $vid;
+                $localParams[] = $vid;
+            }
+            $localSql .= ' LIMIT ?';
+            $localParams[] = $limit;
+            $local = DB::all($localSql, $localParams);
             foreach ($local as $u) $accounts[] = UserModel::toMasto($u);
 
-            $remote = DB::all(
-                "SELECT * FROM remote_actors
+            $remoteSql = "SELECT * FROM remote_actors
                  WHERE domain != ?
-                   AND (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\')
-                 LIMIT ?",
-                [AP_DOMAIN, $qLike, $qLike, $limit]
-            );
+                   AND (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\')";
+            $remoteParams = [AP_DOMAIN, $qLike, $qLike];
+            if ($vid) {
+                $remoteSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                $remoteSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
+                $remoteParams[] = $vid;
+                $remoteParams[] = $vid;
+            }
+            if ($blockedDomains) {
+                $remoteSql .= ' AND LOWER(domain) NOT IN (' . implode(',', array_fill(0, count($blockedDomains), '?')) . ')';
+                array_push($remoteParams, ...$blockedDomains);
+            }
+            $remoteSql .= ' LIMIT ?';
+            $remoteParams[] = $limit;
+            $remote = DB::all($remoteSql, $remoteParams);
             foreach ($remote as $ra) $accounts[] = UserModel::remoteToMasto($ra);
         }
 
@@ -66,23 +112,36 @@ class SearchCtrl
         // before quoting it (GET /api/v2/search?q=URL&resolve=true).
         if ($wantStatuses && (str_starts_with($q, 'https://') || str_starts_with($q, 'http://'))) {
             $byUri = StatusModel::byUri($q);
-            if (!$byUri && $resolve && !is_local(parse_url($q, PHP_URL_HOST) ?? '')) {
+            $queryHost = strtolower((string)(parse_url($q, PHP_URL_HOST) ?? ''));
+            if (!$byUri && $resolve && !is_local($queryHost) && !in_array($queryHost, $blockedDomains, true)) {
                 $byUri = \App\ActivityPub\InboxProcessor::fetchRemoteNote($q, true, 0);
             }
             if ($byUri) {
-                $m = StatusModel::toMasto($byUri, $vid);
+                $m = $isHiddenStatus($byUri) ? null : StatusModel::toMasto($byUri, $vid);
                 if ($m) $statuses[] = $m;
             }
         }
 
         if ($wantStatuses) {
-            $rows = DB::all(
-                "SELECT * FROM statuses WHERE content LIKE ? ESCAPE '\\' AND visibility='public' ORDER BY created_at DESC LIMIT ?",
-                [$qLike, $limit]
-            );
+            $statusSql = "SELECT * FROM statuses
+                          WHERE content LIKE ? ESCAPE '\\'
+                            AND visibility='public'
+                            AND (expires_at IS NULL OR expires_at='' OR expires_at>?)
+                            AND (user_id LIKE 'http%' OR user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))";
+            $statusParams = [$qLike, now_iso()];
+            if ($vid) {
+                $statusSql .= ' AND user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                $statusSql .= ' AND user_id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
+                $statusParams[] = $vid;
+                $statusParams[] = $vid;
+            }
+            $statusSql .= StatusModel::domainBlockSql('user_id', $blockedDomains);
+            $statusSql .= ' ORDER BY created_at DESC LIMIT ?';
+            $statusParams[] = $limit;
+            $rows = DB::all($statusSql, $statusParams);
             $statuses = array_values(array_filter(array_merge(
                 $statuses,
-                array_map(fn($s) => StatusModel::toMasto($s, $vid), $rows)
+                array_map(fn($s) => $isHiddenStatus($s) ? null : StatusModel::toMasto($s, $vid), $rows)
             )));
             $statuses = array_slice(array_values(array_filter(
                 array_combine(array_column($statuses, 'id'), $statuses) ?: []
@@ -225,6 +284,7 @@ class BookmarksCtrl
     {
         $user    = require_auth('read');
         $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $scanLimit = max(100, min(5000, $limit * 10));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -256,7 +316,7 @@ class BookmarksCtrl
             }
         }
         $sql .= $minId ? ' ORDER BY b.created_at ASC, b.id ASC LIMIT ?' : ' ORDER BY b.created_at DESC, b.id DESC LIMIT ?';
-        $par[] = $limit;
+        $par[] = $scanLimit;
 
         $rows = DB::all($sql, $par);
 
@@ -267,10 +327,11 @@ class BookmarksCtrl
             $m = StatusModel::toMasto($s, $user['id']);
             if (!$m) continue;
             $out[] = $m;
+            if (count($out) >= $limit) break;
         }
         if ($minId && $out) { $out = array_reverse($out); }
 
-        if ($out) {
+        if ($rows) {
             $base = ap_url('api/v1/bookmarks');
             header(sprintf('Link: <%s?%s>; rel="next", <%s?%s>; rel="prev"',
                 $base, http_build_query(['limit' => $limit, 'max_id' => end($rows)['id']]),
@@ -289,6 +350,7 @@ class FavouritesCtrl
     {
         $user    = require_auth('read');
         $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $scanLimit = max(100, min(5000, $limit * 10));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -320,7 +382,7 @@ class FavouritesCtrl
             }
         }
         $sql .= $minId ? ' ORDER BY f.created_at ASC, f.id ASC LIMIT ?' : ' ORDER BY f.created_at DESC, f.id DESC LIMIT ?';
-        $par[] = $limit;
+        $par[] = $scanLimit;
 
         $rows = DB::all($sql, $par);
         $out  = [];
@@ -330,9 +392,10 @@ class FavouritesCtrl
             $m = StatusModel::toMasto($s, $user['id']);
             if (!$m) continue;
             $out[] = $m;
+            if (count($out) >= $limit) break;
         }
         if ($minId && $out) { $out = array_reverse($out); }
-        if ($out) {
+        if ($rows) {
             $base = ap_url('api/v1/favourites');
             header(sprintf('Link: <%s?%s>; rel="next", <%s?%s>; rel="prev"',
                 $base, http_build_query(['limit' => $limit, 'max_id' => end($rows)['id']]),
@@ -353,7 +416,10 @@ class BlocksCtrl
         $rows = DB::all('SELECT target_id FROM blocks WHERE user_id=? LIMIT 40', [$user['id']]);
         $out  = array_values(array_filter(array_map(function ($r) {
             $u = UserModel::byId($r['target_id']);
-            if ($u) return UserModel::toMasto($u);
+            if ($u) {
+                if (!empty($u['is_suspended'])) return null;
+                return UserModel::toMasto($u);
+            }
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$r['target_id']]);
             if ($ra) return UserModel::remoteToMasto($ra);
             return null;
@@ -372,7 +438,10 @@ class MutesCtrl
         $rows = DB::all('SELECT target_id FROM mutes WHERE user_id=? LIMIT 40', [$user['id']]);
         $out  = array_values(array_filter(array_map(function ($r) {
             $u = UserModel::byId($r['target_id']);
-            if ($u) return UserModel::toMasto($u);
+            if ($u) {
+                if (!empty($u['is_suspended'])) return null;
+                return UserModel::toMasto($u);
+            }
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$r['target_id']]);
             if ($ra) return UserModel::remoteToMasto($ra);
             return null;
@@ -385,11 +454,26 @@ class MutesCtrl
 
 class ConversationsCtrl
 {
+    private function isHiddenFromViewer(string $viewerId, string $targetId): bool
+    {
+        if ($targetId === '' || $targetId === $viewerId) return false;
+        if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+        if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+        if (!str_starts_with($targetId, 'http')) return false;
+        $ra = DB::one('SELECT domain FROM remote_actors WHERE id=?', [$targetId]);
+        if (!$ra || ($ra['domain'] ?? '') === '') return false;
+        return (bool)DB::one(
+            'SELECT 1 FROM user_domain_blocks WHERE user_id=? AND domain=?',
+            [$viewerId, strtolower((string)$ra['domain'])]
+        );
+    }
+
     public function index(array $p): void
     {
         $user  = require_auth('read');
         $limit = min((int)($_GET['limit'] ?? 20), 40);
         $maxId = $_GET['max_id'] ?? null;
+        $blockedDomains = StatusModel::blockedDomains($user['id']);
 
         // Encontrar todos os posts directos onde o utilizador está envolvido
         // Agrupar por thread (reply_to_id forma a thread) e mostrar o mais recente
@@ -397,6 +481,7 @@ class ConversationsCtrl
                 FROM statuses s
                 WHERE s.visibility='direct'
                   AND s.reblog_of_id IS NULL
+                  AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
                   AND (
                     s.user_id=?
                     OR s.id IN (
@@ -406,7 +491,8 @@ class ConversationsCtrl
                   )
                   AND s.user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
                   AND s.user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)";
-        $par = [$user['id'], $user['id'], $user['id'], $user['id']];
+        $par = [now_iso(), $user['id'], $user['id'], $user['id'], $user['id']];
+        $sql .= StatusModel::domainBlockSql('s.user_id', $blockedDomains);
         if ($maxId) {
             $ref = DB::one('SELECT created_at FROM statuses WHERE id=?', [$maxId]);
             if ($ref) { $sql .= ' AND s.created_at<?'; $par[] = $ref['created_at']; }
@@ -459,30 +545,46 @@ class ConversationsCtrl
             $sm = StatusModel::toMasto($lastStatus, $user['id']);
             if (!$sm) continue;
 
-            // Construir lista de participantes
-            $accounts = [];
-            $seen = [];
-
-            // Autor do último post
-            $authorId = $lastStatus['user_id'];
-            if (!isset($seen[$authorId])) {
-                $seen[$authorId] = true;
-                $local = UserModel::byId($authorId);
-                if ($local) $accounts[] = UserModel::toMasto($local, $user['id']);
-                else {
-                    $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$authorId]);
-                    if ($ra) $accounts[] = UserModel::remoteToMasto($ra);
+            // Construir lista de participantes a partir de toda a thread, para não omitir
+            // intervenientes que não aparecem no último post.
+            $allIds = [$rootId];
+            $queue  = [$rootId];
+            $depth  = 0;
+            while ($queue && $depth < 20) {
+                $ids      = array_splice($queue, 0, 20);
+                $phs      = implode(',', array_fill(0, count($ids), '?'));
+                $children = DB::all(
+                    "SELECT id FROM statuses
+                     WHERE reply_to_id IN ($phs) AND visibility='direct'
+                       AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+                    array_merge($ids, [now_iso()])
+                );
+                foreach ($children as $c) {
+                    if (!in_array($c['id'], $allIds, true)) {
+                        $allIds[] = $c['id'];
+                        $queue[]  = $c['id'];
+                    }
                 }
+                $depth++;
             }
 
-            // Mencionados
-            foreach ($sm['mentions'] as $mn) {
-                $mnId = $mn['id'];
-                if (isset($seen[$mnId])) continue;
-                $seen[$mnId] = true;
-                $u = UserModel::byId($mnId);
-                if ($u) { $accounts[] = UserModel::toMasto($u, $user['id']); continue; }
-                $ra = DB::one('SELECT * FROM remote_actors WHERE masto_id=?', [$mnId]);
+            $accounts = [];
+            $seen = [];
+            $phs = implode(',', array_fill(0, count($allIds), '?'));
+            $threadStatuses = DB::all("SELECT DISTINCT user_id FROM statuses WHERE id IN ($phs)", $allIds);
+            foreach ($threadStatuses as $row) {
+                $uid = $row['user_id'];
+                if (isset($seen[$uid])) continue;
+                if ($this->isHiddenFromViewer($user['id'], $uid)) continue;
+                $seen[$uid] = true;
+                $local = UserModel::byId($uid);
+                if ($local) {
+                    if (!empty($local['is_suspended'])) continue;
+                    $masto = UserModel::toMasto($local, $user['id']);
+                    if ($masto) $accounts[] = $masto;
+                    continue;
+                }
+                $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$uid]);
                 if ($ra) $accounts[] = UserModel::remoteToMasto($ra);
             }
 
@@ -491,6 +593,15 @@ class ConversationsCtrl
                 $viewer = UserModel::byId($user['id']);
                 if ($viewer) $accounts[] = UserModel::toMasto($viewer, $user['id']);
             }
+
+            $hasVisibleOther = false;
+            foreach ($accounts as $account) {
+                if (($account['id'] ?? '') !== $user['id']) {
+                    $hasVisibleOther = true;
+                    break;
+                }
+            }
+            if (!$hasVisibleOther) continue;
 
             $out[] = [
                 'id'          => (string)$rootId,
@@ -520,8 +631,10 @@ class ConversationsCtrl
             $ids      = array_splice($queue, 0, 20);
             $phs      = implode(',', array_fill(0, count($ids), '?'));
             $children = DB::all(
-                "SELECT id FROM statuses WHERE reply_to_id IN ($phs) AND visibility='direct'",
-                $ids
+                "SELECT id FROM statuses
+                 WHERE reply_to_id IN ($phs) AND visibility='direct'
+                   AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+                array_merge($ids, [now_iso()])
             );
             foreach ($children as $c) {
                 if (!in_array($c['id'], $allIds, true)) {
@@ -556,9 +669,15 @@ class ConversationsCtrl
         foreach ($threadStatuses as $row) {
             $uid = $row['user_id'];
             if (isset($seen[$uid])) continue;
+            if ($this->isHiddenFromViewer($user['id'], $uid)) continue;
             $seen[$uid] = true;
             $local = UserModel::byId($uid);
-            if ($local) { $accounts[] = UserModel::toMasto($local, $user['id']); continue; }
+            if ($local) {
+                if (!empty($local['is_suspended'])) continue;
+                $masto = UserModel::toMasto($local, $user['id']);
+                if ($masto) $accounts[] = $masto;
+                continue;
+            }
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$uid]);
             if ($ra) $accounts[] = UserModel::remoteToMasto($ra);
         }
@@ -566,6 +685,15 @@ class ConversationsCtrl
             $viewer = UserModel::byId($user['id']);
             if ($viewer) $accounts[] = UserModel::toMasto($viewer, $user['id']);
         }
+
+        $hasVisibleOther = false;
+        foreach ($accounts as $account) {
+            if (($account['id'] ?? '') !== $user['id']) {
+                $hasVisibleOther = true;
+                break;
+            }
+        }
+        if (!$hasVisibleOther) err_out('Not found', 404);
 
         json_out(['id' => (string)$rootId, 'accounts' => array_values($accounts), 'last_status' => $sm, 'unread' => false]);
     }
@@ -575,6 +703,20 @@ class ConversationsCtrl
 
 class FollowRequestsCtrl
 {
+    private function isHiddenFromViewer(string $viewerId, string $targetId): bool
+    {
+        if ($targetId === '' || $targetId === $viewerId) return false;
+        if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+        if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+        if (!str_starts_with($targetId, 'http')) return false;
+        $ra = DB::one('SELECT domain FROM remote_actors WHERE id=?', [$targetId]);
+        if (!$ra || ($ra['domain'] ?? '') === '') return false;
+        return (bool)DB::one(
+            'SELECT 1 FROM user_domain_blocks WHERE user_id=? AND domain=?',
+            [$viewerId, strtolower((string)$ra['domain'])]
+        );
+    }
+
     private function relationship(string $viewerId, string $clientId, string $internalId): array
     {
         $domainBlocking = false;
@@ -583,7 +725,7 @@ class FollowRequestsCtrl
             if ($ra) {
                 $domainBlocking = (bool)DB::one(
                     'SELECT 1 FROM user_domain_blocks WHERE user_id=? AND domain=?',
-                    [$viewerId, $ra['domain']]
+                    [$viewerId, strtolower((string)$ra['domain'])]
                 );
             }
         }
@@ -623,9 +765,15 @@ class FollowRequestsCtrl
         );
         $out = [];
         foreach ($rows as $r) {
+            if ($this->isHiddenFromViewer($user['id'], $r['follower_id'])) continue;
             // Could be local or remote
             $u = UserModel::byId($r['follower_id']);
-            if ($u) { $out[] = UserModel::toMasto($u); continue; }
+            if ($u) {
+                if (!empty($u['is_suspended'])) continue;
+                $masto = UserModel::toMasto($u);
+                if ($masto) $out[] = $masto;
+                continue;
+            }
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$r['follower_id']]);
             if ($ra) $out[] = UserModel::remoteToMasto($ra);
         }
@@ -641,6 +789,9 @@ class FollowRequestsCtrl
         // for remote actors. The follows table stores the AP URL for remote actors.
         // Resolve to the actual follower_id used in the follows table.
         $localFollower = UserModel::byId($clientId);
+        if ($localFollower && !empty($localFollower['is_suspended'])) {
+            $localFollower = null;
+        }
         $ra            = null;
         if ($localFollower) {
             $followerId = $clientId;             // local UUID = follower_id in follows
@@ -694,6 +845,9 @@ class FollowRequestsCtrl
 
         // Same resolution: client sends masto_id, follows table has AP URL
         $localFollower = UserModel::byId($clientId);
+        if ($localFollower && !empty($localFollower['is_suspended'])) {
+            $localFollower = null;
+        }
         $ra            = null;
         if ($localFollower) {
             $followerId = $clientId;
@@ -730,6 +884,20 @@ class FollowRequestsCtrl
 
 class ListsCtrl
 {
+    private function isHiddenFromViewer(string $viewerId, string $targetId): bool
+    {
+        if ($targetId === '' || $targetId === $viewerId) return false;
+        if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+        if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+        if (!str_starts_with($targetId, 'http')) return false;
+        $ra = DB::one('SELECT domain FROM remote_actors WHERE id=?', [$targetId]);
+        if (!$ra || ($ra['domain'] ?? '') === '') return false;
+        return (bool)DB::one(
+            'SELECT 1 FROM user_domain_blocks WHERE user_id=? AND domain=?',
+            [$viewerId, strtolower((string)$ra['domain'])]
+        );
+    }
+
     private function fmt(array $l): array
     {
         return ['id' => $l['id'], 'title' => $l['title'], 'replies_policy' => 'list', 'exclusive' => false];
@@ -829,9 +997,15 @@ class ListsCtrl
         $out  = [];
         foreach ($rows as $r) {
             $aid = $r['account_id'];
+            if ($this->isHiddenFromViewer($user['id'], $aid)) continue;
             // Internal IDs: UUID for local users, AP URL for remote actors
             $u = UserModel::byId($aid);
-            if ($u) { $out[] = UserModel::toMasto($u); continue; }
+            if ($u) {
+                if (!empty($u['is_suspended'])) continue;
+                $masto = UserModel::toMasto($u);
+                if ($masto) $out[] = $masto;
+                continue;
+            }
             $ra = DB::one('SELECT * FROM remote_actors WHERE id=?', [$aid]);
             if ($ra) $out[] = UserModel::remoteToMasto($ra);
         }
@@ -846,6 +1020,9 @@ class ListsCtrl
     private function resolveAccountId(string $clientId): ?string
     {
         $local = UserModel::byId($clientId);
+        if ($local && !empty($local['is_suspended'])) {
+            return null;
+        }
         if ($local) return $local['id'];
         $ra = DB::one('SELECT id FROM remote_actors WHERE masto_id=?', [$clientId]);
         return $ra ? $ra['id'] : null;
@@ -860,6 +1037,7 @@ class ListsCtrl
         foreach (($d['account_ids'] ?? []) as $clientId) {
             $internalId = $this->resolveAccountId((string)$clientId);
             if (!$internalId) continue;
+            if ($this->isHiddenFromViewer($user['id'], $internalId)) continue;
             // Only allow accounts the user follows (enforces list timeline privacy)
             $isFollowing = (bool)DB::one(
                 'SELECT 1 FROM follows WHERE follower_id=? AND following_id=? AND pending=0',
@@ -1044,19 +1222,21 @@ class MiscCtrl
             $maxSince    = $since; // track the latest created_at seen this cycle
 
             if (in_array($stream, ['user', 'home'])) {
-                $blockedDomains  = \App\Models\StatusModel::blockedDomains();
+                $blockedDomains  = \App\Models\StatusModel::blockedDomains($user['id']);
                 $domainFilterSSE = \App\Models\StatusModel::domainBlockSql('s.user_id', $blockedDomains);
                 // Novos posts na home timeline
                 $rows = \App\Models\DB::all(
                     "SELECT s.* FROM statuses s
                      WHERE (s.user_id=? OR s.user_id IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0))
                      AND s.visibility IN ('public','unlisted','private')
+                     AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                     AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                      AND s.user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
                      AND s.user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)
                      {$domainFilterSSE}
                      AND s.created_at > ?
                      ORDER BY s.created_at ASC, s.id ASC LIMIT 20",
-                    [$user['id'], $user['id'], $user['id'], $user['id'], $since]
+                    [$user['id'], $user['id'], now_iso(), $user['id'], $user['id'], $since]
                 );
                 foreach ($rows as $s) {
                     $masto = \App\Models\StatusModel::toMasto($s, $user['id']);
@@ -1080,6 +1260,7 @@ class MiscCtrl
                 );
                 $notifCtrl = new NotificationsCtrl();
                 foreach ($notifs as $n) {
+                    if (!$notifCtrl->shouldAppearInMainList($n, $user)) continue;
                     $notifObj = $notifCtrl->fmtPublic($n, $user);
                     if (!$notifObj) continue;
                     $json = json_encode($notifObj, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -1094,10 +1275,21 @@ class MiscCtrl
                 // Edited posts (status.update event) — check for posts updated since last poll
                 $edited = \App\Models\DB::all(
                     "SELECT s.* FROM statuses s
-                     WHERE (s.user_id=? OR s.user_id IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0))
+                     WHERE (
+                        s.user_id=?
+                        OR (
+                            s.user_id IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)
+                            AND s.visibility IN ('public','unlisted','private')
+                        )
+                     )
+                     AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                     AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
+                     AND s.user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
+                     AND s.user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)
+                     {$domainFilterSSE}
                      AND s.updated_at > s.created_at AND s.updated_at > ?
                      ORDER BY s.updated_at ASC LIMIT 10",
-                    [$user['id'], $user['id'], $since]
+                    [$user['id'], $user['id'], now_iso(), $user['id'], $user['id'], $since]
                 );
                 foreach ($edited as $s) {
                     $masto = \App\Models\StatusModel::toMasto($s, $user['id']);
@@ -1112,8 +1304,20 @@ class MiscCtrl
 
                 // Deleted posts (delete event) — check tombstones created since last poll
                 $deleted = \App\Models\DB::all(
-                    "SELECT uri, deleted_at FROM tombstones WHERE deleted_at > ? ORDER BY deleted_at ASC LIMIT 10",
-                    [$since]
+                    "SELECT uri, deleted_at FROM tombstones
+                     WHERE deleted_at > ?
+                     AND (
+                        user_id=?
+                        OR (
+                            user_id IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)
+                            AND visibility IN ('public','unlisted','private')
+                        )
+                     )
+                     AND user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
+                     AND user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)
+                     {$domainFilterSSE}
+                     ORDER BY deleted_at ASC LIMIT 10",
+                    [$since, $user['id'], $user['id'], $user['id'], $user['id']]
                 );
                 foreach ($deleted as $t) {
                     // Extract the status ID from the URI (last path segment)
@@ -1126,7 +1330,7 @@ class MiscCtrl
                     $sent = true;
                 }
             } elseif (in_array($stream, ['public', 'public:local', 'public:media', 'public:local:media'])) {
-                $blockedDomainsPub  = \App\Models\StatusModel::blockedDomains();
+                $blockedDomainsPub  = \App\Models\StatusModel::blockedDomains($user['id'] ?? null);
                 $domainFilterPub    = \App\Models\StatusModel::domainBlockSql('s.user_id', $blockedDomainsPub);
                 $pubUserId = $user['id'] ?? '';
                 $mediaOnly = in_array($stream, ['public:media', 'public:local:media'], true);
@@ -1134,24 +1338,28 @@ class MiscCtrl
                 if (in_array($stream, ['public:local', 'public:local:media'], true)) {
                     $rows = \App\Models\DB::all(
                         "SELECT s.* FROM statuses s WHERE s.visibility='public' AND s.local=1
+                         AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                         AND s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
                          AND s.user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
                          AND s.user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)
                          {$domainFilterPub}
                          {$mediaClause}
                          AND s.created_at > ?
                          ORDER BY s.created_at ASC, s.id ASC LIMIT 20",
-                        [$pubUserId, $pubUserId, $since]
+                        [now_iso(), $pubUserId, $pubUserId, $since]
                     );
                 } else {
                     $rows = \App\Models\DB::all(
                         "SELECT s.* FROM statuses s WHERE s.visibility='public'
+                         AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+                         AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
                          AND s.user_id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)
                          AND s.user_id NOT IN (SELECT target_id FROM mutes  WHERE user_id=?)
                          {$domainFilterPub}
                          {$mediaClause}
                          AND s.created_at > ?
                          ORDER BY s.created_at ASC, s.id ASC LIMIT 20",
-                        [$pubUserId, $pubUserId, $since]
+                        [now_iso(), $pubUserId, $pubUserId, $since]
                     );
                 }
                 foreach ($rows as $s) {

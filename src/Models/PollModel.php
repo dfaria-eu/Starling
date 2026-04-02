@@ -157,7 +157,7 @@ class PollModel
             $normTitle = mb_strtolower(trim((string)$choice['title']));
             $existing = $byPosition[(string)$pos] ?? $byNormTitle[$normTitle] ?? null;
             if ($existing) {
-                $votes = max($incomingVotes, (int)$existing['votes_count']);
+                $votes = $incomingVotes;
                 $seenOptionIds[] = $existing['id'];
                 DB::update('poll_options', [
                     'title'       => $choice['title'],
@@ -185,10 +185,10 @@ class PollModel
                 DB::delete('poll_options', 'id=?', [$opt['id']]);
             }
         }
-        $existingVotesCount = (int)($existingPoll['votes_count'] ?? 0);
-        $existingVotersCount = (int)($existingPoll['voters_count'] ?? 0);
-        $finalVotes = max($totalVotes, $existingVotesCount);
-        $finalVoters = max($voters ?? $totalVotes, $existingVotersCount);
+        $finalVotes = $totalVotes;
+        $finalVoters = $voters !== null
+            ? max(0, $voters)
+            : ((bool)$multiple ? max(0, (int)($existingPoll['voters_count'] ?? 0)) : $totalVotes);
 
         DB::update('polls', [
             'votes_count'  => $finalVotes,
@@ -223,23 +223,33 @@ class PollModel
         self::syncRemoteQuestion($statusId, $obj);
     }
 
-    public static function vote(array $poll, string $userId, array $choices, bool $incrementTotals = true): array
+    private static function voteOrThrow(array $poll, string $userId, array $choices, bool $incrementTotals = true): array
     {
         self::closeIfExpired($poll);
-        if (!empty($poll['closed_at'])) err_out('Poll has already ended', 422);
+        if (!empty($poll['closed_at'])) {
+            throw new \RuntimeException('Poll has already ended');
+        }
         if (DB::one('SELECT 1 FROM poll_votes WHERE poll_id=? AND user_id=?', [$poll['id'], $userId])) {
-            err_out('Already voted', 422);
+            throw new \RuntimeException('Already voted');
         }
 
         $options = self::options($poll['id']);
-        if (!$options) err_out('Poll not found', 404);
+        if (!$options) {
+            throw new \RuntimeException('Poll not found');
+        }
         $byPos = [];
         foreach ($options as $opt) $byPos[(string)$opt['position']] = $opt;
 
         $choices = array_values(array_unique(array_map(fn($v) => (string)$v, $choices)));
-        if (!$choices) err_out('choices required', 422);
-        if (!(bool)$poll['multiple'] && count($choices) !== 1) err_out('Single-choice poll', 422);
-        if ((bool)$poll['multiple'] && count($choices) > count($options)) err_out('Too many choices', 422);
+        if (!$choices) {
+            throw new \RuntimeException('choices required');
+        }
+        if (!(bool)$poll['multiple'] && count($choices) !== 1) {
+            throw new \RuntimeException('Single-choice poll');
+        }
+        if ((bool)$poll['multiple'] && count($choices) > count($options)) {
+            throw new \RuntimeException('Too many choices');
+        }
 
         $pdo = DB::pdo();
         $pdo->beginTransaction();
@@ -271,10 +281,29 @@ class PollModel
             $pdo->commit();
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) $pdo->rollBack();
-            err_out($e instanceof \RuntimeException ? $e->getMessage() : 'Unable to vote', 422);
+            throw ($e instanceof \RuntimeException ? $e : new \RuntimeException('Unable to vote', 0, $e));
         }
 
         return self::byId($poll['id']) ?? $poll;
+    }
+
+    public static function vote(array $poll, string $userId, array $choices, bool $incrementTotals = true): array
+    {
+        try {
+            return self::voteOrThrow($poll, $userId, $choices, $incrementTotals);
+        } catch (\RuntimeException $e) {
+            $status = $e->getMessage() === 'Poll not found' ? 404 : 422;
+            err_out($e->getMessage(), $status);
+        }
+    }
+
+    public static function tryVote(array $poll, string $userId, array $choices, bool $incrementTotals = true): ?array
+    {
+        try {
+            return self::voteOrThrow($poll, $userId, $choices, $incrementTotals);
+        } catch (\RuntimeException) {
+            return null;
+        }
     }
 
     public static function toMasto(array $poll, ?string $viewerId = null): array
@@ -445,7 +474,9 @@ class PollModel
             ],
         ]);
         $raw = curl_exec($ch);
-        curl_close($ch);
+        if (PHP_VERSION_ID < 80000) {
+            curl_close($ch);
+        }
         if (!is_string($raw) || $raw === '') return;
 
         $data = json_decode($raw, true);

@@ -34,16 +34,21 @@ class InstanceCtrl
         $b = $this->base();
         $contact = self::adminAccount();
         $iconUrl = $contact['avatar_static'] ?? $contact['avatar'] ?? null;
-        json_out([
+        $out = [
             'uri'         => AP_DOMAIN,
             'domain'      => AP_DOMAIN,
             'title'       => AP_NAME,
             'version'     => $this->mastodonVersionLabel(),
             'source_url'  => AP_SOURCE_URL,
             'description' => AP_DESCRIPTION,
-            'usage'       => ['users' => ['active_month' => (int)(DB::one('SELECT COUNT(DISTINCT user_id) c FROM statuses WHERE local=1 AND created_at>?', [gmdate('Y-m-d\TH:i:s\Z', strtotime('-30 days'))])['c'] ?? 0)]],
+            'usage'       => ['users' => ['active_month' => (int)(DB::one(
+                "SELECT COUNT(DISTINCT user_id) c FROM statuses
+                 WHERE local=1 AND created_at>?
+                   AND user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
+                   AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+                [gmdate('Y-m-d\TH:i:s\Z', strtotime('-30 days')), now_iso()]
+            )['c'] ?? 0)]],
             'icon'        => $iconUrl ? [['src' => $iconUrl, 'size' => '192x192']] : [],
-            'thumbnail'   => ['url' => $iconUrl, 'blurhash' => null, 'versions' => null],
             'languages'   => ['en'],
             'api_versions' => ['mastodon' => 6],
             'configuration' => array_merge($b['configuration'], [
@@ -59,7 +64,11 @@ class InstanceCtrl
             'contact'         => ['email' => AP_ADMIN_EMAIL, 'account' => $contact],
             'rules'           => $b['rules'],
             'urls'            => ['streaming' => AP_BASE_URL . '/api/v1/streaming'],
-        ]);
+        ];
+        if ($iconUrl) {
+            $out['thumbnail'] = ['url' => $iconUrl, 'blurhash' => null, 'versions' => null];
+        }
+        json_out($out);
     }
 
     public function peers(array $p): void
@@ -77,7 +86,13 @@ class InstanceCtrl
             $week_start = gmdate('Y-m-d\TH:i:s\Z', strtotime("-" . ($i + 1) . " weeks"));
             $logins  = $this->activeLoginCountBetween($week_start, $week_end);
             $reg     = DB::count('users', 'created_at>=? AND created_at<?', [$week_start, $week_end]);
-            $posts   = DB::count('statuses', 'local=1 AND created_at>=? AND created_at<?', [$week_start, $week_end]);
+            $posts   = (int)(DB::one(
+                "SELECT COUNT(*) c FROM statuses
+                 WHERE local=1 AND created_at>=? AND created_at<?
+                   AND user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
+                   AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+                [$week_start, $week_end, now_iso()]
+            )['c'] ?? 0);
             $out[]   = [
                 'week'      => (string)strtotime($week_start),
                 'statuses'  => (string)$posts,
@@ -111,7 +126,13 @@ class InstanceCtrl
             'urls'              => ['streaming_api' => AP_BASE_URL . '/api/v1/streaming'],
             'stats'             => [
                 'user_count'   => DB::count('users', 'is_suspended=0'),
-                'status_count' => DB::count('statuses', 'local=1'),
+                'status_count' => (int)(DB::one(
+                    "SELECT COUNT(*) c FROM statuses
+                     WHERE local=1
+                       AND user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
+                       AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+                    [now_iso()]
+                )['c'] ?? 0),
                 'domain_count' => (int)(DB::one('SELECT COUNT(DISTINCT domain) n FROM remote_actors WHERE domain != ?', [AP_DOMAIN])['n'] ?? 0),
             ],
             'languages'          => ['en'],

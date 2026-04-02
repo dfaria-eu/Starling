@@ -101,7 +101,7 @@ $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
 if (!str_starts_with($requestPath, '/api/v1/streaming')) {
     defer_after_response(static function (): void {
         if (throttle_allow('delivery_retry_queue', 30)) {
-            \App\ActivityPub\Delivery::processRetryQueue(5);
+            \App\ActivityPub\Delivery::processRetryQueue(\App\ActivityPub\Delivery::REQUEST_DRAIN_BATCH);
         }
         if (throttle_allow('local_status_expiry', 60)) {
             \App\Models\StatusModel::deleteExpiredLocal(25);

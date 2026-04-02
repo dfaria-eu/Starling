@@ -516,6 +516,8 @@ class Schema
             created_at    TEXT NOT NULL,
             last_http_code INTEGER NOT NULL DEFAULT 0,
             last_error    TEXT NOT NULL DEFAULT '',
+            last_error_bucket TEXT NOT NULL DEFAULT '',
+            last_error_detail TEXT NOT NULL DEFAULT '',
             last_attempt_at TEXT NOT NULL DEFAULT '',
             last_response_body TEXT NOT NULL DEFAULT '',
             processing_until TEXT NOT NULL DEFAULT ''
@@ -523,6 +525,8 @@ class Schema
         try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN payload_hash TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN last_http_code INTEGER NOT NULL DEFAULT 0"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN last_error_bucket TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN last_error_detail TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN last_attempt_at TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN last_response_body TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE delivery_queue ADD COLUMN processing_until TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
@@ -548,8 +552,12 @@ class Schema
         // Tombstones: track deleted posts so we can return 410 Gone (AP spec compliance)
         $db->exec("CREATE TABLE IF NOT EXISTS tombstones (
             uri        TEXT PRIMARY KEY,
+            user_id    TEXT NOT NULL DEFAULT '',
+            visibility TEXT NOT NULL DEFAULT 'public',
             deleted_at TEXT NOT NULL
         )");
+        try { $db->exec("ALTER TABLE tombstones ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE tombstones ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'"); } catch (\Throwable) {}
 
         // Admin action audit trail
         $db->exec("CREATE TABLE IF NOT EXISTS admin_action_log (

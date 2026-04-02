@@ -27,7 +27,8 @@ class StatusesCtrl
         if (class_exists(\DOMDocument::class)) {
             $prev = libxml_use_internal_errors(true);
             $doc  = new \DOMDocument();
-            if (@$doc->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_NOWARNING | LIBXML_NOERROR)) {
+            $domHtml = '<?xml encoding="UTF-8">' . mb_encode_numericentity($html, [0x80, 0x10FFFF, 0, 0x10FFFF], 'UTF-8');
+            if (@$doc->loadHTML($domHtml, LIBXML_NOWARNING | LIBXML_NOERROR)) {
                 $xpath = new \DOMXPath($doc);
                 $query = sprintf('//meta[translate(@%s,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="%s"]/@content', $attr, strtolower($name));
                 $nodes = $xpath->query($query);
@@ -95,18 +96,27 @@ class StatusesCtrl
         // reply_to_id can be a UUID or a full AP URI (fallback stored when parent wasn't cached),
         // so each level queries by both id and uri of the parent.
         $descRows = [];
+        $visibleCount = 0;
+        $traversedCount = 0;
         $queue    = [[$s['id'], $s['uri']]];
         $seen     = [$s['id'] => true];
-        while ($queue && count($descRows) < 200) {
+        while ($queue && $visibleCount < 200 && $traversedCount < 400) {
             [$pId, $pUri] = array_shift($queue);
+            $remainingVisible = max(1, 200 - $visibleCount);
+            $remainingTraversal = max(1, 400 - $traversedCount);
+            $fetchLimit = min($remainingTraversal, max(20, $remainingVisible * 3));
             $children = DB::all(
-                'SELECT * FROM statuses WHERE reply_to_id IN (?,?) ORDER BY created_at ASC LIMIT 40',
-                [$pId, $pUri]
+                'SELECT * FROM statuses WHERE reply_to_id IN (?,?) ORDER BY created_at ASC LIMIT ?',
+                [$pId, $pUri, $fetchLimit]
             );
             foreach ($children as $child) {
                 if (!isset($seen[$child['id']])) {
                     $seen[$child['id']] = true;
                     $descRows[] = $child;
+                    $traversedCount++;
+                    if (StatusModel::canView($child, $vid)) {
+                        $visibleCount++;
+                    }
                     $queue[] = [$child['id'], $child['uri']];
                 }
             }
@@ -133,7 +143,7 @@ class StatusesCtrl
              LIMIT 40',
             [$p['id'], $p['id']]
         );
-        json_out($this->resolveAccounts(array_column($rows, 'user_id')));
+        json_out($this->resolveAccounts(array_column($rows, 'user_id'), $viewer['id'] ?? null));
     }
 
     public function favouritedBy(array $p): void
@@ -141,23 +151,36 @@ class StatusesCtrl
         $viewer = authed_user();
         $this->requireVisibleStatus($p['id'], $viewer['id'] ?? null);
         $rows = DB::all('SELECT user_id FROM favourites WHERE status_id=? LIMIT 40', [$p['id']]);
-        json_out($this->resolveAccounts(array_column($rows, 'user_id')));
+        json_out($this->resolveAccounts(array_column($rows, 'user_id'), $viewer['id'] ?? null));
     }
 
     /** Batch-resolve a list of user IDs (local or remote) to Mastodon account objects. */
-    private function resolveAccounts(array $uids): array
+    private function resolveAccounts(array $uids, ?string $viewerId = null): array
     {
         if (!$uids) return [];
+        $isHidden = function (string $targetId, ?string $domain = null) use ($viewerId): bool {
+            if (!$viewerId) return false;
+            if (DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+            if (DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $targetId])) return true;
+            return $domain !== null && in_array(strtolower($domain), StatusModel::blockedDomains($viewerId), true);
+        };
         $ph = implode(',', array_fill(0, count($uids), '?'));
         $local  = DB::all("SELECT * FROM users WHERE id IN ($ph)", $uids);
         $byId   = [];
-        foreach ($local as $u) $byId[$u['id']] = UserModel::toMasto($u);
+        foreach ($local as $u) {
+            if (!empty($u['is_suspended'])) continue;
+            if ($isHidden($u['id'])) continue;
+            $byId[$u['id']] = UserModel::toMasto($u);
+        }
 
         $remoteIds = array_values(array_diff($uids, array_keys($byId)));
         if ($remoteIds) {
             $ph2    = implode(',', array_fill(0, count($remoteIds), '?'));
             $remote = DB::all("SELECT * FROM remote_actors WHERE id IN ($ph2)", $remoteIds);
-            foreach ($remote as $ra) $byId[$ra['id']] = UserModel::remoteToMasto($ra);
+            foreach ($remote as $ra) {
+                if ($isHidden($ra['id'], $ra['domain'] ?? null)) continue;
+                $byId[$ra['id']] = UserModel::remoteToMasto($ra);
+            }
         }
 
         return array_values(array_filter(array_map(fn($id) => $byId[$id] ?? null, $uids)));
@@ -405,6 +428,21 @@ class StatusesCtrl
         if (!empty($s['reblog_of_id'])) err_out('Cannot edit a boost', 422);
 
         $d   = req_body();
+        $mediaIds = null;
+        if (array_key_exists('media_ids', $d)) {
+            $mediaIds = array_values(array_filter((array)$d['media_ids'], fn($v) => is_string($v) && $v !== ''));
+            if (count($mediaIds) > 4) err_out('Too many media attachments', 422);
+            if ($mediaIds) {
+                $ph = implode(',', array_fill(0, count($mediaIds), '?'));
+                $owned = DB::all(
+                    "SELECT id FROM media_attachments WHERE user_id=? AND id IN ($ph) AND (status_id IS NULL OR status_id=?)",
+                    array_merge([$user['id']], $mediaIds, [$s['id']])
+                );
+                if (count($owned) !== count(array_unique($mediaIds))) {
+                    err_out('Invalid media_ids', 422);
+                }
+            }
+        }
         if (PollModel::byStatusId($s['id']) && isset($d['poll'])) err_out('Editing polls is not supported', 422);
         if (array_key_exists('expires_in', $d) && !empty($d['expires_in']) && (int)$d['expires_in'] < 300) {
             err_out('Auto-delete must be at least 5 minutes', 422);
@@ -437,12 +475,17 @@ class StatusesCtrl
             $upd['expires_at'] = $expireIn > 0 ? gmdate('Y-m-d\TH:i:s\Z', time() + $expireIn) : null;
         }
 
+        $currentMediaIds = array_column(DB::all(
+            'SELECT media_id FROM status_media WHERE status_id=? ORDER BY position ASC',
+            [$s['id']]
+        ), 'media_id');
         $changed = (
             (($upd['content'] ?? $s['content']) !== $s['content']) ||
             (($upd['cw'] ?? $s['cw']) !== $s['cw']) ||
             ((int)($upd['sensitive'] ?? $s['sensitive']) !== (int)$s['sensitive']) ||
             (($upd['visibility'] ?? $s['visibility']) !== $s['visibility']) ||
-            (($upd['expires_at'] ?? ($s['expires_at'] ?? null)) !== ($s['expires_at'] ?? null))
+            (($upd['expires_at'] ?? ($s['expires_at'] ?? null)) !== ($s['expires_at'] ?? null)) ||
+            ($mediaIds !== null && $mediaIds !== $currentMediaIds)
         );
         if (!$changed) {
             json_out(StatusModel::toMasto($s, $user['id']));
@@ -457,6 +500,22 @@ class StatusesCtrl
             'created_at' => $now,
         ]);
         DB::update('statuses', $upd, 'id=?', [$s['id']]);
+
+        if ($mediaIds !== null) {
+            $removed = array_values(array_diff($currentMediaIds, $mediaIds));
+            if ($removed) {
+                $ph = implode(',', array_fill(0, count($removed), '?'));
+                DB::run(
+                    "UPDATE media_attachments SET status_id=NULL WHERE user_id=? AND status_id=? AND id IN ($ph)",
+                    array_merge([$user['id'], $s['id']], $removed)
+                );
+            }
+            DB::delete('status_media', 'status_id=?', [$s['id']]);
+            foreach ($mediaIds as $i => $mid) {
+                DB::insertIgnore('status_media', ['status_id' => $s['id'], 'media_id' => $mid, 'position' => $i]);
+                DB::update('media_attachments', ['status_id' => $s['id']], 'id=? AND user_id=?', [$mid, $user['id']]);
+            }
+        }
 
         // Re-index hashtags if content changed
         if (isset($upd['content'])) {
@@ -501,7 +560,7 @@ class StatusesCtrl
             DB::insertIgnore('statuses', [
                 'id' => $rbId, 'uri' => ap_url('objects/' . $rbId), 'user_id' => $user['id'],
                 'reply_to_id' => null, 'reply_to_uid' => null, 'reblog_of_id' => $orig['id'],
-                'content' => '', 'cw' => '', 'visibility' => 'public', 'language' => $orig['language'],
+                'content' => '', 'cw' => '', 'visibility' => $orig['visibility'], 'language' => $orig['language'],
                 'sensitive' => 0, 'local' => 1, 'reply_count' => 0, 'reblog_count' => 0,
                 'favourite_count' => 0, 'created_at' => $now, 'updated_at' => $now,
             ]);
@@ -692,7 +751,9 @@ class StatusesCtrl
         ]);
         $html = curl_exec($ch);
         $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-        curl_close($ch);
+        if (PHP_VERSION_ID < 80000) {
+            curl_close($ch);
+        }
 
         if (!$html) return null;
 

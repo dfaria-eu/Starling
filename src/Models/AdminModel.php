@@ -94,13 +94,15 @@ class AdminModel
     public static function dashboardStats(): array
     {
         $db = DB::pdo();
+        $now = now_iso();
+        $activeStatusCond = "(expires_at IS NULL OR expires_at='' OR expires_at>?)";
 
         // Contagens básicas
         $users       = DB::count('users', 'is_suspended=0');
         $admins      = DB::count('users', 'is_admin=1');
         $suspended   = DB::count('users', 'is_suspended=1');
-        $localPosts  = DB::count('statuses', 'local=1');
-        $remotePosts = DB::count('statuses', 'local=0');
+        $localPosts  = DB::count('statuses', "local=1 AND $activeStatusCond", [$now]);
+        $remotePosts = DB::count('statuses', "local=0 AND $activeStatusCond", [$now]);
         $follows     = DB::count('follows', '1');
         $pending     = DB::count('follows', 'pending=1');
         $remoteActors= DB::count('remote_actors', '1');
@@ -111,7 +113,7 @@ class AdminModel
 
         // Actividade recente (últimas 24h)
         $since24h = gmdate('Y-m-d\TH:i:s\Z', time() - 86400);
-        $newPosts24h  = DB::count('statuses',   'local=1 AND created_at>?', [$since24h]);
+        $newPosts24h  = DB::count('statuses',   "local=1 AND created_at>? AND $activeStatusCond", [$since24h, $now]);
         $newUsers24h  = DB::count('users',       'created_at>?', [$since24h]);
         $inboxItems24h= DB::count('inbox_log',   'created_at>?', [$since24h]);
 
@@ -127,7 +129,10 @@ class AdminModel
         $chart = [];
         for ($i = 13; $i >= 0; $i--) {
             $day   = gmdate('Y-m-d', time() - $i * 86400);
-            $count = DB::one("SELECT COUNT(*) n FROM statuses WHERE local=1 AND substr(created_at,1,10)=?", [$day])['n'] ?? 0;
+            $count = DB::one(
+                "SELECT COUNT(*) n FROM statuses WHERE local=1 AND substr(created_at,1,10)=? AND $activeStatusCond",
+                [$day, $now]
+            )['n'] ?? 0;
             $chart[] = ['day' => substr($day, 5), 'count' => (int)$count];
         }
 
@@ -291,6 +296,9 @@ class AdminModel
 
     public static function suspendUser(string $id, bool $suspend): void
     {
+        if ($suspend && self::wouldRemoveLastActiveAdmin($id, 'suspend')) {
+            throw new \RuntimeException('Cannot suspend the last active administrator account.');
+        }
         DB::update('users', ['is_suspended' => $suspend ? 1 : 0, 'updated_at' => now_iso()], 'id=?', [$id]);
         // Revoke all OAuth tokens so the suspended user cannot continue using the API
         if ($suspend) {
@@ -302,11 +310,27 @@ class AdminModel
     {
         $u = UserModel::byId($id);
         if (!$u) return;
+        if (!empty($u['is_admin']) && self::wouldRemoveLastActiveAdmin($id, 'demote')) {
+            throw new \RuntimeException('Cannot remove administrator access from the last active administrator account.');
+        }
         DB::update('users', ['is_admin' => $u['is_admin'] ? 0 : 1, 'updated_at' => now_iso()], 'id=?', [$id]);
     }
 
     public static function deleteUser(string $id): void
     {
+        if (self::wouldRemoveLastActiveAdmin($id, 'delete')) {
+            throw new \RuntimeException('Cannot delete the last active administrator account.');
+        }
+        $affectedUserIds = array_values(array_unique(array_filter(array_merge(
+            array_column(DB::all('SELECT follower_id FROM follows WHERE following_id=? AND follower_id<>?', [$id, $id]), 'follower_id'),
+            array_column(DB::all('SELECT following_id FROM follows WHERE follower_id=? AND following_id<>?', [$id, $id]), 'following_id')
+        ))));
+        $affectedStatusIds = array_values(array_unique(array_filter(array_merge(
+            array_column(DB::all('SELECT status_id FROM favourites WHERE user_id=?', [$id]), 'status_id'),
+            array_column(DB::all('SELECT status_id FROM reblogs WHERE user_id=?', [$id]), 'status_id'),
+            array_column(DB::all('SELECT reply_to_id FROM statuses WHERE user_id=? AND reply_to_id IS NOT NULL AND reply_to_id<>""', [$id]), 'reply_to_id'),
+            array_column(DB::all('SELECT reblog_of_id FROM statuses WHERE user_id=? AND reblog_of_id IS NOT NULL AND reblog_of_id<>""', [$id]), 'reblog_of_id')
+        ))));
         $mediaRows = DB::all('SELECT url, preview_url FROM media_attachments WHERE user_id=?', [$id]);
         $statusIds = array_column(DB::all('SELECT id FROM statuses WHERE user_id=?', [$id]), 'id');
         foreach (array_chunk($statusIds, 200) as $chunk) {
@@ -361,6 +385,39 @@ class AdminModel
         DB::delete('oauth_codes',   'user_id=?', [$id]);
         DB::delete('oauth_tokens',  'user_id=?', [$id]);
         DB::delete('users',         'id=?', [$id]);
+        self::reconcileStatusCounters($affectedStatusIds);
+        foreach ($affectedUserIds as $userId) {
+            UserModel::reconcileCounts((string)$userId);
+        }
+    }
+
+    private static function wouldRemoveLastActiveAdmin(string $id, string $mode): bool
+    {
+        $user = DB::one('SELECT id, is_admin, is_suspended FROM users WHERE id=?', [$id]);
+        if (!$user || empty($user['is_admin']) || !empty($user['is_suspended']) && $mode !== 'delete') {
+            return false;
+        }
+        $activeAdmins = (int)DB::count('users', 'is_admin=1 AND is_suspended=0');
+        return $activeAdmins <= 1 && empty($user['is_suspended']);
+    }
+
+    private static function reconcileStatusCounters(array $statusIds): void
+    {
+        $statusIds = array_values(array_unique(array_filter(array_map(
+            static fn($id) => is_string($id) && $id !== '' ? $id : null,
+            $statusIds
+        ))));
+        foreach ($statusIds as $statusId) {
+            if (!DB::one('SELECT id FROM statuses WHERE id=?', [$statusId])) continue;
+            $replyCount = (int)(DB::one('SELECT COUNT(*) c FROM statuses WHERE reply_to_id=?', [$statusId])['c'] ?? 0);
+            $reblogCount = (int)(DB::one('SELECT COUNT(*) c FROM statuses WHERE reblog_of_id=?', [$statusId])['c'] ?? 0);
+            $favouriteCount = (int)(DB::one('SELECT COUNT(*) c FROM favourites WHERE status_id=?', [$statusId])['c'] ?? 0);
+            DB::update('statuses', [
+                'reply_count' => $replyCount,
+                'reblog_count' => $reblogCount,
+                'favourite_count' => $favouriteCount,
+            ], 'id=?', [$statusId]);
+        }
     }
 
     // ── Gestão de domínios / federação ───────────────────────
@@ -528,6 +585,10 @@ class AdminModel
 
         // Collect IDs to cascade-delete associated rows first
         $ids = array_column(DB::all("SELECT id FROM statuses WHERE $cond", [$before]), 'id');
+        $affectedStatusIds = array_values(array_unique(array_filter(array_merge(
+            array_column(DB::all("SELECT reply_to_id FROM statuses WHERE $cond AND reply_to_id IS NOT NULL AND reply_to_id<>''", [$before]), 'reply_to_id'),
+            array_column(DB::all("SELECT reblog_of_id FROM statuses WHERE $cond AND reblog_of_id IS NOT NULL AND reblog_of_id<>''", [$before]), 'reblog_of_id')
+        ))));
         $count = count($ids);
 
         if ($ids) {
@@ -562,6 +623,7 @@ class AdminModel
                 DB::run("DELETE FROM notifications   WHERE status_id IN ($ph)", $chunk);
                 DB::run("DELETE FROM statuses        WHERE id        IN ($ph)", $chunk);
             }
+            self::reconcileStatusCounters($affectedStatusIds);
         }
 
         return $count;

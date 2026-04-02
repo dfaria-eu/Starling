@@ -124,7 +124,13 @@ class WebCtrl
     public function home(array $p): void
     {
         $users  = DB::count('users', 'is_suspended=0');
-        $posts  = DB::count('statuses', 'local=1');
+        $posts  = (int)(DB::one(
+            "SELECT COUNT(*) c FROM statuses
+             WHERE local=1
+               AND user_id NOT IN (SELECT id FROM users WHERE is_suspended=1)
+               AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
+            [now_iso()]
+        )['c'] ?? 0);
         $domain = AP_DOMAIN;
         $name   = htmlspecialchars(AP_NAME);
         $desc   = htmlspecialchars(AP_DESCRIPTION);
@@ -405,7 +411,7 @@ HTML;
             if ($orig) {
                 // Redirect to the original post if it's local, or show its content
                 if ((int)($orig['local'] ?? 0)) {
-                    $origAuthor = DB::one('SELECT username FROM users WHERE id=?', [$orig['user_id']]);
+                    $origAuthor = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$orig['user_id']]);
                     if ($origAuthor) {
                         header('Location: ' . ap_url('@' . $origAuthor['username'] . '/' . $orig['id']), true, 302);
                         exit;
@@ -448,7 +454,7 @@ HTML;
             $replyToHandle = '';
             $replyToUrl = '';
             if (!empty($displayStatus['reply_to_uid'])) {
-                $rl = DB::one('SELECT username FROM users WHERE id=?', [$displayStatus['reply_to_uid']]);
+                $rl = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$displayStatus['reply_to_uid']]);
                 if ($rl) {
                     $replyToHandle = '@' . $rl['username'] . '@' . $domain;
                     $replyToUrl = ap_url('@' . $rl['username']);

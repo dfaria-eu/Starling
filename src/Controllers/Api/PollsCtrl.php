@@ -46,11 +46,11 @@ class PollsCtrl
                 $delivered = false;
                 foreach (PollModel::choiceTitles($poll, $choices) as $title) {
                     $activity = Builder::vote($status, $poll, $user, $title);
-                    if (!$delivered) {
-                        $delivered = Delivery::toActor($user, $remote, $activity);
-                    }
-                    if (!$delivered) {
+                    $choiceDelivered = Delivery::toActor($user, $remote, $activity);
+                    if (!$choiceDelivered) {
                         Delivery::queueToActor($user, $remote, $activity);
+                    } else {
+                        $delivered = true;
                     }
                 }
                 if ($delivered && !empty($status['uri'])) {
@@ -106,7 +106,9 @@ class PollsCtrl
             ],
         ]);
         $raw = curl_exec($ch);
-        curl_close($ch);
+        if (PHP_VERSION_ID < 80000) {
+            curl_close($ch);
+        }
         if (!is_string($raw) || $raw === '') return;
 
         $data = json_decode($raw, true);
