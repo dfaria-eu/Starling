@@ -611,6 +611,14 @@ class Schema
         try { $db->exec("ALTER TABLE statuses ADD COLUMN quote_of_id TEXT"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE statuses ADD COLUMN idempotency_key TEXT"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE statuses ADD COLUMN expires_at TEXT"); } catch (\Throwable) {}
+        try { $db->exec("CREATE TABLE IF NOT EXISTS tombstones (
+            uri TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT '',
+            visibility TEXT NOT NULL DEFAULT 'public',
+            deleted_at TEXT NOT NULL
+        )"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE tombstones ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE tombstones ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'"); } catch (\Throwable) {}
         try { $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_status_idempotency ON statuses(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"); } catch (\Throwable) {}
         try { $db->exec("CREATE INDEX IF NOT EXISTS idx_status_expires ON statuses(expires_at)"); } catch (\Throwable) {}
     }

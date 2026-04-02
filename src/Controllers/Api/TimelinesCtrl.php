@@ -37,8 +37,6 @@ class TimelinesCtrl
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
-        $minId   = $_GET['min_id']   ?? null;
-        $minId   = $_GET['min_id']   ?? null;
         $rows = StatusModel::homeTimeline($user['id'], $limit, $maxId, $sinceId, $minId);
         $out  = array_values(array_filter(array_map(
             fn($s) => StatusModel::toMasto($s, $user['id']),
@@ -150,6 +148,7 @@ class TimelinesCtrl
         $limit   = min((int)($_GET['limit'] ?? 20), 40);
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
+        $minId   = $_GET['min_id']   ?? null;
 
         $acctIds = array_column(
             DB::all('SELECT account_id FROM list_accounts WHERE list_id=?', [$p['id']]),
