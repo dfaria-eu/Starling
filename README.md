@@ -54,6 +54,7 @@ Tested clients so far include Ivory, Elk, and Phanpy.
 
 1. Copy the project to your server.
 2. Open `/install` and complete the installer.
+3. Open `/admin` for general settings and instance operation.
 
 ## Project Status
 
