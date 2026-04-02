@@ -1,5 +1,7 @@
 # ⋰⋱ Starling 
 
+> Simplest way to run a fediverse instance.
+
 Lightweight ActivityPub for small, independent servers.
 
 Starling is a lightweight ActivityPub server written in PHP.
