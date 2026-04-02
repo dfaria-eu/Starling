@@ -50,6 +50,8 @@ Tested clients so far include Ivory, Elk, and Phanpy.
 
 - PHP 8.2 or newer with SQLite support
 
+Starling runs on a minimal PHP stack and is compatible with typical LAMP-style hosting environments (no MySQL required). This makes it suitable for shared hosting, low-cost hosting, small VPS, or personal instances.
+
 ## Quick Start
 
 1. Copy the project to your server.
