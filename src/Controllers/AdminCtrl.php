@@ -710,7 +710,18 @@ class AdminCtrl
     {
         $this->requireAuth();
         $data = AdminModel::deliveryQueueOverview();
-        $this->html($this->layout('Deliveries', $this->deliveryQueueContent($data['rows'], $data['stats'], $data['errorBuckets'], $data['topDomains'], $data['recentAttempts'] ?? [])));
+        $this->html($this->layout('Deliveries', $this->deliveryQueueContent(
+            $data['rows'],
+            $data['stats'],
+            $data['errorBuckets'],
+            $data['topDomains'],
+            $data['recentAttempts'] ?? [],
+            $data['recentBatches'] ?? [],
+            $data['batchStats'] ?? [],
+            $data['tuning'] ?? [],
+            $data['profiles'] ?? [],
+            $data['matchedProfile'] ?? 'custom'
+        )));
     }
 
     public function deliveryQueueAction(array $p): void
@@ -721,6 +732,15 @@ class AdminCtrl
         $admin = AdminModel::currentAdmin();
 
         $msg = match ($action) {
+            'save_tuning' => (function () use ($admin) {
+                $preset = trim((string)($_POST['preset'] ?? 'custom'));
+                $saved = AdminModel::saveDeliveryQueueTuning($_POST, (string)($admin['id'] ?? ''), $preset);
+                $matched = AdminModel::matchDeliveryQueueProfile($saved);
+                $label = $matched !== 'custom'
+                    ? (AdminModel::deliveryQueueProfiles()[$matched]['label'] ?? 'preset')
+                    : 'custom settings';
+                return 'Delivery queue tuning saved: <strong>' . htmlspecialchars($label, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</strong>.';
+            })(),
             'retry_all' => (function () {
                 $now = gmdate('Y-m-d\TH:i:s\Z');
                 $n = (int)(DB::one("SELECT COUNT(*) c FROM delivery_queue WHERE attempts<=7")['c'] ?? 0);
@@ -1314,7 +1334,7 @@ HTML;
         }
 
         // Disk
-        $dbPct    = $s['freeSpace'] > 0 ? min(100, round((($s['totalSpace'] - $s['freeSpace']) / $s['totalSpace']) * 100)) : 0;
+        $dbPct    = $s['totalSpace'] > 0 ? min(100, round((($s['totalSpace'] - $s['freeSpace']) / $s['totalSpace']) * 100)) : 0;
         $diskCls  = $dbPct > 85 ? 'red' : ($dbPct > 65 ? '' : 'green');
 
         return <<<HTML
@@ -1345,16 +1365,20 @@ HTML;
 </div>
 
 <div class="section">
-  <div class="section-title">Disk</div>
+  <div class="section-title">Host filesystem</div>
   <div style="max-width:500px">
     <div style="display:flex;justify-content:space-between;font-size:.75rem;color:var(--text2);margin-bottom:.3rem">
-      <span>Disk used</span><span>{$fb($s['totalSpace'] - $s['freeSpace'])} / {$fb($s['totalSpace'])}</span>
+      <span>Host disk used</span><span>{$fb($s['totalSpace'] - $s['freeSpace'])} / {$fb($s['totalSpace'])}</span>
     </div>
     <div class="disk-bar-wrap"><div class="disk-bar-fill {$diskCls}" style="width:{$dbPct}%"></div></div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem;margin-top:.8rem;font-size:.75rem">
       <div style="color:var(--text2)">Database<br><span style="color:var(--text)">{$fb($s['dbSize'])}</span></div>
       <div style="color:var(--text2)">Media<br><span style="color:var(--text)">{$fb($s['mediaSize'])}</span></div>
       <div style="color:var(--text2)">Inbox log (raw)<br><span style="color:var(--text)">{$fb($s['inboxLogSize'])}</span></div>
+    </div>
+    <div style="margin-top:.8rem;font-size:.75rem;color:var(--text2)">
+      Starling storage footprint<br><strong style="color:var(--text)">{$fb($s['starlingStorageFootprint'])}</strong>
+      <div style="margin-top:.25rem;color:var(--text3)">Database + media + runtime files. Raw inbox payload is shown separately as an estimate, not added again here.</div>
     </div>
   </div>
 </div>
@@ -2310,7 +2334,7 @@ HTML;
         </div>";
     }
 
-    private function deliveryQueueContent(array $rows, array $stats, array $errorBuckets, array $topDomains, array $recentAttempts): string
+    private function deliveryQueueContent(array $rows, array $stats, array $errorBuckets, array $topDomains, array $recentAttempts, array $recentBatches, array $batchStats, array $tuning, array $profiles, string $matchedProfile): string
     {
         $e   = fn($v) => htmlspecialchars((string)$v, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         $now = time();
@@ -2435,6 +2459,39 @@ HTML;
             $attemptRows = "<tr><td colspan='5' style='text-align:center;color:var(--text3);padding:1.4rem'>No recent attempt history.</td></tr>";
         }
 
+        $batchRows = '';
+        foreach ($recentBatches as $row) {
+            $batchRows .= "<tr>
+              <td class='td-dim' style='font-size:.75rem'>" . $e($this->fmtDateTime($row['created_at'] ?? '')) . "</td>
+              <td class='td-mono' style='font-size:.72rem'>limit " . $e($row['batch_limit'] ?? 0) . "</td>
+              <td class='td-dim' style='font-size:.72rem'>leased " . $e($row['leased'] ?? 0) . " · processed " . $e($row['processed'] ?? 0) . "</td>
+              <td class='td-dim' style='font-size:.72rem'>success " . $e($row['success'] ?? 0) . " · retry " . $e($row['retry'] ?? 0) . " · terminal " . $e($row['terminal'] ?? 0) . " · skipped " . $e($row['skipped'] ?? 0) . "</td>
+              <td class='td-dim' style='font-size:.72rem'>" . (((int)($row['due_remaining'] ?? 0)) > 0 ? 'true' : 'false') . "</td>
+              <td class='td-dim' style='font-size:.72rem'>" . $e(number_format(((int)($row['duration_ms'] ?? 0)) / 1000, 3, '.', '')) . "s</td>
+            </tr>";
+        }
+        if ($batchRows === '') {
+            $batchRows = "<tr><td colspan='6' style='text-align:center;color:var(--text3);padding:1.4rem'>No recent batch summaries recorded yet.</td></tr>";
+        }
+
+        $profileOptions = "<option value='custom'" . ($matchedProfile === 'custom' ? ' selected' : '') . ">Custom</option>";
+        $profileCards = '';
+        foreach ($profiles as $key => $profile) {
+            $selected = $matchedProfile === $key ? ' selected' : '';
+            $profileOptions .= "<option value='{$e($key)}'{$selected}>{$e($profile['label'] ?? $key)}</option>";
+            $values = (array)($profile['values'] ?? []);
+            $profileCards .= "<div class='card'><div class='card-label'>{$e($profile['label'] ?? $key)}</div><div class='card-sub'>{$e($profile['description'] ?? '')}</div><div class='card-sub'>wake {$e($values['internal_wake_batch'] ?? '')} · request {$e($values['request_drain_batch'] ?? '')} · inbox {$e($values['inbox_drain_batch'] ?? '')}</div><div class='card-sub'>fallback {$e($values['wake_fallback_batch'] ?? '')}×{$e($values['wake_fallback_cycles'] ?? '')} · connect {$e($values['delivery_connect_timeout'] ?? '')}s · total {$e($values['delivery_timeout'] ?? '')}s</div></div>";
+        }
+        $input = static function (string $name, array $tuning, $default = '') use ($e): string {
+            return "<input type='number' min='1' name='{$e($name)}' value='{$e($tuning[$name] ?? $default)}' style='width:110px'>";
+        };
+
+        $batchCount24h = (int)($batchStats['count_24h'] ?? 0);
+        $slowBatches24h = (int)($batchStats['slow_24h'] ?? 0);
+        $avgBatch24h = number_format((float)($batchStats['avg_duration_s'] ?? 0), 3, '.', '');
+        $p95Batch24h = number_format((float)($batchStats['p95_duration_s'] ?? 0), 3, '.', '');
+        $maxBatch24h = number_format((float)($batchStats['max_duration_s'] ?? 0), 3, '.', '');
+
         return <<<HTML
 <div class="cards" style="margin-bottom:1.5rem">
   <div class="card"><div class="card-label">Pending (not sent)</div><div class="card-value" style="color:{$pendingColor}">{$stats['pending']}</div></div>
@@ -2447,6 +2504,26 @@ HTML;
 <div class="cards" style="margin-bottom:1.5rem">
   <div class="card"><div class="card-label">Failures by type</div>{$bucketHtml}</div>
   <div class="card"><div class="card-label">Top queued servers</div>{$domainHtml}</div>
+</div>
+
+<div class="cards" style="margin-bottom:1.5rem">
+  <div class="card"><div class="card-label">Batch runs (24h)</div><div class="card-value">{$batchCount24h}</div></div>
+  <div class="card"><div class="card-label">Slow batches (≥5s)</div><div class="card-value" style="color:var(--amber)">{$slowBatches24h}</div></div>
+  <div class="card"><div class="card-label">Average batch</div><div class="card-value">{$avgBatch24h}s</div><div class="card-sub">p95: {$p95Batch24h}s</div></div>
+  <div class="card"><div class="card-label">Worst batch (24h)</div><div class="card-value">{$maxBatch24h}s</div></div>
+</div>
+
+<div class="section" style="margin-bottom:1.5rem">
+  <div class="section-title">Recent batch summaries</div>
+  <div style="font-size:.72rem;color:var(--text3);margin-bottom:.8rem">
+    A quick health view of recent queue runs. These are the same batch-level signals that used to be useful mainly in the server log.
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>When</th><th>Batch</th><th>Work</th><th>Results</th><th>Due remaining</th><th>Duration</th></tr></thead>
+      <tbody>{$batchRows}</tbody>
+    </table>
+  </div>
 </div>
 
 <div class="section">
@@ -2489,6 +2566,40 @@ HTML;
       <tbody>{$attemptRows}</tbody>
     </table>
   </div>
+</div>
+
+<div class="section" style="margin-top:1.5rem">
+  <div class="section-title">Delivery queue tuning</div>
+  <div style="font-size:.72rem;color:var(--text3);margin-bottom:.8rem">
+    Review the queue first, then change these values if you need to tune behaviour for your hosting. Choose a profile first, and only override individual values if you need a custom setup.
+  </div>
+  <form method="POST" action="/admin/delivery-queue">
+    <input type="hidden" name="action" value="save_tuning">
+    <div class="form-row">
+      <div class="form-group" style="min-width:280px">
+        <label>Server profile</label>
+        <select name="preset">{$profileOptions}</select>
+      </div>
+    </div>
+    <div class="cards" style="margin:.4rem 0 1rem 0">{$profileCards}</div>
+    <div class="form-row">
+      <div class="form-group"><label>Internal wake batch</label>{$input('internal_wake_batch', $tuning, 10)}</div>
+      <div class="form-group"><label>Request drain batch</label>{$input('request_drain_batch', $tuning, 1)}</div>
+      <div class="form-group"><label>Inbox drain batch</label>{$input('inbox_drain_batch', $tuning, 3)}</div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Wake fallback batch</label>{$input('wake_fallback_batch', $tuning, 6)}</div>
+      <div class="form-group"><label>Wake fallback cycles</label>{$input('wake_fallback_cycles', $tuning, 1)}</div>
+      <div class="form-group"><label>Connect timeout (seconds)</label>{$input('delivery_connect_timeout', $tuning, 3)}</div>
+      <div class="form-group"><label>Total timeout (seconds)</label>{$input('delivery_timeout', $tuning, 6)}</div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-primary" type="submit">Save tuning</button>
+      </div>
+    </div>
+  </form>
 </div>
 HTML;
     }

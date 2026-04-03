@@ -18,6 +18,7 @@ class AdminModel
     private const VACUUM_MIN_DB_BYTES       = 262144000; // 250 MB
     private const VACUUM_MIN_DELETIONS      = 5000;
     private const VACUUM_AUTO_COOLDOWN_SECS = 172800;    // 48 h
+    private const DASHBOARD_HEAVY_CACHE_TTL = 300;
     // ── Autenticação de sessão ────────────────────────────────
 
     public static function startSession(): void
@@ -117,30 +118,37 @@ class AdminModel
         $newUsers24h  = DB::count('users',       'created_at>?', [$since24h]);
         $inboxItems24h= DB::count('inbox_log',   'created_at>?', [$since24h]);
 
-        // Disco
-        $dbSize      = file_exists(AP_DB_PATH) ? filesize(AP_DB_PATH) : 0;
-        $mediaSize   = self::dirSize(AP_MEDIA_DIR);
-        $inboxLogSize = (int)(DB::one("SELECT SUM(LENGTH(raw_json)) n FROM inbox_log")['n'] ?? 0);
-        $basePath   = is_dir(AP_MEDIA_DIR) ? AP_MEDIA_DIR : dirname(AP_DB_PATH);
-        $freeSpace  = (int)(@disk_free_space($basePath)  ?: 0);
-        $totalSpace = (int)(@disk_total_space($basePath) ?: 0);
+        $heavy = self::dashboardHeavyStats();
+        $dbSize = $heavy['dbSize'];
+        $mediaSize = $heavy['mediaSize'];
+        $inboxLogSize = $heavy['inboxLogSize'];
+        $freeSpace = $heavy['freeSpace'];
+        $totalSpace = $heavy['totalSpace'];
+        $runtimeSize = self::dirSize(ROOT . '/storage/runtime');
+        $starlingStorageFootprint = $dbSize + $mediaSize + $runtimeSize;
 
         // Posts por dia (últimos 14 dias)
         $chart = [];
+        $chartRows = DB::all(
+            "SELECT substr(created_at,1,10) day, COUNT(*) n
+               FROM statuses
+              WHERE local=1
+                AND created_at>=?
+                AND $activeStatusCond
+              GROUP BY substr(created_at,1,10)",
+            [gmdate('Y-m-d\TH:i:s\Z', time() - 13 * 86400), $now]
+        );
+        $chartMap = [];
+        foreach ($chartRows as $row) {
+            $chartMap[(string)($row['day'] ?? '')] = (int)($row['n'] ?? 0);
+        }
         for ($i = 13; $i >= 0; $i--) {
-            $day   = gmdate('Y-m-d', time() - $i * 86400);
-            $count = DB::one(
-                "SELECT COUNT(*) n FROM statuses WHERE local=1 AND substr(created_at,1,10)=? AND $activeStatusCond",
-                [$day, $now]
-            )['n'] ?? 0;
-            $chart[] = ['day' => substr($day, 5), 'count' => (int)$count];
+            $day = gmdate('Y-m-d', time() - $i * 86400);
+            $chart[] = ['day' => substr($day, 5), 'count' => (int)($chartMap[$day] ?? 0)];
         }
 
         // Top domínios federados
-        $topDomains = DB::all(
-            "SELECT domain, COUNT(*) c FROM remote_actors WHERE domain != ? GROUP BY domain ORDER BY c DESC LIMIT 8",
-            [AP_DOMAIN]
-        );
+        $topDomains = $heavy['topDomains'];
 
         // Erros de inbox recentes
         $inboxErrors = DB::all(
@@ -193,11 +201,60 @@ class AdminModel
             'follows','pending','remoteActors','domains',
             'inboxLog','mediaFiles','blocked',
             'newPosts24h','newUsers24h','inboxItems24h',
-            'dbSize','mediaSize','inboxLogSize',
-            'freeSpace','totalSpace',
+            'dbSize','mediaSize','inboxLogSize','runtimeSize',
+            'freeSpace','totalSpace','starlingStorageFootprint',
             'chart','topDomains','inboxErrors',
             'queueTotal','queueDue','queueRetrying','queueFailed','queueOldest','queueNextDue','queueLastAttempt','queueTopErrors','queueTopDomains'
         );
+    }
+
+    private static function dashboardHeavyCachePath(): string
+    {
+        return ROOT . '/storage/runtime/admin_dashboard_heavy.json';
+    }
+
+    private static function dashboardHeavyStats(): array
+    {
+        $defaults = [
+            'dbSize' => 0,
+            'mediaSize' => 0,
+            'inboxLogSize' => 0,
+            'freeSpace' => 0,
+            'totalSpace' => 0,
+            'topDomains' => [],
+        ];
+
+        $path = self::dashboardHeavyCachePath();
+        try {
+            if (is_file($path) && (time() - (int)@filemtime($path)) < self::DASHBOARD_HEAVY_CACHE_TTL) {
+                $cached = json_decode((string)@file_get_contents($path), true);
+                if (is_array($cached)) {
+                    return array_merge($defaults, $cached);
+                }
+            }
+        } catch (\Throwable) {
+        }
+
+        $dbSize = file_exists(AP_DB_PATH) ? (int)filesize(AP_DB_PATH) : 0;
+        $mediaSize = self::dirSize(AP_MEDIA_DIR);
+        $inboxLogSize = (int)(DB::one("SELECT SUM(LENGTH(raw_json)) n FROM inbox_log")['n'] ?? 0);
+        $basePath = is_dir(AP_MEDIA_DIR) ? AP_MEDIA_DIR : dirname(AP_DB_PATH);
+        $freeSpace = (int)(@disk_free_space($basePath) ?: 0);
+        $totalSpace = (int)(@disk_total_space($basePath) ?: 0);
+        $topDomains = DB::all(
+            "SELECT domain, COUNT(*) c FROM remote_actors WHERE domain != ? GROUP BY domain ORDER BY c DESC LIMIT 8",
+            [AP_DOMAIN]
+        );
+
+        $data = compact('dbSize', 'mediaSize', 'inboxLogSize', 'freeSpace', 'totalSpace', 'topDomains');
+        try {
+            $dir = dirname($path);
+            if (!is_dir($dir)) @mkdir($dir, 0755, true);
+            @file_put_contents($path, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
+        } catch (\Throwable) {
+        }
+
+        return $data;
     }
 
     public static function deliveryQueueOverview(int $limit = 200): array
@@ -247,6 +304,14 @@ class AdminModel
              LIMIT 8"
         );
         $recentAttempts = [];
+        $recentBatches = [];
+        $batchStats = [
+            'count_24h' => 0,
+            'slow_24h' => 0,
+            'avg_duration_s' => 0.0,
+            'p95_duration_s' => 0.0,
+            'max_duration_s' => 0.0,
+        ];
         try {
             $recentAttempts = DB::all(
                 "SELECT *
@@ -263,7 +328,170 @@ class AdminModel
             )['c'] ?? 0);
         } catch (\Throwable) {
         }
-        return ['rows' => $rows, 'stats' => $stats, 'errorBuckets' => $errorBuckets, 'topDomains' => $topDomains, 'recentAttempts' => $recentAttempts];
+        try {
+            $recentBatches = DB::all(
+                "SELECT *
+                   FROM delivery_batch_log
+                  ORDER BY created_at DESC
+                  LIMIT 30"
+            );
+            $durations = array_map(
+                static fn(array $row): float => max(0.0, ((int)($row['duration_ms'] ?? 0)) / 1000),
+                DB::all(
+                    "SELECT duration_ms
+                       FROM delivery_batch_log
+                      WHERE created_at>?
+                      ORDER BY duration_ms ASC",
+                    [gmdate('Y-m-d\TH:i:s\Z', time() - 86400)]
+                )
+            );
+            $count = count($durations);
+            if ($count > 0) {
+                $batchStats['count_24h'] = $count;
+                $batchStats['slow_24h'] = count(array_filter($durations, static fn(float $s): bool => $s >= 5.0));
+                $batchStats['avg_duration_s'] = array_sum($durations) / $count;
+                $batchStats['max_duration_s'] = max($durations);
+                $p95Index = max(0, (int)ceil($count * 0.95) - 1);
+                $batchStats['p95_duration_s'] = $durations[$p95Index] ?? end($durations) ?: 0.0;
+            }
+        } catch (\Throwable) {
+        }
+        return [
+            'rows' => $rows,
+            'stats' => $stats,
+            'errorBuckets' => $errorBuckets,
+            'topDomains' => $topDomains,
+            'recentAttempts' => $recentAttempts,
+            'recentBatches' => $recentBatches,
+            'batchStats' => $batchStats,
+            'tuning' => self::deliveryQueueTuning(),
+            'profiles' => self::deliveryQueueProfiles(),
+            'matchedProfile' => self::matchDeliveryQueueProfile(self::deliveryQueueTuning()),
+        ];
+    }
+
+    public static function deliveryQueueProfiles(): array
+    {
+        return [
+            'shared_conservative' => [
+                'label' => 'Shared Hosting Conservative',
+                'description' => 'Lower peaks and less inline work; best for tight hosting limits.',
+                'values' => [
+                    'internal_wake_batch' => 10,
+                    'request_drain_batch' => 1,
+                    'inbox_drain_batch' => 3,
+                    'wake_fallback_batch' => 6,
+                    'wake_fallback_cycles' => 1,
+                    'delivery_connect_timeout' => 3,
+                    'delivery_timeout' => 6,
+                ],
+            ],
+            'shared_balanced' => [
+                'label' => 'Shared Hosting Balanced',
+                'description' => 'More throughput without drifting back into overly long batches.',
+                'values' => [
+                    'internal_wake_batch' => 12,
+                    'request_drain_batch' => 2,
+                    'inbox_drain_batch' => 4,
+                    'wake_fallback_batch' => 8,
+                    'wake_fallback_cycles' => 1,
+                    'delivery_connect_timeout' => 4,
+                    'delivery_timeout' => 7,
+                ],
+            ],
+            'vps_small' => [
+                'label' => 'Small VPS',
+                'description' => 'More aggressive for hosts with extra CPU and I/O headroom.',
+                'values' => [
+                    'internal_wake_batch' => 15,
+                    'request_drain_batch' => 3,
+                    'inbox_drain_batch' => 5,
+                    'wake_fallback_batch' => 10,
+                    'wake_fallback_cycles' => 2,
+                    'delivery_connect_timeout' => 4,
+                    'delivery_timeout' => 8,
+                ],
+            ],
+            'vps_dedicated' => [
+                'label' => 'VPS / Dedicated',
+                'description' => 'Most aggressive profile for environments with plenty of headroom.',
+                'values' => [
+                    'internal_wake_batch' => 20,
+                    'request_drain_batch' => 4,
+                    'inbox_drain_batch' => 8,
+                    'wake_fallback_batch' => 12,
+                    'wake_fallback_cycles' => 2,
+                    'delivery_connect_timeout' => 5,
+                    'delivery_timeout' => 10,
+                ],
+            ],
+        ];
+    }
+
+    public static function defaultDeliveryQueueTuning(): array
+    {
+        return self::deliveryQueueProfiles()['shared_conservative']['values'];
+    }
+
+    public static function deliveryQueueTuning(): array
+    {
+        $defaults = self::defaultDeliveryQueueTuning();
+        $row = self::instanceContent('delivery_queue_tuning');
+        $saved = json_decode((string)($row['body'] ?? '{}'), true);
+        if (!is_array($saved)) return $defaults;
+
+        $out = [];
+        foreach ($defaults as $key => $default) {
+            $value = $saved[$key] ?? $default;
+            $out[$key] = max(1, (int)$value);
+        }
+        return $out;
+    }
+
+    public static function matchDeliveryQueueProfile(array $values): string
+    {
+        foreach (self::deliveryQueueProfiles() as $key => $profile) {
+            if (($profile['values'] ?? []) === $values) return $key;
+        }
+        return 'custom';
+    }
+
+    public static function saveDeliveryQueueTuning(array $input, string $adminId, string $preset = 'custom'): array
+    {
+        $profiles = self::deliveryQueueProfiles();
+        $defaults = self::defaultDeliveryQueueTuning();
+        $values = $defaults;
+
+        if ($preset !== 'custom' && isset($profiles[$preset])) {
+            $values = $profiles[$preset]['values'];
+        } else {
+            foreach ($defaults as $key => $default) {
+                $value = max(1, (int)($input[$key] ?? $default));
+                $values[$key] = match ($key) {
+                    'request_drain_batch' => min($value, 10),
+                    'inbox_drain_batch' => min($value, 20),
+                    'internal_wake_batch' => min($value, 50),
+                    'wake_fallback_batch' => min($value, 25),
+                    'wake_fallback_cycles' => min($value, 5),
+                    'delivery_connect_timeout' => min($value, 15),
+                    'delivery_timeout' => min($value, 30),
+                    default => $value,
+                };
+            }
+            if ($values['delivery_timeout'] < $values['delivery_connect_timeout']) {
+                $values['delivery_timeout'] = $values['delivery_connect_timeout'];
+            }
+        }
+
+        self::saveInstanceContent(
+            'delivery_queue_tuning',
+            'Delivery queue tuning',
+            json_encode($values, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}',
+            'json',
+            $adminId
+        );
+
+        return $values;
     }
 
     // ── Gestão de utilizadores ───────────────────────────────

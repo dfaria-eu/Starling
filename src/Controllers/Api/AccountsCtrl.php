@@ -281,25 +281,14 @@ use App\ActivityPub\{Builder, Delivery};
             $fieldAttrs = $src['fields'];
         }
         if ($fieldAttrs !== null) {
-            $actorUrl    = actor_url($user['username']);
-            $existFields = json_decode($user['fields'] ?? '[]', true) ?: [];
-            // Index existing fields by value for preserving verified_at when unchanged
-            $existByValue = [];
-            foreach ($existFields as $ef) {
-                $existByValue[trim($ef['value'] ?? '')] = $ef['verified_at'] ?? null;
-            }
+            $actorUrl = actor_url($user['username']);
             $fields = [];
             foreach (array_slice((array)$fieldAttrs, 0, 4) as $f) {
                 $name  = trim((string)($f['name']  ?? ''));
-                $value = UserModel::normalizeProfileFieldValue((string)($f['value'] ?? ''));
+                $value = trim((string)($f['value'] ?? ''));
                 if ($name === '') continue;
-                // Preserve verified_at only if already verified; re-check if null
-                $existingVerified = $existByValue[$value] ?? null;
-                if ($existingVerified !== null) {
-                    $verifiedAt = $existingVerified;
-                } else {
-                    $verifiedAt = \App\Models\UserModel::verifyRelMe($value, $actorUrl);
-                }
+                // Always re-check profile verification so stale rel=me claims do not persist forever.
+                $verifiedAt = \App\Models\UserModel::verifyRelMe($value, $actorUrl);
                 $fields[] = ['name' => $name, 'value' => $value, 'verified_at' => $verifiedAt];
             }
             $upd['fields'] = json_encode($fields);

@@ -626,6 +626,11 @@ class InboxProcessor
             $uri,
             'application/activity+json'
         );
+        return self::storeFetchedRemoteNoteData($data, $uri, $resolveNested, $ancestorDepth, $refreshExisting);
+    }
+
+    private static function storeFetchedRemoteNoteData(?array $data, string $uri, bool $resolveNested = true, int $ancestorDepth = 4, bool $refreshExisting = false): ?array
+    {
         $noteTypes = ['Note', 'Article', 'Page', 'Question', 'Video', 'Audio', 'Event'];
         if (!$data || !in_array($data['type'] ?? '', $noteTypes, true)) return null;
 
@@ -859,6 +864,111 @@ class InboxProcessor
         self::reconcileRepliesForParent($sid, $noteUri, $actorId ?: $noteUri);
 
         return StatusModel::byUri($noteUri);
+    }
+
+    /**
+     * Best-effort remote thread enrichment for context() of a cached remote post.
+     * Fetches a small portion of the remote replies collection, when exposed,
+     * and caches discovered replies locally.
+     */
+    public static function opportunisticFetchRepliesForContext(array $status, int $objectBudget = 20, int $fetchBudget = 3, ?array $prefetchedNote = null): int
+    {
+        if ((int)($status['local'] ?? 0) === 1) return 0;
+        $statusUri = (string)($status['uri'] ?? '');
+        if ($statusUri === '' || is_local(parse_url($statusUri, PHP_URL_HOST) ?? '')) return 0;
+
+        $note = $prefetchedNote ?? RemoteActorModel::httpGet($statusUri, 'application/activity+json');
+        if (!is_array($note)) return 0;
+
+        $resources = [];
+        $seenResources = [];
+        $seenObjects = [];
+        $imported = 0;
+        $remainingObjects = max(0, $objectBudget);
+        $remainingFetches = max(0, $fetchBudget);
+
+        self::queueRepliesCollectionResource($resources, $seenResources, $note['replies'] ?? null);
+
+        while ($resources && $remainingObjects > 0 && $remainingFetches >= 0) {
+            $resource = array_shift($resources);
+            $payload = null;
+            if (is_string($resource)) {
+                if ($remainingFetches <= 0) break;
+                $remainingFetches--;
+                $payload = RemoteActorModel::httpGet($resource, 'application/activity+json');
+            } elseif (is_array($resource)) {
+                $payload = $resource;
+            }
+            if (!is_array($payload)) continue;
+
+            foreach (self::extractRepliesCollectionItems($payload) as $item) {
+                if ($remainingObjects <= 0) break 2;
+
+                $itemId = null;
+                if (is_string($item)) {
+                    $itemId = $item;
+                } elseif (is_array($item) && is_string($item['id'] ?? null)) {
+                    $itemId = $item['id'];
+                }
+                if (!$itemId || isset($seenObjects[$itemId]) || $itemId === $statusUri) continue;
+                $seenObjects[$itemId] = true;
+
+                $before = StatusModel::byUri($itemId);
+                $cached = is_array($item)
+                    ? self::storeFetchedRemoteNoteData($item, $itemId, false, 1, true)
+                    : self::fetchRemoteNote($itemId, false, 1, true);
+                if ($cached) {
+                    $remainingObjects--;
+                    if (!$before) $imported++;
+                }
+            }
+
+            if ($remainingObjects <= 0) break;
+            if ($remainingFetches > 0) {
+                self::queueRepliesCollectionResource($resources, $seenResources, $payload['first'] ?? null);
+                self::queueRepliesCollectionResource($resources, $seenResources, $payload['next'] ?? null);
+            }
+        }
+
+        return $imported;
+    }
+
+    private static function queueRepliesCollectionResource(array &$queue, array &$seen, mixed $resource): void
+    {
+        if (is_string($resource)) {
+            if ($resource === '' || isset($seen[$resource])) return;
+            $seen[$resource] = true;
+            $queue[] = $resource;
+            return;
+        }
+        if (!is_array($resource)) return;
+        $key = '';
+        if (is_string($resource['id'] ?? null)) {
+            $key = $resource['id'];
+        } elseif (isset($resource['first']) || isset($resource['next']) || isset($resource['items']) || isset($resource['orderedItems'])) {
+            $key = md5(json_encode($resource));
+        }
+        if ($key !== '' && isset($seen[$key])) return;
+        if ($key !== '') $seen[$key] = true;
+        $queue[] = $resource;
+    }
+
+    private static function extractRepliesCollectionItems(array $payload): array
+    {
+        foreach (['orderedItems', 'items'] as $key) {
+            if (!isset($payload[$key])) continue;
+            $items = self::apList($payload[$key]);
+            if ($items) return $items;
+        }
+        $first = $payload['first'] ?? null;
+        if (is_array($first)) {
+            foreach (['orderedItems', 'items'] as $key) {
+                if (!isset($first[$key])) continue;
+                $items = self::apList($first[$key]);
+                if ($items) return $items;
+            }
+        }
+        return [];
     }
 
     private static function onUpdate(array $a, string $actorId): bool

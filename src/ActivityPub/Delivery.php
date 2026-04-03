@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 namespace App\ActivityPub;
 
-use App\Models\{DB, CryptoModel, RemoteActorModel, StatusModel};
+use App\Models\{AdminModel, DB, CryptoModel, RemoteActorModel, StatusModel};
 
 class Delivery
 {
@@ -12,11 +12,58 @@ class Delivery
     private const PROCESSING_LEASE_SECONDS = 120;
     private const ATTEMPT_LOG_RETENTION_DAYS = 14;
     private const ATTEMPT_LOG_MAX_ROWS = 5000;
-    public const INTERNAL_WAKE_BATCH = 15;
-    public const REQUEST_DRAIN_BATCH = 3;
-    public const INBOX_DRAIN_BATCH = 5;
-    private const WAKE_FALLBACK_BATCH = 10;
-    private const WAKE_FALLBACK_MAX_CYCLES = 2;
+    private const DEFAULT_INTERNAL_WAKE_BATCH = 10;
+    private const DEFAULT_REQUEST_DRAIN_BATCH = 1;
+    private const DEFAULT_INBOX_DRAIN_BATCH = 3;
+    private const DEFAULT_WAKE_FALLBACK_BATCH = 6;
+    private const DEFAULT_WAKE_FALLBACK_MAX_CYCLES = 1;
+    private const DEFAULT_DELIVERY_CONNECT_TIMEOUT = 3;
+    private const DEFAULT_DELIVERY_TIMEOUT = 6;
+
+    private static function tuning(): array
+    {
+        try {
+            return AdminModel::deliveryQueueTuning();
+        } catch (\Throwable) {
+            return AdminModel::defaultDeliveryQueueTuning();
+        }
+    }
+
+    public static function internalWakeBatch(): int
+    {
+        return max(1, (int)(self::tuning()['internal_wake_batch'] ?? self::DEFAULT_INTERNAL_WAKE_BATCH));
+    }
+
+    public static function requestDrainBatch(): int
+    {
+        return max(1, (int)(self::tuning()['request_drain_batch'] ?? self::DEFAULT_REQUEST_DRAIN_BATCH));
+    }
+
+    public static function inboxDrainBatch(): int
+    {
+        return max(1, (int)(self::tuning()['inbox_drain_batch'] ?? self::DEFAULT_INBOX_DRAIN_BATCH));
+    }
+
+    private static function wakeFallbackBatch(): int
+    {
+        return max(1, (int)(self::tuning()['wake_fallback_batch'] ?? self::DEFAULT_WAKE_FALLBACK_BATCH));
+    }
+
+    private static function wakeFallbackMaxCycles(): int
+    {
+        return max(1, (int)(self::tuning()['wake_fallback_cycles'] ?? self::DEFAULT_WAKE_FALLBACK_MAX_CYCLES));
+    }
+
+    private static function deliveryConnectTimeout(): int
+    {
+        return max(1, (int)(self::tuning()['delivery_connect_timeout'] ?? self::DEFAULT_DELIVERY_CONNECT_TIMEOUT));
+    }
+
+    private static function deliveryTimeout(): int
+    {
+        $timeout = max(1, (int)(self::tuning()['delivery_timeout'] ?? self::DEFAULT_DELIVERY_TIMEOUT));
+        return max($timeout, self::deliveryConnectTimeout());
+    }
 
     private static function closeCurlHandle($ch): void
     {
@@ -52,9 +99,9 @@ class Delivery
     {
         $cycles = 0;
         do {
-            self::processRetryQueue(self::WAKE_FALLBACK_BATCH);
+            self::processRetryQueue(self::wakeFallbackBatch());
             $cycles++;
-        } while ($cycles < self::WAKE_FALLBACK_MAX_CYCLES && self::hasDueRetries());
+        } while ($cycles < self::wakeFallbackMaxCycles() && self::hasDueRetries());
     }
 
     private static function isQueueableUrl(string $url): bool
@@ -234,6 +281,62 @@ class Delivery
                   )",
                 [$drop]
             );
+        }
+    }
+
+    private static function ensureBatchLogTable(): void
+    {
+        static $done = false;
+        if ($done) return;
+        DB::pdo()->exec("CREATE TABLE IF NOT EXISTS delivery_batch_log (
+            id TEXT PRIMARY KEY,
+            batch_limit INTEGER NOT NULL DEFAULT 0,
+            leased INTEGER NOT NULL DEFAULT 0,
+            processed INTEGER NOT NULL DEFAULT 0,
+            success INTEGER NOT NULL DEFAULT 0,
+            retry INTEGER NOT NULL DEFAULT 0,
+            terminal INTEGER NOT NULL DEFAULT 0,
+            skipped INTEGER NOT NULL DEFAULT 0,
+            due_remaining INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )");
+        DB::pdo()->exec("CREATE INDEX IF NOT EXISTS idx_delivery_batch_log_created ON delivery_batch_log(created_at DESC)");
+        DB::run('DELETE FROM delivery_batch_log WHERE created_at < ?', [gmdate('Y-m-d\TH:i:s\Z', time() - 1209600)]);
+        $count = (int)(DB::one('SELECT COUNT(*) c FROM delivery_batch_log')['c'] ?? 0);
+        if ($count > 1000) {
+            $drop = $count - 1000;
+            DB::run(
+                "DELETE FROM delivery_batch_log
+                  WHERE id IN (
+                    SELECT id FROM delivery_batch_log
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                  )",
+                [$drop]
+            );
+        }
+        $done = true;
+    }
+
+    private static function recordBatchLog(int $limit, int $leased, int $processed, int $successes, int $retryFailures, int $terminalFailures, int $skipped, bool $dueRemaining, float $duration): void
+    {
+        try {
+            self::ensureBatchLogTable();
+            DB::insertIgnore('delivery_batch_log', [
+                'id' => uuid(),
+                'batch_limit' => $limit,
+                'leased' => $leased,
+                'processed' => $processed,
+                'success' => $successes,
+                'retry' => $retryFailures,
+                'terminal' => $terminalFailures,
+                'skipped' => $skipped,
+                'due_remaining' => $dueRemaining ? 1 : 0,
+                'duration_ms' => (int)round($duration * 1000),
+                'created_at' => now_iso(),
+            ]);
+        } catch (\Throwable) {
         }
     }
 
@@ -420,8 +523,8 @@ class Delivery
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => $body,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_TIMEOUT        => 10,
+            CURLOPT_CONNECTTIMEOUT => self::deliveryConnectTimeout(),
+            CURLOPT_TIMEOUT        => self::deliveryTimeout(),
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HTTPHEADER     => $headerLines,
@@ -757,8 +860,8 @@ class Delivery
                     CURLOPT_POST           => true,
                     CURLOPT_POSTFIELDS     => $body,
                     CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_CONNECTTIMEOUT => 5,
-                    CURLOPT_TIMEOUT        => 10,
+                    CURLOPT_CONNECTTIMEOUT => self::deliveryConnectTimeout(),
+                    CURLOPT_TIMEOUT        => self::deliveryTimeout(),
                     CURLOPT_SSL_VERIFYPEER => true,
                     CURLOPT_SSL_VERIFYHOST => 2,
                     CURLOPT_HTTPHEADER     => $headerLines,
@@ -829,22 +932,9 @@ class Delivery
 
         $duration = microtime(true) - $startedAt;
         $processed = $successes + $retryFailures + $terminalFailures + $skipped;
-        $shouldLogSlowBatch = $duration >= 5.0 && $leased >= 3;
-        if (
-            $processed > 0 &&
-            ($retryFailures > 0 || $terminalFailures > 0 || $shouldLogSlowBatch)
-        ) {
-            self::logQueue('batch', [
-                'limit' => $limit,
-                'leased' => $leased,
-                'processed' => $processed,
-                'success' => $successes,
-                'retry' => $retryFailures,
-                'terminal' => $terminalFailures,
-                'skipped' => $skipped,
-                'due_remaining' => self::hasDueRetries(),
-                'duration_s' => $duration,
-            ], 'batch_summary', 20);
+        $dueRemaining = self::hasDueRetries();
+        if ($processed > 0) {
+            self::recordBatchLog($limit, $leased, $processed, $successes, $retryFailures, $terminalFailures, $skipped, $dueRemaining, $duration);
         }
     }
 

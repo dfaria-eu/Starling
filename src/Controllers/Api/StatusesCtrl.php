@@ -92,6 +92,14 @@ class StatusesCtrl
             $cur = $par;
         }
 
+        if ((int)($s['local'] ?? 0) === 0) {
+            try {
+                \App\ActivityPub\InboxProcessor::opportunisticFetchRepliesForContext($s, 20, 3);
+            } catch (\Throwable $e) {
+                error_log('[Starling] statuses.context remote replies fetch skipped: ' . $e->getMessage());
+            }
+        }
+
         // BFS to collect all descendants, not just direct replies.
         // reply_to_id can be a UUID or a full AP URI (fallback stored when parent wasn't cached),
         // so each level queries by both id and uri of the parent.
@@ -215,10 +223,35 @@ class StatusesCtrl
             if (is_local($m['domain'] ?? '')) continue;
             $key = strtolower($m['username'] . '@' . ($m['domain'] ?? ''));
             if (isset($seenRemoteMentions[$key])) continue;
-            $seenRemoteMentions[$key] = true;
             $remote = RemoteActorModel::fetchByAcct($m['username'], $m['domain'] ?? '');
-            if ($remote) Delivery::queueToActor($user, $remote, $activity);
+            $seenRemoteMentions[$key] = true;
+            if ($remote) {
+                $seenRemoteMentions[strtolower((string)$remote['id'])] = true;
+                Delivery::queueToActor($user, $remote, $activity);
+            }
         }
+
+        $replyToUid = (string)($status['reply_to_uid'] ?? '');
+        if ($replyToUid !== '' && str_starts_with($replyToUid, 'http')) {
+            $remote = DB::one('SELECT * FROM remote_actors WHERE id=?', [$replyToUid]);
+            if ($remote) {
+                $key = strtolower((string)$remote['id']);
+                if (!isset($seenRemoteMentions[$key])) {
+                    Delivery::queueToActor($user, $remote, $activity);
+                }
+            }
+        }
+    }
+
+    private function resolveReplyParent(string $id, ?string $viewerId): ?array
+    {
+        $parent = StatusModel::byId($id);
+        if (!$parent && str_starts_with($id, 'http')) {
+            $parent = StatusModel::byUri($id)
+                ?? \App\ActivityPub\InboxProcessor::fetchRemoteNote($id, false, 0);
+        }
+        if (!$parent || !StatusModel::canView($parent, $viewerId)) return null;
+        return $parent;
     }
 
     public function create(array $p): void
@@ -276,9 +309,11 @@ class StatusesCtrl
             }
         }
 
+        $parent = null;
         if (!empty($d['in_reply_to_id'])) {
-            $parent = StatusModel::byId((string)$d['in_reply_to_id']);
-            if (!$parent || !StatusModel::canView($parent, $user['id'])) err_out('Cannot reply to this post', 422);
+            $parent = $this->resolveReplyParent((string)$d['in_reply_to_id'], $user['id']);
+            if (!$parent) err_out('Cannot reply to this post', 422);
+            $d['in_reply_to_id'] = $parent['id'];
         }
 
         // Validate quoted post visibility — prevents quoting private/direct posts
@@ -328,6 +363,21 @@ class StatusesCtrl
                                 'read_at' => null, 'created_at' => now_iso(),
                             ]);
                         }
+                    }
+                }
+
+                if ($parent && !empty($parent['user_id']) && !str_starts_with((string)$parent['user_id'], 'http')) {
+                    $parentAuthorId = (string)$parent['user_id'];
+                    if ($parentAuthorId !== $user['id'] && !isset($seenLocalMentions[$parentAuthorId])) {
+                        DB::insertIgnore('notifications', [
+                            'id' => flake_id(),
+                            'user_id' => $parentAuthorId,
+                            'from_acct_id' => $user['id'],
+                            'type' => $isDirect ? 'direct' : 'mention',
+                            'status_id' => $status['id'],
+                            'read_at' => null,
+                            'created_at' => now_iso(),
+                        ]);
                     }
                 }
 

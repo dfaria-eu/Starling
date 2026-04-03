@@ -16,6 +16,7 @@ class TrendsCtrl
         $path = rawurldecode((string)($parts['path'] ?? ''));
         $path = preg_replace('~/+~', '/', $path ?? '') ?? '';
         $pathLower = strtolower($path);
+        $query = (string)($parts['query'] ?? '');
 
         $socialHosts = [
             'mastodon.social', 'bsky.app', 'twitter.com', 'x.com', 'instagram.com',
@@ -29,9 +30,19 @@ class TrendsCtrl
             }
         }
 
+        if ($query !== '' && ($pathLower === '' || $pathLower === '/')) {
+            parse_str($query, $queryParams);
+            foreach (['author', 'author_name', 'profile', 'username', 'acct', 'handle'] as $key) {
+                $value = $queryParams[$key] ?? null;
+                if (is_string($value) && trim($value) !== '') {
+                    return true;
+                }
+            }
+        }
+
         if ($pathLower === '' || $pathLower === '/') return false;
 
-        if (preg_match('~/(?:@[^/]+|users/[^/]+|profile/[^/]+|profiles/[^/]+|u/[^/]+|c/[^/]+|channel/[^/]+|people/[^/]+|author/[^/]+|member/[^/]+|members/[^/]+)$~i', $path)) {
+        if (preg_match('~/(?:@[^/]+|user/[^/]+|users/[^/]+|profile/[^/]+|profiles/[^/]+|u/[^/]+|c/[^/]+|channel/[^/]+|people/[^/]+|author/[^/]+|member/[^/]+|members/[^/]+)$~i', $path)) {
             return true;
         }
 
@@ -61,6 +72,107 @@ class TrendsCtrl
         }
 
         return false;
+    }
+
+    private static function looksGenericNewsUrl(string $url): bool
+    {
+        $parts = parse_url($url);
+        if (!$parts) return false;
+
+        $path = rawurldecode((string)($parts['path'] ?? ''));
+        $path = preg_replace('~/+~', '/', $path ?? '') ?? '';
+        $pathLower = strtolower($path);
+
+        if ($pathLower === '' || $pathLower === '/') {
+            return true;
+        }
+
+        if (preg_match('~^/(?:tag|tags|category|categories|topic|topics|search|discover|explore|latest|recent|archive|archives|feed|feeds)(?:/|$)~i', $pathLower)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static function newsTrendScore(array $row): float
+    {
+        $shareCount = max(0, (int)($row['share_count'] ?? 0));
+        $fetchedAt = strtotime((string)($row['fetched_at'] ?? '')) ?: time();
+        $ageHours = max(0.0, (time() - $fetchedAt) / 3600.0);
+        $baseScore = ($shareCount + 1) * exp(-$ageHours * 0.693147 / 8.0);
+
+        $url = trim((string)($row['url'] ?? ''));
+        $title = trim((string)($row['title'] ?? ''));
+        $description = trim((string)($row['description'] ?? ''));
+        $provider = trim((string)($row['provider'] ?? ''));
+        $titleWords = preg_match_all('~[\p{L}\p{N}]+~u', $title);
+        $descWords = preg_match_all('~[\p{L}\p{N}]+~u', $description);
+        $parts = parse_url($url) ?: [];
+        $path = rawurldecode((string)($parts['path'] ?? ''));
+        $path = preg_replace('~/+~', '/', $path ?? '') ?? '';
+        $pathLower = strtolower($path);
+        $segments = array_values(array_filter(explode('/', trim($pathLower, '/')), fn($s) => $s !== ''));
+
+        $multiplier = 1.0;
+
+        if (self::looksGenericNewsUrl($url)) {
+            $multiplier *= 0.2;
+        }
+
+        if (count($segments) >= 2) {
+            $multiplier *= 1.15;
+        }
+
+        if (preg_match('~/(?:news|article|articles|post|posts|blog)/~i', $pathLower) || preg_match('~/(?:19|20)\d{2}/(?:0[1-9]|1[0-2])(?:/\d{1,2})?/~', $pathLower)) {
+            $multiplier *= 1.2;
+        }
+
+        if ($titleWords >= 4) {
+            $multiplier *= 1.08;
+        }
+
+        if ($descWords >= 12) {
+            $multiplier *= 1.12;
+        }
+
+        if ($provider !== '' && mb_strtolower($title) === mb_strtolower($provider)) {
+            $multiplier *= 0.75;
+        }
+
+        return $baseScore * $multiplier;
+    }
+
+    private static function suggestionHash(string $accountId, ?string $viewerId): int
+    {
+        $seed = gmdate('Y-m-d') . '|' . ($viewerId ?? 'anon') . '|' . $accountId;
+        return (int)sprintf('%u', crc32($seed));
+    }
+
+    /** Keep the strongest anchors, then rotate within small windows for variety. */
+    private static function pickInterestingFallbackPeople(array $rows, int $need, ?string $viewerId): array
+    {
+        if ($need <= 0) return [];
+        if (count($rows) <= $need) return array_slice($rows, 0, $need);
+
+        $anchors = array_slice($rows, 0, min(2, $need));
+        $pool = array_slice($rows, count($anchors));
+        $windowSize = 6;
+        $picked = $anchors;
+
+        foreach (array_chunk($pool, $windowSize) as $chunk) {
+            usort($chunk, function (array $a, array $b) use ($viewerId): int {
+                return self::suggestionHash((string)$a['account_id'], $viewerId)
+                    <=> self::suggestionHash((string)$b['account_id'], $viewerId);
+            });
+            foreach ($chunk as $row) {
+                $picked[] = $row;
+                if (count($picked) >= $need) {
+                    return $picked;
+                }
+            }
+        }
+
+        return array_slice($picked, 0, $need);
     }
 
     /** Build 7-day history for a set of hashtag IDs. Returns [hashtag_id => history_array]. */
@@ -109,7 +221,7 @@ class TrendsCtrl
         $domainFilter = StatusModel::domainBlockSql('s.user_id', $blocked);
         $reblogDomainFilter = StatusModel::domainBlockSql('r.user_id', $blocked);
 
-        // score = (public_boosts×2 + favourite_count + 1) × EXP(-age_hours × ln2 / 4)
+        // score = (public_boosts×2 + favourite_count + reply_count×0.25 + 1) × EXP(-age_hours × ln2 / 5)
         // Compute boosts in a separate aggregate pass instead of LEFT JOIN-ing all recent
         // reblogs into every candidate row. On SQLite/shared hosting that join is the main
         // cost of this endpoint and quickly becomes the slowest public API query.
@@ -122,7 +234,7 @@ class TrendsCtrl
         if ($maxId) {
             $ref = DB::one(
                 "WITH candidates AS (
-                    SELECT s.id, s.favourite_count, s.created_at
+                    SELECT s.id, s.favourite_count, s.reply_count, s.created_at
                     FROM statuses s
                     WHERE s.visibility = 'public'
                       AND s.reblog_of_id IS NULL
@@ -144,9 +256,9 @@ class TrendsCtrl
                  ),
                  scored AS (
                     SELECT c.id,
-                           (COALESCE(pr.public_boosts, 0) * 2 + c.favourite_count + 1) * EXP(
+                           (COALESCE(pr.public_boosts, 0) * 2 + c.favourite_count + (c.reply_count * 0.25) + 1) * EXP(
                                -CAST((JULIANDAY('now') - JULIANDAY(c.created_at)) * 24.0 AS REAL)
-                               * 0.693147 / 4.0
+                               * 0.693147 / 5.0
                            ) AS trend_score
                     FROM candidates c
                     LEFT JOIN public_reblogs pr ON pr.status_id = c.id
@@ -187,9 +299,9 @@ class TrendsCtrl
             ),
             scored AS (
                 SELECT c.*,
-                       (COALESCE(pr.public_boosts, 0) * 2 + c.favourite_count + 1) * EXP(
+                       (COALESCE(pr.public_boosts, 0) * 2 + c.favourite_count + (c.reply_count * 0.25) + 1) * EXP(
                            -CAST((JULIANDAY('now') - JULIANDAY(c.created_at)) * 24.0 AS REAL)
-                           * 0.693147 / 4.0
+                           * 0.693147 / 5.0
                        ) AS trend_score
                 FROM candidates c
                 LEFT JOIN public_reblogs pr ON pr.status_id = c.id
@@ -220,9 +332,13 @@ class TrendsCtrl
 
         $rows = DB::all(
             "SELECT h.name, h.id,
-                    COUNT(*) * EXP(
+                    (
+                        COUNT(DISTINCT s.user_id) * 3
+                        + COUNT(*) * 0.5
+                        + 1
+                    ) * EXP(
                         -CAST((JULIANDAY('now') - JULIANDAY(MAX(s.created_at))) * 24.0 AS REAL)
-                        * 0.693147 / 4.0
+                        * 0.693147 / 6.0
                     ) AS trend_score
              FROM hashtags h
              JOIN status_hashtags sh ON sh.hashtag_id = h.id
@@ -282,14 +398,29 @@ class TrendsCtrl
                  * 0.693147 / 8.0
              ) DESC, fetched_at DESC
              LIMIT ?",
-            [$since, max($limit * 5, 50)]
+            [$since, max($limit * 8, 80)]
         );
 
-        $out = [];
+        $scored = [];
         foreach ($rows as $r) {
             if (self::looksLikeProfileCard($r)) {
                 continue;
             }
+            if (self::looksGenericNewsUrl((string)($r['url'] ?? ''))) {
+                continue;
+            }
+            $r['_news_score'] = self::newsTrendScore($r);
+            $scored[] = $r;
+        }
+
+        usort($scored, static function (array $a, array $b): int {
+            $scoreCmp = (($b['_news_score'] ?? 0.0) <=> ($a['_news_score'] ?? 0.0));
+            if ($scoreCmp !== 0) return $scoreCmp;
+            return strcmp((string)($b['fetched_at'] ?? ''), (string)($a['fetched_at'] ?? ''));
+        });
+
+        $out = [];
+        foreach ($scored as $r) {
             $out[] = [
                 'url'               => $r['url'],
                 'title'             => $r['title'],
@@ -351,52 +482,90 @@ class TrendsCtrl
         if (count($rows) < $limit) {
             $need       = $limit - count($rows);
             $alreadyIds = array_column($rows, 'account_id');
+            $recentSince = gmdate('Y-m-d\TH:i:s\Z', strtotime('-14 days'));
+            $fallbackRows = [];
 
-            $localSql    = "SELECT id AS account_id, 0 AS mutual_count FROM users WHERE is_suspended=0 AND is_bot=0 AND discoverable=1";
-            $localParams = [];
+            $localSql    = "SELECT
+                                u.id AS account_id,
+                                0 AS mutual_count,
+                                u.follower_count AS follower_count,
+                                COALESCE(rs.recent_posts, 0) AS recent_posts,
+                                COALESCE(rs.last_post_at, '') AS last_post_at
+                            FROM users u
+                            LEFT JOIN (
+                                SELECT user_id, COUNT(*) AS recent_posts, MAX(created_at) AS last_post_at
+                                FROM statuses
+                                WHERE visibility = 'public'
+                                  AND reblog_of_id IS NULL
+                                  AND created_at > ?
+                                  AND (expires_at IS NULL OR expires_at='' OR expires_at>?)
+                                  AND (user_id LIKE 'http%' OR user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
+                                GROUP BY user_id
+                            ) rs ON rs.user_id = u.id
+                            WHERE u.is_suspended=0 AND u.is_bot=0 AND u.discoverable=1";
+            $localParams = [$recentSince, now_iso()];
             if ($uid) {
-                $localSql .= ' AND id != ? AND id NOT IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)';
-                $localSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
-                $localSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
+                $localSql .= ' AND u.id != ? AND u.id NOT IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)';
+                $localSql .= ' AND u.id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                $localSql .= ' AND u.id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
                 $localParams[] = $uid;
                 $localParams[] = $uid;
                 $localParams[] = $uid;
                 $localParams[] = $uid;
             }
             if ($alreadyIds) {
-                $localSql .= ' AND id NOT IN (' . implode(',', array_fill(0, count($alreadyIds), '?')) . ')';
+                $localSql .= ' AND u.id NOT IN (' . implode(',', array_fill(0, count($alreadyIds), '?')) . ')';
                 array_push($localParams, ...$alreadyIds);
             }
-            $localSql .= ' ORDER BY follower_count DESC LIMIT ?';
-            $localParams[] = $need;
-            $rows = array_merge($rows, DB::all($localSql, $localParams));
+            $localSql .= ' ORDER BY (CASE WHEN COALESCE(rs.recent_posts, 0) > 0 THEN 1 ELSE 0 END) DESC, COALESCE(rs.recent_posts, 0) DESC, u.follower_count DESC, u.id ASC LIMIT ?';
+            $localParams[] = max($need * 6, 24);
+            $fallbackRows = array_merge($fallbackRows, DB::all($localSql, $localParams));
 
-            if (count($rows) < $limit) {
-                $need2       = $limit - count($rows);
-                $alreadyIds2 = array_column($rows, 'account_id');
-                $remoteSql   = 'SELECT id AS account_id, 0 AS mutual_count FROM remote_actors WHERE username != \'\' AND domain != \'\' AND is_bot=0';
-                $remoteParams = [];
+            if (count($fallbackRows) < $need) {
+                $need2       = $need - count($fallbackRows);
+                $alreadyIds2 = array_merge($alreadyIds, array_column($fallbackRows, 'account_id'));
+                $remoteSql   = "SELECT
+                                    ra.id AS account_id,
+                                    0 AS mutual_count,
+                                    ra.follower_count AS follower_count,
+                                    COALESCE(rs.recent_posts, 0) AS recent_posts,
+                                    COALESCE(rs.last_post_at, '') AS last_post_at
+                                FROM remote_actors ra
+                                LEFT JOIN (
+                                    SELECT user_id, COUNT(*) AS recent_posts, MAX(created_at) AS last_post_at
+                                    FROM statuses
+                                    WHERE visibility = 'public'
+                                      AND reblog_of_id IS NULL
+                                      AND created_at > ?
+                                      AND (expires_at IS NULL OR expires_at='' OR expires_at>?)
+                                      AND user_id LIKE 'http%'
+                                    GROUP BY user_id
+                                ) rs ON rs.user_id = ra.id
+                                WHERE ra.username != '' AND ra.domain != '' AND ra.is_bot=0";
+                $remoteParams = [$recentSince, now_iso()];
                 if ($uid) {
-                    $remoteSql .= ' AND id != ? AND id NOT IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)';
+                    $remoteSql .= ' AND ra.id != ? AND ra.id NOT IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)';
                     $remoteParams[] = $uid;
                     $remoteParams[] = $uid;
-                    $remoteSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
-                    $remoteSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
+                    $remoteSql .= ' AND ra.id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
+                    $remoteSql .= ' AND ra.id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';
                     $remoteParams[] = $uid;
                     $remoteParams[] = $uid;
                 }
                 if ($blocked) {
-                    $remoteSql .= ' AND LOWER(domain) NOT IN (' . implode(',', array_fill(0, count($blocked), '?')) . ')';
+                    $remoteSql .= ' AND LOWER(ra.domain) NOT IN (' . implode(',', array_fill(0, count($blocked), '?')) . ')';
                     array_push($remoteParams, ...$blocked);
                 }
                 if ($alreadyIds2) {
-                    $remoteSql .= ' AND id NOT IN (' . implode(',', array_fill(0, count($alreadyIds2), '?')) . ')';
+                    $remoteSql .= ' AND ra.id NOT IN (' . implode(',', array_fill(0, count($alreadyIds2), '?')) . ')';
                     array_push($remoteParams, ...$alreadyIds2);
                 }
-                $remoteSql .= ' ORDER BY follower_count DESC LIMIT ?';
-                $remoteParams[] = $need2;
-                $rows = array_merge($rows, DB::all($remoteSql, $remoteParams));
+                $remoteSql .= ' ORDER BY (CASE WHEN COALESCE(rs.recent_posts, 0) > 0 THEN 1 ELSE 0 END) DESC, COALESCE(rs.recent_posts, 0) DESC, ra.follower_count DESC, ra.id ASC LIMIT ?';
+                $remoteParams[] = max($need2 * 6, 24);
+                $fallbackRows = array_merge($fallbackRows, DB::all($remoteSql, $remoteParams));
             }
+
+            $rows = array_merge($rows, self::pickInterestingFallbackPeople($fallbackRows, $need, $uid));
         }
 
         $accountIds = array_slice(array_column($rows, 'account_id'), 0, $limit);

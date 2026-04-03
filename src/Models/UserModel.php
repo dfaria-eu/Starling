@@ -227,6 +227,56 @@ class UserModel
      * Fetch $url and check if it contains a rel="me" link pointing to $actorUrl.
      * Returns ISO timestamp if verified, null otherwise.
      */
+    public static function htmlHasRelMeLink(string $html, array $acceptUrls, string $baseUrl = ''): bool
+    {
+        $normalizedAccept = [];
+        foreach ($acceptUrls as $url) {
+            if (!is_string($url) || $url === '') continue;
+            $normalizedAccept[self::normalizeProfileFieldValue($url)] = true;
+        }
+        if (!$normalizedAccept) return false;
+
+        $matchesHref = static function (string $href) use ($normalizedAccept, $baseUrl): bool {
+            $resolved = $baseUrl !== '' ? absolute_url($baseUrl, $href) : trim($href);
+            $normalized = self::normalizeProfileFieldValue($resolved);
+            return isset($normalizedAccept[$normalized]);
+        };
+
+        if (class_exists(\DOMDocument::class)) {
+            $prev = libxml_use_internal_errors(true);
+            $doc  = new \DOMDocument();
+            $domHtml = '<?xml encoding="UTF-8">' . mb_encode_numericentity($html, [0x80, 0x10FFFF, 0, 0x10FFFF], 'UTF-8');
+            if (@$doc->loadHTML($domHtml, LIBXML_NOWARNING | LIBXML_NOERROR)) {
+                foreach (['a', 'link'] as $tagName) {
+                    foreach ($doc->getElementsByTagName($tagName) as $node) {
+                        $rel = strtolower(trim((string)$node->getAttribute('rel')));
+                        if ($rel === '' || !in_array('me', preg_split('/\s+/', $rel) ?: [], true)) continue;
+                        $href = trim((string)$node->getAttribute('href'));
+                        if ($href !== '' && $matchesHref($href)) {
+                            libxml_clear_errors();
+                            libxml_use_internal_errors($prev);
+                            return true;
+                        }
+                    }
+                }
+            }
+            libxml_clear_errors();
+            libxml_use_internal_errors($prev);
+        }
+
+        if (preg_match_all('/<(?:a|link)\b([^>]*?)>/i', $html, $tags)) {
+            foreach ($tags[1] as $attrs) {
+                if (!preg_match('/\brel=["\']([^"\']*)["\']/i', $attrs, $relMatch)) continue;
+                $rels = preg_split('/\s+/', strtolower(trim($relMatch[1]))) ?: [];
+                if (!in_array('me', $rels, true)) continue;
+                if (!preg_match('/\bhref=["\']([^"\']+)["\']/i', $attrs, $hrefMatch)) continue;
+                if ($matchesHref($hrefMatch[1])) return true;
+            }
+        }
+
+        return false;
+    }
+
     public static function verifyRelMe(string $value, string $actorUrl): ?string
     {
         if (!filter_var($value, FILTER_VALIDATE_URL)) return null;
@@ -280,23 +330,11 @@ class UserModel
         }
 
         // All accepted URLs for this profile (both /users/df and /@df formats)
-        $username   = parse_url($actorUrl, PHP_URL_PATH);
-        $atUrl      = AP_BASE_URL . '/@' . ltrim(basename($username), '@');
-        $acceptUrls = [$actorUrl, $atUrl];
-
-        // Look for <a rel="me" href="..."> or <link rel="me" href="...">
-        // Use [\s\S] to handle multi-line tags
-        if (preg_match_all('/<(?:a|link)([\s\S]*?)(?:>|\/?>)/i', $html, $tags)) {
-            foreach ($tags[0] as $tag) {
-                $hasRelMe = (bool)preg_match('/\brel=["\'][^"\']*\bme\b[^"\']*["\']/i', $tag);
-                if (!$hasRelMe) continue;
-                foreach ($acceptUrls as $url) {
-                    if (str_contains($tag, $url)) return now_iso();
-                }
-            }
-        }
-
-        return null;
+        $username = parse_url($actorUrl, PHP_URL_PATH);
+        $atUrl    = AP_BASE_URL . '/@' . ltrim(basename($username), '@');
+        return self::htmlHasRelMeLink($html, [$actorUrl, $atUrl], (string)($finalUrl ?: $value))
+            ? now_iso()
+            : null;
     }
 
     public static function fieldValueToHtml(string $value): string
@@ -308,7 +346,8 @@ class UserModel
         // Plain URL — only allow http(s) to prevent javascript:/data: XSS
         if (preg_match('~^https?://~i', $trimmed) && filter_var($trimmed, FILTER_VALIDATE_URL)) {
             $normalized = self::normalizeProfileFieldValue($trimmed);
-            $display = htmlspecialchars(ltrim(preg_replace('~^https?://~i', '', $normalized), '/'));
+            $displayValue = preg_replace('~^https?://~i', '', $trimmed) ?? $trimmed;
+            $display = htmlspecialchars(ltrim($displayValue, '/'));
             $href    = htmlspecialchars($normalized);
             return '<a href="' . $href . '" rel="me nofollow noopener noreferrer" target="_blank">' . $display . '</a>';
         }
