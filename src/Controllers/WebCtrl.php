@@ -147,7 +147,8 @@ class WebCtrl
         // Featured profiles
         $featuredUsers = DB::all('SELECT username, display_name, avatar, bio, follower_count FROM users WHERE is_suspended=0 ORDER BY follower_count DESC, created_at ASC LIMIT 4');
         $recentPosts = DB::all(
-            "SELECT s.id, s.content, s.cw, s.created_at, u.username, u.display_name, u.avatar
+            "SELECT s.id, s.content, s.cw, s.created_at, s.reblog_of_id, s.reply_to_id, s.user_id,
+                    u.username, u.display_name, u.avatar
              FROM statuses s
              JOIN users u ON u.id = s.user_id
              WHERE s.local=1 AND s.visibility IN ('public','unlisted') AND u.is_suspended=0
@@ -207,6 +208,7 @@ main{max-width:900px;margin:0 auto;padding:2rem 1rem}
 .stat.muted .n{color:var(--text2)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin-bottom:2rem}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1.25rem 1.4rem}
+.card-full{grid-column:1 / -1}
 .card-title{font-size:.75rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.9rem}
 .profile-row{display:flex;align-items:center;gap:.75rem;padding:.5rem 0;border-bottom:1px solid var(--border)}
 .profile-row:last-child{border-bottom:0}
@@ -221,6 +223,7 @@ main{max-width:900px;margin:0 auto;padding:2rem 1rem}
 .post-avatar{width:32px;height:32px;border-radius:50%;object-fit:cover;flex-shrink:0}
 .post-author{font-size:.86rem;font-weight:700;color:var(--text)}
 .post-time{font-size:.78rem;color:var(--text3)}
+.post-kind{display:inline-flex;align-items:center;margin-left:.35rem;padding:.08rem .42rem;border-radius:9999px;border:1px solid var(--border);background:var(--hover);color:var(--text2);font-size:.72rem;font-weight:700}
 .post-snippet{font-size:.9rem;color:var(--text2);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .chip{display:inline-block;color:var(--text2);font-size:.82rem;font-weight:500;padding:.38rem .85rem;border-radius:9999px;border:1px solid var(--border);background:var(--hover)}
 .chip:hover{border-color:var(--blue);color:var(--blue);text-decoration:none}
@@ -292,11 +295,53 @@ SECTION;
         if ($recentPosts) {
             $recentRows = '';
             foreach ($recentPosts as $rp) {
-                $postAvatar = htmlspecialchars(local_media_url_or_fallback($rp['avatar'] ?? '', '/img/avatar.svg'));
-                $postName = htmlspecialchars($rp['display_name'] ?: $rp['username']);
-                $postUrl = htmlspecialchars(ap_url('@' . $rp['username'] . '/' . $rp['id']));
+                $displayPost = $rp;
+                $displayNameRaw = (string)($rp['display_name'] ?: $rp['username']);
+                $displayAvatarRaw = (string)($rp['avatar'] ?? '');
+                $kindIcon = '•';
+                $kindLabel = 'Post';
+                $postUrlRaw = ap_url('@' . $rp['username'] . '/' . $rp['id']);
+
+                if (!empty($rp['reblog_of_id'])) {
+                    $kindIcon = '↻';
+                    $kindLabel = 'Repost';
+                    $orig = StatusModel::byId((string)$rp['reblog_of_id']);
+                    if ($orig) {
+                        $displayPost = $orig;
+                        if ((int)($orig['local'] ?? 0) === 1) {
+                            $origAuthor = DB::one(
+                                'SELECT username, display_name, avatar FROM users WHERE id=? AND is_suspended=0',
+                                [$orig['user_id']]
+                            );
+                            if ($origAuthor) {
+                                $displayNameRaw = (string)($origAuthor['display_name'] ?: $origAuthor['username']);
+                                $displayAvatarRaw = (string)($origAuthor['avatar'] ?? '');
+                            }
+                        } else {
+                            $remoteAuthor = DB::one(
+                                'SELECT username, display_name, avatar FROM remote_actors WHERE id=?',
+                                [$orig['user_id']]
+                            );
+                            if ($remoteAuthor) {
+                                $displayNameRaw = (string)($remoteAuthor['display_name'] ?: $remoteAuthor['username']);
+                                $displayAvatarRaw = (string)($remoteAuthor['avatar'] ?? '');
+                            }
+                        }
+                    }
+                } elseif (!empty($rp['reply_to_id'])) {
+                    $kindIcon = '↩';
+                    $kindLabel = 'Reply';
+                }
+
+                $postAvatar = htmlspecialchars(local_media_url_or_fallback($displayAvatarRaw, '/img/avatar.svg'));
+                $postName = htmlspecialchars($displayNameRaw);
+                $postUrl = htmlspecialchars($postUrlRaw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
                 $postTime = htmlspecialchars(date('j M · H:i', strtotime((string)$rp['created_at'])));
-                $snippetSource = trim((string)($rp['cw'] ?: strip_tags(text_to_html((string)$rp['content']))));
+                $postKind = htmlspecialchars($kindIcon . ' ' . $kindLabel, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                $snippetHtml = (int)($displayPost['local'] ?? 1) === 1
+                    ? text_to_html((string)($displayPost['content'] ?? ''))
+                    : ensure_html((string)($displayPost['content'] ?? ''));
+                $snippetSource = trim((string)(($displayPost['cw'] ?? '') ?: strip_tags($snippetHtml)));
                 $snippet = htmlspecialchars(mb_substr($snippetSource, 0, 180), ENT_QUOTES | ENT_HTML5, 'UTF-8');
                 $recentRows .= <<<ROW
 <a href="$postUrl" class="post-row">
@@ -304,7 +349,7 @@ SECTION;
     <img class="post-avatar" src="$postAvatar" alt="">
     <div>
       <div class="post-author">$postName</div>
-      <div class="post-time">$postTime</div>
+      <div class="post-time">$postTime <span class="post-kind">$postKind</span></div>
     </div>
   </div>
   <div class="post-snippet">$snippet</div>
@@ -320,7 +365,7 @@ SECTION;
         }
 
         echo <<<HTML
-    <div class="card">
+    <div class="card card-full">
       <div class="card-title">Server info</div>
       <div class="links-row">
         <a href="/api/v1/instance" class="chip">API</a>
@@ -328,7 +373,7 @@ SECTION;
         <a href="/.well-known/webfinger?resource=acct:$wfAcct" class="chip">WebFinger</a>
         <a href="/about" class="chip">About</a>
       </div>
-      <p style="font-size:.8rem;color:var(--text2);margin-top:1rem">Server: <strong>$domain</strong> &bull; v$v</p>
+      <p style="font-size:.8rem;color:var(--text2);margin-top:1rem">Server: <strong>$domain</strong> &bull; Software: <strong>Starling</strong> v$v</p>
     </div>
   </div>
 
@@ -396,6 +441,12 @@ HTML;
         // Content negotiation: serve ActivityPub JSON when requested (Mastodon search, etc.)
         $accept = $_SERVER['HTTP_ACCEPT'] ?? '';
         if (str_contains($accept, 'activity+json') || str_contains($accept, 'ld+json')) {
+            if (!empty($s['reblog_of_id'])) {
+                $orig = StatusModel::byId((string)$s['reblog_of_id']);
+                if ($orig) {
+                    ap_json_out(\App\ActivityPub\Builder::announce($s, $orig, $user));
+                }
+            }
             $note = \App\ActivityPub\Builder::note($s, $user);
             $note = ['@context' => \App\ActivityPub\Builder::getContext()] + $note;
             ap_json_out($note);
@@ -403,7 +454,7 @@ HTML;
 
         $domain = AP_DOMAIN;
         $name   = htmlspecialchars(AP_NAME);
-        $apUrl  = htmlspecialchars($s['uri']);
+        $activityPubUrlRaw = (string)($displayStatus['uri'] ?? $s['uri'] ?? '');
 
         // For boosts, show the original post's content and author
         if ($s['reblog_of_id']) {
@@ -437,10 +488,40 @@ HTML;
             exit;
         }
 
-        $uname      = htmlspecialchars($user['display_name'] ?: $user['username']);
-        $acct       = htmlspecialchars('@' . $user['username'] . '@' . $domain);
-        $avatar     = htmlspecialchars(local_media_url_or_fallback($user['avatar'] ?? '', '/img/avatar.svg'));
-        $profileUrl = htmlspecialchars(ap_url('users/' . $user['username']));
+        $ownerProfileUrlRaw = ap_url('users/' . $user['username']);
+        $displayProfileUrlRaw = $ownerProfileUrlRaw;
+        $displayNameRaw = (string)($user['display_name'] ?: $user['username']);
+        $displayAcctRaw = '@' . $user['username'] . '@' . $domain;
+        $displayAvatarRaw = (string)($user['avatar'] ?? '');
+        $boostHtml = '';
+
+        if ($s['reblog_of_id'] && !empty($displayStatus['user_id'])) {
+            if ((int)($displayStatus['local'] ?? 0) === 1) {
+                $displayAuthor = DB::one('SELECT username, display_name, avatar FROM users WHERE id=? AND is_suspended=0', [$displayStatus['user_id']]);
+                if ($displayAuthor) {
+                    $displayNameRaw = (string)($displayAuthor['display_name'] ?: $displayAuthor['username']);
+                    $displayAcctRaw = '@' . $displayAuthor['username'] . '@' . $domain;
+                    $displayAvatarRaw = (string)($displayAuthor['avatar'] ?? '');
+                    $displayProfileUrlRaw = ap_url('users/' . $displayAuthor['username']);
+                }
+            } else {
+                $displayRemote = DB::one('SELECT username, display_name, avatar, domain, url, id FROM remote_actors WHERE id=?', [$displayStatus['user_id']]);
+                if ($displayRemote) {
+                    $displayNameRaw = (string)($displayRemote['display_name'] ?: $displayRemote['username']);
+                    $displayAcctRaw = '@' . $displayRemote['username'] . '@' . $displayRemote['domain'];
+                    $displayAvatarRaw = (string)($displayRemote['avatar'] ?? '');
+                    $displayProfileUrlRaw = (string)($displayRemote['url'] ?: (($displayRemote['domain'] && $displayRemote['username']) ? 'https://' . $displayRemote['domain'] . '/@' . ltrim((string)$displayRemote['username'], '@') : ($displayRemote['id'] ?? '')));
+                }
+            }
+
+            $boostHtml = '<div class="reply-indicator"><svg viewBox="0 0 24 24"><path d="M17 1L21 5L17 9V6H7V12H5V6C5 4.9 5.9 4 7 4H17V1ZM7 23L3 19L7 15V18H17V12H19V18C19 19.1 18.1 20 17 20H7V23Z"/></svg> Reposted by <a class="reply-to-name" href="' . htmlspecialchars(ap_url('users/' . $user['username']), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">@' . htmlspecialchars($user['username'], ENT_QUOTES | ENT_HTML5, 'UTF-8') . '@' . htmlspecialchars($domain, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</a></div>';
+        }
+
+        $uname      = htmlspecialchars($displayNameRaw);
+        $acct       = htmlspecialchars($displayAcctRaw);
+        $avatar     = htmlspecialchars(local_media_url_or_fallback($displayAvatarRaw, '/img/avatar.svg'));
+        $ownerProfileUrl = htmlspecialchars($ownerProfileUrlRaw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $profileUrl = htmlspecialchars($displayProfileUrlRaw);
         $contentRaw = (int)($displayStatus['local'] ?? 1) ? text_to_html($displayStatus['content']) : ensure_html($displayStatus['content']);
         $ts         = htmlspecialchars($s['created_at']);
         $visBadge   = ($displayStatus['visibility'] ?? 'public') === 'unlisted'
@@ -453,6 +534,18 @@ HTML;
         if (!empty($displayStatus['reply_to_id'])) {
             $replyToHandle = '';
             $replyToUrl = '';
+            $replyTargetUrl = '';
+            $replyTargetId = (string)$displayStatus['reply_to_id'];
+            $replyParent = StatusModel::byId($replyTargetId);
+            if ($replyParent) {
+                if ((int)($replyParent['local'] ?? 0) === 1) {
+                    $replyTargetUrl = ap_url('objects/' . rawurlencode((string)$replyParent['id']));
+                } else {
+                    $replyTargetUrl = (string)(($replyParent['url'] ?? '') !== '' ? $replyParent['url'] : ($replyParent['uri'] ?? ''));
+                }
+            } elseif (str_starts_with($replyTargetId, 'http')) {
+                $replyTargetUrl = $replyTargetId;
+            }
             if (!empty($displayStatus['reply_to_uid'])) {
                 $rl = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$displayStatus['reply_to_uid']]);
                 if ($rl) {
@@ -467,8 +560,9 @@ HTML;
                 }
             }
             $replyLabel = $replyToHandle ? htmlspecialchars($replyToHandle) : '';
-            $replyTarget = ($replyLabel && $replyToUrl)
-                ? ' to <a class="reply-to-name" href="' . htmlspecialchars($replyToUrl) . '">' . $replyLabel . '</a>'
+            $replyHref = $replyTargetUrl !== '' ? $replyTargetUrl : $replyToUrl;
+            $replyTarget = ($replyLabel && $replyHref)
+                ? ' to <a class="reply-to-name" href="' . htmlspecialchars($replyHref, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">' . $replyLabel . '</a>'
                 : ($replyLabel ? ' to ' . $replyLabel : '');
             $replyHtml = '<div class="reply-indicator"><svg viewBox="0 0 24 24"><path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"/></svg> Reply' . $replyTarget . '</div>';
         }
@@ -489,7 +583,18 @@ HTML;
             $ogImage = htmlspecialchars($mediaItems[0]['url']);
         }
 
-        $canonicalUrl = htmlspecialchars(AP_BASE_URL . '/@' . $user['username'] . '/' . $s['id']);
+        $canonicalUrlRaw = AP_BASE_URL . '/@' . $user['username'] . '/' . $s['id'];
+        $interactUrlRaw = $canonicalUrlRaw;
+        if (!empty($s['reblog_of_id'])) {
+            if ((int)($displayStatus['local'] ?? 0) === 1) {
+                $interactUrlRaw = AP_BASE_URL . '/objects/' . rawurlencode((string)$displayStatus['id']);
+            } elseif (!empty($displayStatus['uri'])) {
+                $interactUrlRaw = (string)$displayStatus['uri'];
+            }
+        }
+        $canonicalUrl = htmlspecialchars($canonicalUrlRaw);
+        $interactUrl = htmlspecialchars($interactUrlRaw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $apUrl = htmlspecialchars($activityPubUrlRaw !== '' ? $activityPubUrlRaw : $interactUrlRaw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
         // Format timestamp nicely
         $tsDate = date('j M Y', strtotime($s['created_at']));
@@ -759,7 +864,7 @@ a:hover{text-decoration:underline}
 <body>
 <div class="col-main">
   <div class="back-header">
-    <a href="$profileUrl" class="back-btn">
+    <a href="$ownerProfileUrl" class="back-btn">
       <svg viewBox="0 0 24 24"><path d="M7.414 13l5.043 5.04-1.414 1.42L3.586 12l7.457-7.46 1.414 1.42L7.414 11H21v2H7.414z"/></svg>
     </a>
     <span class="back-title">Post</span>
@@ -770,7 +875,8 @@ a:hover{text-decoration:underline}
       <div class="status-left">
         <a href="$profileUrl"><img class="avatar" src="$avatar" alt="$uname"></a>
       </div>
-      <div class="status-body">
+        <div class="status-body">
+        $boostHtml
         <div class="status-header">
           <a href="$profileUrl" class="s-name">$uname</a>
           <span class="s-acct">$acct</span>
@@ -813,7 +919,7 @@ a:hover{text-decoration:underline}
   <div class="modal">
     <h3>Interact with this post</h3>
     <p>Copy the post URL and paste it into the search field of your favourite Fediverse app to reply, repost, or like it.</p>
-    <div class="handle-box" onclick="navigator.clipboard&&navigator.clipboard.writeText(this.innerText).then(()=>{this.style.borderColor='var(--green)'})">$canonicalUrl</div>
+    <div class="handle-box" onclick="navigator.clipboard&&navigator.clipboard.writeText(this.innerText).then(()=>{this.style.borderColor='var(--green)'})">$interactUrl</div>
     <br>
     <button class="follow-btn" onclick="window.open('https://joinmastodon.org/apps','_blank','noopener,noreferrer')">Get a Fediverse app</button>
     <br>

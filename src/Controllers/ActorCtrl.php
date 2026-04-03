@@ -207,6 +207,113 @@ HTML;
             . '</div></div>';
     }
 
+    private function rssItemTitle(array $status, array $owner): string
+    {
+        $ownerHandle = '@' . $owner['username'] . '@' . AP_DOMAIN;
+        if (!empty($status['reblog_of_id'])) {
+            $orig = StatusModel::byId((string)$status['reblog_of_id']);
+            if ($orig) {
+                $origHandle = $this->rssAuthorHandle((string)$orig['user_id']);
+                return 'Repost by ' . $ownerHandle . ($origHandle !== '' ? ' of ' . $origHandle : '');
+            }
+            return 'Repost by ' . $ownerHandle;
+        }
+        if (!empty($status['reply_to_id'])) {
+            return 'Reply by ' . $ownerHandle;
+        }
+        $plain = trim(html_entity_decode(strip_tags((int)($status['local'] ?? 1) ? text_to_html((string)$status['content']) : ensure_html((string)$status['content'])), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if ($plain === '') return 'Post by ' . $ownerHandle;
+        return (function_exists('mb_substr') ? mb_substr($plain, 0, 80) : substr($plain, 0, 80));
+    }
+
+    private function rssAuthorHandle(string $userId): string
+    {
+        $local = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$userId]);
+        if ($local) return '@' . $local['username'] . '@' . AP_DOMAIN;
+        $remote = DB::one('SELECT username, domain FROM remote_actors WHERE id=?', [$userId]);
+        if ($remote && !empty($remote['username']) && !empty($remote['domain'])) {
+            return '@' . $remote['username'] . '@' . $remote['domain'];
+        }
+        return '';
+    }
+
+    private function rssItemDescription(array $status, array $owner): string
+    {
+        $statusForContent = $status;
+        $prefix = '';
+        if (!empty($status['reblog_of_id'])) {
+            $orig = StatusModel::byId((string)$status['reblog_of_id']);
+            if ($orig) {
+                $statusForContent = $orig;
+                $origHandle = $this->rssAuthorHandle((string)$orig['user_id']);
+                $prefix = '<p><strong>Reposted by @' . htmlspecialchars($owner['username'], ENT_QUOTES | ENT_HTML5, 'UTF-8') . '@' . htmlspecialchars(AP_DOMAIN, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</strong>'
+                    . ($origHandle !== '' ? ' &middot; original by ' . htmlspecialchars($origHandle, ENT_QUOTES | ENT_HTML5, 'UTF-8') : '')
+                    . '</p>';
+            }
+        } elseif (!empty($status['reply_to_id'])) {
+            $prefix = '<p><strong>Reply by @' . htmlspecialchars($owner['username'], ENT_QUOTES | ENT_HTML5, 'UTF-8') . '@' . htmlspecialchars(AP_DOMAIN, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</strong></p>';
+        }
+        $html = (int)($statusForContent['local'] ?? 1) ? text_to_html((string)$statusForContent['content']) : ensure_html((string)$statusForContent['content']);
+        if (trim(strip_tags($html)) === '') {
+            $html = '<p>(No text content)</p>';
+        }
+        return $prefix . $html;
+    }
+
+    public function rss(array $p): void
+    {
+        $u = UserModel::byUsername($p['username']);
+        if (!$u) err_out('Not found', 404);
+
+        $rows = DB::all(
+            "SELECT * FROM statuses WHERE user_id=? AND visibility IN ('public','unlisted') AND (expires_at IS NULL OR expires_at='' OR expires_at>?) ORDER BY created_at DESC LIMIT 20",
+            [$u['id'], now_iso()]
+        );
+
+        $profileUrlRaw = ap_url('@' . $u['username']);
+        $rssUrlRaw = $profileUrlRaw . '.rss';
+        $title = ($u['display_name'] ?: $u['username']) . ' (@' . $u['username'] . '@' . AP_DOMAIN . ')';
+        $description = trim((string)($u['bio'] ?? ''));
+        if ($description === '') {
+            $description = 'Public posts from ' . $title;
+        }
+
+        $itemsXml = '';
+        foreach ($rows as $s) {
+            $linkRaw = ap_url('@' . $u['username'] . '/' . $s['id']);
+            $guidRaw = $linkRaw;
+            if (!empty($s['reblog_of_id'])) {
+                $orig = StatusModel::byId((string)$s['reblog_of_id']);
+                if ($orig && (int)($orig['local'] ?? 0) === 1) {
+                    $guidRaw = AP_BASE_URL . '/objects/' . rawurlencode((string)$orig['id']);
+                } elseif ($orig && !empty($orig['uri'])) {
+                    $guidRaw = (string)$orig['uri'];
+                }
+            }
+            $itemTitle = htmlspecialchars($this->rssItemTitle($s, $u), ENT_QUOTES | ENT_XML1, 'UTF-8');
+            $itemLink = htmlspecialchars($linkRaw, ENT_QUOTES | ENT_XML1, 'UTF-8');
+            $itemGuid = htmlspecialchars($guidRaw, ENT_QUOTES | ENT_XML1, 'UTF-8');
+            $itemAuthor = htmlspecialchars($u['username'] . '@' . AP_DOMAIN, ENT_QUOTES | ENT_XML1, 'UTF-8');
+            $itemPubDate = htmlspecialchars(date(DATE_RSS, strtotime((string)$s['created_at'])), ENT_QUOTES | ENT_XML1, 'UTF-8');
+            $itemDesc = '<![CDATA[' . $this->rssItemDescription($s, $u) . ']]>';
+            $itemsXml .= "<item><title>{$itemTitle}</title><link>{$itemLink}</link><guid isPermaLink=\"false\">{$itemGuid}</guid><pubDate>{$itemPubDate}</pubDate><author>{$itemAuthor}</author><description>{$itemDesc}</description></item>";
+        }
+
+        $lastBuild = !empty($rows) ? date(DATE_RSS, strtotime((string)$rows[0]['created_at'])) : date(DATE_RSS);
+        header('Content-Type: application/rss+xml; charset=utf-8');
+        echo '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<rss version="2.0"><channel>'
+            . '<title>' . htmlspecialchars($title, ENT_QUOTES | ENT_XML1, 'UTF-8') . '</title>'
+            . '<link>' . htmlspecialchars($profileUrlRaw, ENT_QUOTES | ENT_XML1, 'UTF-8') . '</link>'
+            . '<atom:link xmlns:atom="http://www.w3.org/2005/Atom" href="' . htmlspecialchars($rssUrlRaw, ENT_QUOTES | ENT_XML1, 'UTF-8') . '" rel="self" type="application/rss+xml" />'
+            . '<description>' . htmlspecialchars($description, ENT_QUOTES | ENT_XML1, 'UTF-8') . '</description>'
+            . '<language>en</language>'
+            . '<lastBuildDate>' . htmlspecialchars($lastBuild, ENT_QUOTES | ENT_XML1, 'UTF-8') . '</lastBuildDate>'
+            . $itemsXml
+            . '</channel></rss>';
+        exit;
+    }
+
     public function show(array $p): void
     {
         $u = UserModel::byUsername($p['username']);
@@ -215,6 +322,11 @@ HTML;
         $accept = $_SERVER['HTTP_ACCEPT'] ?? '';
         if (str_contains($accept, 'activity+json') || str_contains($accept, 'ld+json')) {
             ap_json_out(Builder::actor($u));
+        }
+        $requestPath = rawurldecode(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/');
+        if ($requestPath === '/users/' . $u['username']) {
+            header('Location: ' . ap_url('@' . $u['username']), true, 301);
+            exit;
         }
         // HTML fallback — full profile page
         header('Content-Type: text/html; charset=utf-8');
@@ -229,6 +341,8 @@ HTML;
         $following   = (int)$u['following_count'];
         $statusCount = (int)$u['status_count'];
         $apUrl       = actor_url($u['username']);
+        $canonicalProfileUrl = htmlspecialchars(ap_url('@' . $u['username']), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $rssUrl      = htmlspecialchars(ap_url('@' . $u['username'] . '.rss'), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         $handle      = htmlspecialchars('@' . $u['username'] . '@' . $domain);
         $v           = AP_VERSION;
         $loginCta = '<a href="/web/login" class="public-nav-action">Log in</a>';
@@ -295,6 +409,7 @@ HTML;
             $orig = null;
             $content = '';
             $attrHandle = '';
+            $interactUrlRaw = ap_url('@' . $u['username'] . '/' . $s['id']);
 
             if ($kind === 'boost' && $s['reblog_of_id']) {
                 $orig = DB::one('SELECT * FROM statuses WHERE id=?', [$s['reblog_of_id']]);
@@ -305,15 +420,23 @@ HTML;
                         ? htmlspecialchars(ap_url('@' . $origAuthor['username'] . '/' . $orig['id']))
                         : htmlspecialchars(ap_url('@' . $u['username'] . '/' . $s['id']));
                 } elseif ($orig) {
-                    $postUrl = htmlspecialchars($orig['uri'] ?? ap_url('@' . $u['username'] . '/' . $s['id']));
+                    $postUrl = htmlspecialchars(ap_url('@' . $u['username'] . '/' . $s['id']));
                 } else {
                     $postUrl = htmlspecialchars(ap_url('@' . $u['username'] . '/' . $s['id']));
+                }
+                if ($orig) {
+                    if ((int)($orig['local'] ?? 0) === 1) {
+                        $interactUrlRaw = AP_BASE_URL . '/objects/' . rawurlencode((string)$orig['id']);
+                    } else {
+                        $interactUrlRaw = (string)(($orig['url'] ?? '') !== '' ? $orig['url'] : ($orig['uri'] ?? $interactUrlRaw));
+                    }
                 }
             } else {
                 $content = (int)($s['local'] ?? 1) ? text_to_html($s['content']) : ensure_html($s['content']);
                 $attrHandle = $s['reply_to_uid'] ? $getHandle($s['reply_to_uid']) : '';
                 $postUrl = htmlspecialchars(ap_url('@' . $u['username'] . '/' . $s['id']));
             }
+            $interactUrl = htmlspecialchars($interactUrlRaw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
             $contentTextLen = function_exists('mb_strlen') ? mb_strlen(trim(strip_tags($content))) : strlen(trim(strip_tags($content)));
             $truncateContent = $contentTextLen > 600;
             $contentClass = $truncateContent ? 's-content truncated' : 's-content';
@@ -360,9 +483,21 @@ HTML;
             $replyIndicator = '';
             if ($kind !== 'boost' && $s['reply_to_id']) {
                 $replyLabel = $attrHandle ? htmlspecialchars($attrHandle) : '';
-                $replyUrl = $s['reply_to_uid'] ? htmlspecialchars($getProfileUrl($s['reply_to_uid'])) : '';
-                $replyTarget = ($replyLabel && $replyUrl)
-                    ? ' to <a class="reply-to-name" href="' . $replyUrl . '" onclick="event.stopPropagation()">' . $replyLabel . '</a>'
+                $replyTargetUrl = '';
+                $replyParent = \App\Models\StatusModel::byId((string)$s['reply_to_id']);
+                if ($replyParent) {
+                    if ((int)($replyParent['local'] ?? 0) === 1) {
+                        $replyTargetUrl = htmlspecialchars(ap_url('objects/' . rawurlencode((string)$replyParent['id'])));
+                    } else {
+                        $replyTargetUrl = htmlspecialchars((string)(($replyParent['url'] ?? '') !== '' ? $replyParent['url'] : ($replyParent['uri'] ?? '')));
+                    }
+                } elseif (str_starts_with((string)$s['reply_to_id'], 'http')) {
+                    $replyTargetUrl = htmlspecialchars((string)$s['reply_to_id']);
+                } elseif ($s['reply_to_uid']) {
+                    $replyTargetUrl = htmlspecialchars($getProfileUrl($s['reply_to_uid']));
+                }
+                $replyTarget = ($replyLabel && $replyTargetUrl)
+                    ? ' to <a class="reply-to-name" href="' . $replyTargetUrl . '" onclick="event.stopPropagation()">' . $replyLabel . '</a>'
                     : ($replyLabel ? ' to ' . $replyLabel : '');
                 $replyIndicator = '<div class="reply-indicator"><svg viewBox="0 0 24 24"><path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"/></svg> Reply' . $replyTarget . '</div>';
             }
@@ -422,7 +557,7 @@ HTML;
             $fcHtml = $fc > 0 ? '<span class="action-count">' . $fc . '</span>' : '';
 
             return <<<CARD
-<div class="status-card" data-kind="$dataKind"$hideStyle onclick="handleCardClick(event,'$postUrl')">
+<div class="status-card" data-kind="$dataKind" data-interact-url="$interactUrl"$hideStyle onclick="handleCardClick(event,'$postUrl')">
   $boostBar
   <div class="status-inner">
     <div class="status-left">
@@ -488,9 +623,12 @@ MORE;
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>$displayName ($handle)</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="canonical" href="$canonicalProfileUrl">
 <link rel="alternate" type="application/activity+json" href="$apUrl">
+<link rel="alternate" type="application/rss+xml" title="$displayName RSS" href="$rssUrl">
 <meta property="og:type" content="profile">
 <meta property="og:title" content="$displayName ($handle)">
+<meta property="og:url" content="$canonicalProfileUrl">
 <meta property="og:image" content="$avatar">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -751,6 +889,7 @@ a:hover{text-decoration:underline}
       </div>
       <div class="profile-actions">
         <button class="follow-btn" onclick="document.getElementById('follow-modal').style.display='flex'">Follow</button>
+        <a class="public-nav-action" href="$rssUrl">RSS</a>
       </div>
     </div>
   </div>
@@ -817,10 +956,13 @@ function switchTab(btn, kind) {
 function showInteract(ev) {
   var card = ev && ev.target ? ev.target.closest('.status-card') : null;
   if (!card) return;
-  var url = card.getAttribute('onclick');
-  var m = url && url.match(/handleCardClick\(event,'([^']+)'\)/);
-  if (m) {
-    var postUrl = m[1];
+  var postUrl = card.getAttribute('data-interact-url') || '';
+  if (!postUrl) {
+    var url = card.getAttribute('onclick');
+    var m = url && url.match(/handleCardClick\(event,'([^']+)'\)/);
+    if (m) postUrl = m[1];
+  }
+  if (postUrl) {
     if (!postUrl.startsWith('http')) postUrl = window.location.origin + postUrl;
     document.getElementById('interact-url').textContent = postUrl;
   }

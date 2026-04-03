@@ -20,6 +20,7 @@ class Router
         // ── ActivityPub actor ─────────────────────────────────
         $this->get('/users',                          'ActorCtrl@index');
         $this->get('/users/',                         'ActorCtrl@index');
+        $this->get('/users/:username.rss',            'ActorCtrl@rss');
         $this->get('/users/:username',                'ActorCtrl@show');
         $this->get('/users/:username/followers',      'ActorCtrl@followers');
         $this->get('/users/:username/following',      'ActorCtrl@following');
@@ -300,8 +301,9 @@ class Router
         $this->get('/privacy',    'WebCtrl@privacy');
         $this->get('/terms',      'WebCtrl@terms');
         $this->get('/rules',      'WebCtrl@rules');
-        $this->get('/@:username',     'WebCtrl@profile');
-        $this->get('/@:username/',    'WebCtrl@profile');
+        $this->get('/@:username.rss', 'ActorCtrl@rss');
+        $this->get('/@:username',     'ActorCtrl@show');
+        $this->get('/@:username/',    'ActorCtrl@show');
         $this->get('/@:username/:id', 'WebCtrl@status');
         $this->get('/install', 'WebCtrl@install');
         $this->post('/install','WebCtrl@installPost');

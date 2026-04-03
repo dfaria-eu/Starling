@@ -225,55 +225,9 @@ class TrendsCtrl
         // Compute boosts in a separate aggregate pass instead of LEFT JOIN-ing all recent
         // reblogs into every candidate row. On SQLite/shared hosting that join is the main
         // cost of this endpoint and quickly becomes the slowest public API query.
-        $outerFilter = '';
         $since = gmdate('Y-m-d\TH:i:s\Z', strtotime('-2 days'));
-        $params = [$since, now_iso(), $since, now_iso()];
-
-        // Cursor paging must follow the same ordering as the endpoint: trend_score DESC, id DESC.
-        // Filtering only by id is wrong here and can skip or repeat statuses with higher/lower scores.
-        if ($maxId) {
-            $ref = DB::one(
-                "WITH candidates AS (
-                    SELECT s.id, s.favourite_count, s.reply_count, s.created_at
-                    FROM statuses s
-                    WHERE s.visibility = 'public'
-                      AND s.reblog_of_id IS NULL
-                      AND s.created_at > ?
-                      AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
-                      AND (s.user_id LIKE 'http%' OR s.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
-                      {$domainFilter}
-                 ),
-                 public_reblogs AS (
-                    SELECT r.reblog_of_id AS status_id, COUNT(*) AS public_boosts
-                    FROM statuses r
-                    WHERE r.visibility = 'public'
-                      AND r.reblog_of_id IS NOT NULL
-                      AND r.created_at > ?
-                      AND (r.expires_at IS NULL OR r.expires_at='' OR r.expires_at>?)
-                      AND (r.user_id LIKE 'http%' OR r.user_id NOT IN (SELECT id FROM users WHERE is_suspended=1))
-                      {$reblogDomainFilter}
-                    GROUP BY r.reblog_of_id
-                 ),
-                 scored AS (
-                    SELECT c.id,
-                           (COALESCE(pr.public_boosts, 0) * 2 + c.favourite_count + (c.reply_count * 0.25) + 1) * EXP(
-                               -CAST((JULIANDAY('now') - JULIANDAY(c.created_at)) * 24.0 AS REAL)
-                               * 0.693147 / 5.0
-                           ) AS trend_score
-                    FROM candidates c
-                    LEFT JOIN public_reblogs pr ON pr.status_id = c.id
-                 )
-                 SELECT trend_score, id FROM scored WHERE id=? LIMIT 1",
-                [$since, now_iso(), $since, now_iso(), $maxId]
-            );
-            if ($ref) {
-                $outerFilter = ' WHERE (trend_score < ? OR (trend_score = ? AND id < ?))';
-                $params[] = $ref['trend_score'];
-                $params[] = $ref['trend_score'];
-                $params[] = $ref['id'];
-            }
-        }
-        $params[] = $limit;
+        $poolLimit = max($limit * 8, 200);
+        $params = [$since, now_iso(), $since, now_iso(), $poolLimit];
 
         $sql = "
             WITH candidates AS (
@@ -307,12 +261,23 @@ class TrendsCtrl
                 LEFT JOIN public_reblogs pr ON pr.status_id = c.id
             )
             SELECT * FROM scored
-            {$outerFilter}
             ORDER BY trend_score DESC, id DESC
             LIMIT ?
         ";
 
         $rows = DB::all($sql, $params);
+        if ($maxId !== null && $maxId !== '') {
+            $cursorIndex = null;
+            foreach ($rows as $index => $row) {
+                if ((string)($row['id'] ?? '') === (string)$maxId) {
+                    $cursorIndex = $index;
+                    break;
+                }
+            }
+            $rows = $cursorIndex === null ? [] : array_slice($rows, $cursorIndex + 1, $limit);
+        } else {
+            $rows = array_slice($rows, 0, $limit);
+        }
         $out  = array_values(array_filter(array_map(
             fn($s) => StatusModel::toMasto($s, $viewer['id'] ?? null),
             $rows

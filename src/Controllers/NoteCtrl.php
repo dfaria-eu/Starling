@@ -27,6 +27,13 @@ class NoteCtrl {
         $u = UserModel::byId($s['user_id']);
         if ($u && !empty($u['is_suspended'])) $u = null;
         if (!$u) err_out('Not found', 404);
+        if (!empty($s['reblog_of_id'])) {
+            $orig = StatusModel::byId((string)$s['reblog_of_id']);
+            if ($orig) {
+                $announce = Builder::announce($s, $orig, $u);
+                ap_json_out($announce);
+            }
+        }
         $note = Builder::note($s, $u);
         $note = ['@context' => Builder::getContext()] + $note;
         ap_json_out($note);
