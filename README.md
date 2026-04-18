@@ -1,4 +1,4 @@
-# ⋰⋱ Starling 
+# ⋰⋱ Starling (v0.0.2)
 
 > The simplest way to run your own fediverse server: no database, no workers, no DevOps.
 
@@ -39,7 +39,7 @@ Starling speaks ActivityPub and can interact with platforms such as:
 - PixelFed
 - other ActivityPub-compatible servers
 
-Tested clients so far include Ivory, Elk, and Phanpy.
+Tested clients so far include Ivory, Mastodon iOS, Elk, Phanpy, Fedicat, MastoBlaster, and IceCubes.
 
 ## What You Can Do
 
