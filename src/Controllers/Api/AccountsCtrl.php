@@ -404,7 +404,7 @@ use App\ActivityPub\{Builder, Delivery};
         if (!$acct) err_out('Missing acct parameter', 422);
 
         if (str_contains($acct, '@')) {
-            [$username, $domain] = explode('@', ltrim($acct, '@'), 2);
+            [$username, $domain] = $this->splitLookupAcct($acct);
             $domain = strtolower($domain);
             if (is_local($domain)) {
                 $u = UserModel::byUsername($username);
@@ -435,6 +435,24 @@ use App\ActivityPub\{Builder, Delivery};
         $u = UserModel::byUsername(ltrim($acct, '@'));
         if ($u && !$this->isHiddenFromViewer($viewerId, $u['id'])) json_out(UserModel::toMasto($u));
         err_out('Not found', 404);
+    }
+
+    private function splitLookupAcct(string $acct): array
+    {
+        $acct = ltrim(trim($acct), '@');
+        $parts = explode('@', $acct);
+        $domain = strtolower((string)array_pop($parts));
+        $username = implode('@', $parts);
+
+        // Mastodon iOS 2026.02 can ask lookup for "user@domain@domain" when
+        // refreshing a remote profile. Accept that form so the profile leaves
+        // its updating state and the follow button stops spinning.
+        $duplicateSuffix = '@' . $domain;
+        if ($domain !== '' && str_ends_with(strtolower($username), $duplicateSuffix)) {
+            $username = substr($username, 0, -strlen($duplicateSuffix));
+        }
+
+        return [$username, $domain];
     }
 
     public function show(array $p): void
@@ -777,7 +795,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function follow(array $p): void
     {
-        $viewer = require_auth(['follow', 'write']);
+        $viewer = require_auth(['follow', 'write', 'write:follows']);
         [$local, $remote] = $this->resolve($p['id']);
 
         // Determine canonical target ID (local UUID or remote AP URL)
@@ -846,7 +864,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function unfollow(array $p): void
     {
-        $viewer = require_auth(['follow', 'write']);
+        $viewer = require_auth(['follow', 'write', 'write:follows']);
         [$local, $remote] = $this->resolve($p['id']);
 
         $targetId = $local ? $local['id'] : ($remote ? $remote['id'] : null);
@@ -993,9 +1011,12 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function relationships(array $p): void
     {
-        $viewer = require_auth('read');
-        $ids    = (array)($_GET['id'] ?? []);
-        json_out(array_map(fn($id) => $this->rel($viewer['id'], $id), $ids));
+        $viewer = require_auth();
+        $rawIds = $_GET['id'] ?? $_GET['ids'] ?? $_GET['id[]'] ?? $_GET['ids[]'] ?? [];
+        $ids    = is_array($rawIds) ? $rawIds : preg_split('/[,\s]+/', (string)$rawIds);
+        $ids    = array_values(array_filter(array_map('strval', $ids ?: []), 'strlen'));
+        $out    = array_map(fn($id) => $this->rel($viewer['id'], $id), $ids);
+        json_out($out);
     }
 
     public function search(array $p): void
@@ -1194,7 +1215,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function pinAccount(array $p): void
     {
-        $user = require_auth(['follow', 'write']);
+        $user = require_auth(['follow', 'write', 'write:follows']);
         [$local, $remote] = $this->resolve($p['id']);
         if (!$local && !$remote) err_out('Not found', 404);
         $targetId = $local ? $local['id'] : $remote['id'];
@@ -1215,7 +1236,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function unpinAccount(array $p): void
     {
-        $user = require_auth(['follow', 'write']);
+        $user = require_auth(['follow', 'write', 'write:follows']);
         [$local, $remote] = $this->resolve($p['id']);
         if (!$local && !$remote) err_out('Not found', 404);
         $targetId = $local ? $local['id'] : $remote['id'];
@@ -1225,7 +1246,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function noteAccount(array $p): void
     {
-        $user = require_auth(['follow', 'write']);
+        $user = require_auth(['follow', 'write', 'write:accounts']);
         $d = req_body();
         [$local, $remote] = $this->resolve($p['id']);
         if (!$local && !$remote) err_out('Not found', 404);

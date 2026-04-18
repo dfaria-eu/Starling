@@ -16,7 +16,29 @@ class OAuthModel
         $requestedList = array_values(array_unique(array_filter($requestedList, 'strlen')));
         if ($requestedRaw === '' || !$requestedList) return implode(' ', $allowedList);
 
-        $effective = array_values(array_intersect($requestedList, $allowedList));
+        $knownGranular = [
+            'read:accounts', 'read:blocks', 'read:bookmarks', 'read:favourites',
+            'read:filters', 'read:follows', 'read:lists', 'read:mutes',
+            'read:notifications', 'read:search', 'read:statuses',
+            'write:accounts', 'write:blocks', 'write:bookmarks', 'write:conversations',
+            'write:favourites', 'write:filters', 'write:follows', 'write:lists',
+            'write:media', 'write:mutes', 'write:notifications', 'write:reports',
+            'write:statuses',
+        ];
+        $effective = [];
+        foreach ($requestedList as $scope) {
+            if (in_array($scope, $allowedList, true)) {
+                $effective[] = $scope;
+                continue;
+            }
+            if (in_array($scope, $knownGranular, true)) {
+                $parent = strtok($scope, ':') ?: '';
+                if ($parent !== '' && in_array($parent, $allowedList, true)) {
+                    $effective[] = $scope;
+                }
+            }
+        }
+        $effective = array_values(array_unique($effective));
         return $effective ? implode(' ', $effective) : '';
     }
 

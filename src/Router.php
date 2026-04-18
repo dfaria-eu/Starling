@@ -109,6 +109,8 @@ class Router
         $this->get('/api/v1/timelines/list/:id',      'Api\TimelinesCtrl@listTimeline');
 
         // ── Notifications ─────────────────────────────────────
+        $this->get('/api/v2/notifications/policy',           'Api\NotificationsCtrl@policy');
+        $this->put('/api/v2/notifications/policy',           'Api\NotificationsCtrl@policy');
         $this->get('/api/v2/notifications',                  'Api\NotificationsCtrl@indexV2');
         $this->get('/api/v1/notifications',                  'Api\NotificationsCtrl@index');
         // Specific sub-routes MUST come before /:id to avoid being captured as id='policy' etc.

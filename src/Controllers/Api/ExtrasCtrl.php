@@ -699,11 +699,16 @@ class AccountFeaturedTagsCtrl
     public function show(array $p): void
     {
         // Public featured tags for any account (no auth required)
-        $owner = UserModel::byId((string)$p['id']);
+        $accountId = (string)$p['id'];
+        $owner = UserModel::byId($accountId);
         if (!$owner || !empty($owner['is_suspended'])) {
+            $remote = DB::one('SELECT id FROM remote_actors WHERE masto_id=?', [$accountId]);
+            if ($remote) {
+                json_out([]);
+            }
             err_out('Not found', 404);
         }
-        $rows = DB::all('SELECT * FROM featured_tags WHERE user_id=?', [$p['id']]);
+        $rows = DB::all('SELECT * FROM featured_tags WHERE user_id=?', [$accountId]);
         // p['id'] could be local user id — map directly
         json_out(array_map(function ($r) {
             $since = gmdate('Y-m-d\\TH:i:s\\Z', strtotime('-7 days'));

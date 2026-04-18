@@ -618,7 +618,11 @@ class StatusModel
             'card'                   => self::getCard($rawContent, $s['uri']),
             'poll'                   => $poll ? PollModel::toMasto($poll, $viewerId) : null,
             'quote_id'               => $quote ? $quote['id'] : null,
-            'quote'                  => $quote,
+            'quote'                  => $quote ? [
+                'state'            => 'accepted',
+                'quoted_status_id' => null,
+                'quoted_status'    => $quote,
+            ] : null,
             'favourited'             => (bool)$favd,
             'reblogged'              => (bool)$rbd,
             'muted'                  => false,
