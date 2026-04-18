@@ -546,7 +546,7 @@ class SuggestionsCtrl
     // GET /api/v2/suggestions — returns [{source, account}]
     public function index(array $p): void
     {
-        $limit = min((int)($_GET['limit'] ?? 40), 40);
+        $limit = max(1, min((int)($_GET['limit'] ?? 40), 40));
         $rows  = $this->suggest($limit);
         json_out(array_values(array_filter(array_map(function ($u) {
             $account = ($u['_src'] ?? 'local') === 'remote'
@@ -560,7 +560,7 @@ class SuggestionsCtrl
     // GET /api/v1/follow_suggestions — returns [account] (formato v1)
     public function indexV1(array $p): void
     {
-        $limit = min((int)($_GET['limit'] ?? 40), 40);
+        $limit = max(1, min((int)($_GET['limit'] ?? 40), 40));
         $rows  = $this->suggest($limit);
         json_out(array_values(array_filter(array_map(function ($u) {
             $account = ($u['_src'] ?? 'local') === 'remote'

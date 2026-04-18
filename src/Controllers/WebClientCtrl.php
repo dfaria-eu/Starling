@@ -270,6 +270,24 @@ class WebClientCtrl
         $this->html($this->shell('PROFILE', $p['id'], $user, $token));
     }
 
+    public function followers(array $p): void
+    {
+        [$user, $token] = $this->requireAuth();
+        $this->html($this->shell('FOLLOWERS', $p['id'], $user, $token));
+    }
+
+    public function following(array $p): void
+    {
+        [$user, $token] = $this->requireAuth();
+        $this->html($this->shell('FOLLOWING', $p['id'], $user, $token));
+    }
+
+    public function tagTimeline(array $p): void
+    {
+        [$user, $token] = $this->requireAuth();
+        $this->html($this->shell('TAG_TIMELINE', urldecode((string)$p['id']), $user, $token));
+    }
+
     public function search(array $p): void
     {
         [$user, $token] = $this->requireAuth();
@@ -413,7 +431,7 @@ class WebClientCtrl
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Starling App · ' . $domain . '</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="' . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -638,7 +656,7 @@ class WebClientCtrl
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign In · ' . $domain . '</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="' . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">
 <style>' . $this->css() . '</style>
 </head>
 <body>
@@ -682,7 +700,7 @@ class WebClientCtrl
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Create Account · ' . $domain . '</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="' . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">
 <style>' . $this->css() . '</style>
 </head>
 <body>
@@ -2081,6 +2099,13 @@ const APP_APPEARANCE = {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const escJsSq = s => String(s ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/</g, '\\x3C')
+    .replace(/>/g, '\\x3E');
 
 function prefBool(v) {
     return v === true || v === 1 || v === '1' || v === 'true';
@@ -2147,6 +2172,27 @@ function htmlToPlainText(html) {
     return (div.textContent || div.innerText || '').trim();
 }
 
+async function copyText(value) {
+    if (!value) throw new Error('Nothing to copy.');
+    if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return;
+    }
+    const ta = document.createElement('textarea');
+    ta.value = value;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ta.style.pointerEvents = 'none';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    const ok = document.execCommand('copy');
+    ta.remove();
+    if (!ok) throw new Error('Could not copy to clipboard.');
+}
+
 function parseCsvRow(line) {
     const out = [];
     let cur = '';
@@ -2209,7 +2255,32 @@ const Api = {
             try { const j = JSON.parse(t); msg = j.error || j.message || msg; } catch {}
             throw new Error(msg);
         }
-        return r.json();
+        if (r.status === 204) return null;
+        const t = await r.text();
+        if (!t) return null;
+        try { return JSON.parse(t); } catch { return t; }
+    },
+    async _fetchPage(method, path, body) {
+        const opts = {method, credentials: 'same-origin', headers: {Authorization: 'Bearer ' + WCFG.token}};
+        if (body instanceof FormData) {
+            opts.body = body;
+        } else if (body) {
+            opts.headers['Content-Type'] = 'application/json';
+            opts.body = JSON.stringify(body);
+        }
+        const r = await fetch(path, opts);
+        if (!r.ok) {
+            const t = await r.text();
+            let msg = r.status + '';
+            try { const j = JSON.parse(t); msg = j.error || j.message || msg; } catch {}
+            throw new Error(msg);
+        }
+        const t = await r.text();
+        let data = null;
+        if (t) {
+            try { data = JSON.parse(t); } catch { data = t; }
+        }
+        return {data, nextMaxId: parseNextMaxId(r.headers.get('Link'))};
     },
     get(path, params = {}) {
         const filtered = Object.fromEntries(
@@ -2218,11 +2289,33 @@ const Api = {
         const qs = new URLSearchParams(filtered).toString();
         return this._fetch('GET', qs ? path + '?' + qs : path);
     },
+    getPage(path, params = {}) {
+        const filtered = Object.fromEntries(
+            Object.entries(params).filter(([, v]) => v !== false && v !== null && v !== undefined)
+        );
+        const qs = new URLSearchParams(filtered).toString();
+        return this._fetchPage('GET', qs ? path + '?' + qs : path);
+    },
     post(path, body) { return this._fetch('POST', path, body); },
     del(path, body)  { return this._fetch('DELETE', path, body); },
     patch(path, body){ return this._fetch('PATCH',  path, body); },
     put(path, body)  { return this._fetch('PUT',    path, body); },
 };
+
+function parseNextMaxId(linkHeader) {
+    if (!linkHeader) return null;
+    for (const part of linkHeader.split(',')) {
+        if (!/;\s*rel="?next"?/i.test(part)) continue;
+        const m = part.match(/<([^>]+)>/);
+        if (!m) continue;
+        try {
+            return new URL(m[1], window.location.origin).searchParams.get('max_id');
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
 
 // ── Render: media grid ─────────────────────────────────────────────────────
 function renderMediaGrid(attachments, sensitive) {
@@ -2237,7 +2330,7 @@ function renderMediaGrid(attachments, sensitive) {
             return `<div class="media-item"><video src="${full}" poster="${thumb}" controls playsinline${autoplay} style="width:100%;height:100%;object-fit:cover"></video></div>`;
         }
         const altBadge = a.description ? '<span class="alt-badge">ALT</span>' : '';
-        return `<div class="media-item"><img src="${thumb}" alt="${alt}" loading="lazy" onclick="Lightbox.open('${full}','${alt}')">${altBadge}</div>`;
+        return `<div class="media-item"><img src="${thumb}" alt="${alt}" loading="lazy" data-full-src="${full}" data-alt="${alt}">${altBadge}</div>`;
     });
     return `<div class="media-grid count-${Math.min(attachments.length, 4)}">${items.join('')}</div>`;
 }
@@ -2257,7 +2350,7 @@ function renderQuote(quote) {
     const mediaCount = Math.min((quote.media_attachments || []).length, 4);
     const mediaBadge = mediaCount ? `<span class="quote-badge">${mediaCount} media</span>` : '';
     const pollBadge = quote.poll ? '<span class="quote-badge">Poll</span>' : '';
-    return `<div class="quote-card" onclick="event.stopPropagation();navigate('THREAD','${esc(quote.id)}')">
+    return `<div class="quote-card" onclick="event.stopPropagation();navigate('THREAD','${escJsSq(quote.id)}')">
         <div class="quote-head">
             <img class="quote-avatar" src="${esc(acct.avatar)}" alt="" loading="lazy">
             <div class="quote-meta"><strong>${esc(acct.display_name || acct.username)}</strong><span>@${esc(acct.acct)}</span></div>
@@ -2301,7 +2394,7 @@ function renderPoll(poll, statusId) {
     const showResultsByDefault = !canVote;
 
     return `<div class="poll-box" data-poll-id="${esc(poll.id)}" data-status-id="${esc(statusId)}">
-        <form class="poll-form" onsubmit="submitPollVote(event,'${esc(poll.id)}','${esc(statusId)}')">
+        <form class="poll-form" onsubmit="submitPollVote(event,'${escJsSq(poll.id)}','${escJsSq(statusId)}')">
             <div class="poll-options${showResultsByDefault ? ' poll-hidden' : ''}" data-poll-view="vote">${voteOptionsHtml}</div>
             <div class="poll-options${showResultsByDefault ? '' : ' poll-hidden'}" data-poll-view="results">${resultOptionsHtml}</div>
             ${canVote ? `<button class="poll-vote-btn${showResultsByDefault ? ' poll-hidden' : ''}" data-poll-view="vote" type="submit">Vote</button>` : ''}
@@ -2332,7 +2425,7 @@ function renderStatus(s, focal = false) {
     const boostBar = isBoost ? `
         <div class="boost-bar">
             <svg viewBox="0 0 24 24"><path d="M17 1L21 5L17 9V6H7V12H5V6C5 4.9 5.9 4 7 4H17V1ZM7 23L3 19L7 15V18H17V12H19V18C19 19.1 18.1 20 17 20H7V23Z"/></svg>
-            <a onclick="navigate('PROFILE','${esc(s.account.id)}')" style="cursor:pointer">${esc(s.account.display_name || s.account.username)}</a> repostou
+            <a onclick="navigate('PROFILE','${escJsSq(s.account.id)}')" style="cursor:pointer">${esc(s.account.display_name || s.account.username)}</a> repostou
         </div>` : '';
 
     const visMap = {
@@ -2378,7 +2471,7 @@ function renderStatus(s, focal = false) {
         ? (post.mentions || []).find(m => m.id === post.in_reply_to_account_id)
         : null;
     const replyTo = post.in_reply_to_id
-        ? `<div class="reply-indicator"><svg viewBox="0 0 24 24"><path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"/></svg> Replying to ${replyAcct ? '<span class="reply-to-name" onclick="navigate(\'PROFILE\',\'' + esc(replyAcct.id) + '\')">@' + esc(replyAcct.username) + '</span>' : 'a post'}</div>`
+        ? `<div class="reply-indicator"><svg viewBox="0 0 24 24"><path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"/></svg> Replying to ${replyAcct ? '<span class="reply-to-name" onclick="navigate(\'PROFILE\',\'' + escJsSq(replyAcct.id) + '\')">@' + esc(replyAcct.username) + '</span>' : 'a post'}</div>`
         : '';
 
     const isOwn    = post.account.id === WCFG.myId;
@@ -2401,25 +2494,25 @@ function renderStatus(s, focal = false) {
     const focalMeta = focal ? `
         <div class="focal-meta"><time>${esc(formatDate(post.created_at))}</time>${visBadge ? ' · ' + visBadge : ''}${temporaryMeta ? ' · ' + temporaryMeta : ''}</div>
         ${(post.reblogs_count > 0 || post.favourites_count > 0) ? `<div class="focal-stats">
-            ${post.reblogs_count > 0 ? `<button type="button" class="focal-stat-link" onclick="event.stopPropagation();showRebloggedBy('${esc(post.id)}')"><strong>${post.reblogs_count}</strong> ${post.reblogs_count === 1 ? 'repost' : 'reposts'}</button>` : ''}
-            ${post.favourites_count > 0 ? `<button type="button" class="focal-stat-link" onclick="event.stopPropagation();showFavouritedBy('${esc(post.id)}')"><strong>${post.favourites_count}</strong> ${post.favourites_count === 1 ? 'like' : 'likes'}</button>` : ''}
+            ${post.reblogs_count > 0 ? `<button type="button" class="focal-stat-link" onclick="event.stopPropagation();showRebloggedBy('${escJsSq(post.id)}')"><strong>${post.reblogs_count}</strong> ${post.reblogs_count === 1 ? 'repost' : 'reposts'}</button>` : ''}
+            ${post.favourites_count > 0 ? `<button type="button" class="focal-stat-link" onclick="event.stopPropagation();showFavouritedBy('${escJsSq(post.id)}')"><strong>${post.favourites_count}</strong> ${post.favourites_count === 1 ? 'like' : 'likes'}</button>` : ''}
         </div>` : ''}` : '';
 
     return `
-    <div class="status-card${focal ? ' status-focal' : ''}" data-id="${esc(post.id)}"${focal ? '' : ` onclick="handleCardClick(event,'${esc(post.id)}')"`}>
+    <div class="status-card${focal ? ' status-focal' : ''}" data-id="${esc(post.id)}"${focal ? '' : ` onclick="handleCardClick(event,'${escJsSq(post.id)}')"`}>
         ${boostBar}
         <div class="status-inner">
             <div class="status-left">
-                <img class="avatar" src="${esc(acct.avatar)}" alt="" loading="lazy" onclick="navigate('PROFILE','${esc(acct.id)}')" title="@${esc(acct.acct)}">
+                <img class="avatar" src="${esc(acct.avatar)}" alt="" loading="lazy" onclick="navigate('PROFILE','${escJsSq(acct.id)}')" title="@${esc(acct.acct)}">
             </div>
             <div class="status-body">
                 <div class="status-header">
-                    <span class="s-name" onclick="navigate('PROFILE','${esc(acct.id)}')">${esc(acct.display_name || acct.username)}</span>
+                    <span class="s-name" onclick="navigate('PROFILE','${escJsSq(acct.id)}')">${esc(acct.display_name || acct.username)}</span>
                     <span class="s-acct">@${esc(acct.acct)}</span>
                     ${temporaryBadge}
                     ${focal ? '' : `${visBadge}<span class="s-middot">·</span>
-                    <span class="s-time" onclick="navigate('THREAD','${esc(post.id)}')" title="${esc(formatDate(post.created_at))}">${timeAgo(post.created_at)}</span>`}
-                    <button class="s-more-btn" onclick="event.stopPropagation();showPostMenu(event,'${esc(post.id)}',${post.bookmarked ? 'true' : 'false'},${isOwn ? 'true' : 'false'},'${esc(post.url)}')" aria-label="More options">
+                    <span class="s-time" onclick="navigate('THREAD','${escJsSq(post.id)}')" title="${esc(formatDate(post.created_at))}">${timeAgo(post.created_at)}</span>`}
+                    <button class="s-more-btn" onclick="event.stopPropagation();showPostMenu(event,'${escJsSq(post.id)}',${post.bookmarked ? 'true' : 'false'},${isOwn ? 'true' : 'false'},'${escJsSq(post.url)}')" aria-label="More options">
                         <svg viewBox="0 0 24 24"><path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
                     </button>
                 </div>
@@ -2438,13 +2531,13 @@ function renderStatus(s, focal = false) {
                 </div>
                 ${focalMeta}
                 <div class="action-bar">
-                    <button class="action-btn reply-btn" onclick="Compose.openReply('${esc(post.id)}','${esc(acct.acct)}')" title="Reply" aria-label="Reply">
+                    <button class="action-btn reply-btn" onclick="Compose.openReply('${escJsSq(post.id)}','${escJsSq(acct.acct)}')" title="Reply" aria-label="Reply">
                         <svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg>${rc}
                     </button>
-                    <button class="action-btn boost-btn${post.reblogged ? ' active' : ''}" onclick="showRepostMenu(event,'${esc(post.id)}',this)" title="Repostar" aria-label="Repostar"${!canBoost ? ' disabled' : ''}>
+                    <button class="action-btn boost-btn${post.reblogged ? ' active' : ''}" onclick="showRepostMenu(event,'${escJsSq(post.id)}',this)" title="Repostar" aria-label="Repostar"${!canBoost ? ' disabled' : ''}>
                         <svg viewBox="0 0 24 24"><path d="M17 1L21 5L17 9V6H7V12H5V6C5 4.9 5.9 4 7 4H17V1ZM7 23L3 19L7 15V18H17V12H19V18C19 19.1 18.1 20 17 20H7V23Z"/></svg>${bc}
                     </button>
-                    <button class="action-btn fav-btn${post.favourited ? ' active' : ''}" onclick="toggleFav('${esc(post.id)}',this)" title="Gostar" aria-label="Gostar">
+                    <button class="action-btn fav-btn${post.favourited ? ' active' : ''}" onclick="toggleFav('${escJsSq(post.id)}',this)" title="Gostar" aria-label="Gostar">
                         <svg viewBox="0 0 24 24"><path d="${favPath}"/></svg>${fc}
                     </button>
                 </div>
@@ -2479,21 +2572,21 @@ function renderNotification(n) {
         : '';
     const followReqBtns = type === 'follow_request' ? `
         <div class="notif-actions">
-            <button class="btn-accept" onclick="approveFollowRequest('${esc(actor.id)}',this)">Aceitar</button>
-            <button class="btn-reject" onclick="rejectFollowRequest('${esc(actor.id)}',this)">Rejeitar</button>
+            <button class="btn-accept" onclick="approveFollowRequest('${escJsSq(actor.id)}',this)">Aceitar</button>
+            <button class="btn-reject" onclick="rejectFollowRequest('${escJsSq(actor.id)}',this)">Rejeitar</button>
         </div>` : '';
-    const excerptHtml = excerpt ? `<div class="notif-excerpt" onclick="navigate('THREAD','${esc(n.status?.id || '')}')">${esc(excerpt)}${excerpt.length >= 80 ? '…' : ''}</div>` : '';
+    const excerptHtml = excerpt ? `<div class="notif-excerpt" onclick="navigate('THREAD','${escJsSq(n.status?.id || '')}')">${esc(excerpt)}${excerpt.length >= 80 ? '…' : ''}</div>` : '';
     const statusId = String(n.status?.id || '');
-    const cardClick = statusId ? ` onclick="handleNotificationCardClick(event,'${esc(statusId)}')"` : '';
+    const cardClick = statusId ? ` onclick="handleNotificationCardClick(event,'${escJsSq(statusId)}')"` : '';
 
     return `
     <div class="notif-card notif-type-${esc(type)}"${cardClick}>
         <div class="notif-icon">${icons[type] || ''}</div>
         <div class="notif-main">
-            <img class="notif-avatar" src="${esc(actor.avatar)}" alt="" onclick="navigate('PROFILE','${esc(actor.id)}')">
+            <img class="notif-avatar" src="${esc(actor.avatar)}" alt="" onclick="navigate('PROFILE','${escJsSq(actor.id)}')">
             <div class="notif-body">
                 <div class="notif-head">
-                    <strong class="notif-name" onclick="navigate('PROFILE','${esc(actor.id)}')">${actorName}</strong>
+                    <strong class="notif-name" onclick="navigate('PROFILE','${escJsSq(actor.id)}')">${actorName}</strong>
                     ${notifTime}
                 </div>
                 <div class="notif-text">${labels[type] || esc(type)}</div>
@@ -2519,14 +2612,14 @@ function renderProfileHeader(account, rel) {
     const isRequested = rel?.requested ?? false;
     const isNotifying = rel?.notifying ?? false;
     const dmBtn = !isOwn
-        ? `<button class="profile-dm-btn" onclick="Compose.openDM('${esc(account.acct)}')" title="Enviar mensagem direta">
+        ? `<button class="profile-dm-btn" onclick="Compose.openDM('${escJsSq(account.acct)}')" title="Enviar mensagem direta">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
            </button>` : '';
     const notifyBtn = (!isOwn && isFollowing)
         ? `<button class="profile-dm-btn profile-follow-only${isNotifying ? ' active' : ''}"
             data-notifying="${isNotifying ? '1' : '0'}"
             title="${isNotifying ? 'Disable post notifications' : 'Enable post notifications'}"
-            onclick="toggleNotify('${esc(account.id)}',this)">
+            onclick="toggleNotify('${escJsSq(account.id)}',this)">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="${isNotifying
                 ? 'M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6V11c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z'
                 : 'M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6V11c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2zM17 13.58V11c0-2.28-1.47-4.22-3.54-4.78C11.02 5.65 9 7.32 9 9.5c0 .39.08.76.19 1.12L17 13.58z'
@@ -2534,7 +2627,7 @@ function renderProfileHeader(account, rel) {
            </button>` : '';
     const listsBtn = (!isOwn && isFollowing)
         ? `<button class="profile-dm-btn profile-follow-only" title="Add to lists"
-            onclick="showListsMenu('${esc(account.id)}',this)">
+            onclick="showListsMenu('${escJsSq(account.id)}',this)">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
            </button>` : '';
     const actionBtn  = isOwn
@@ -2543,7 +2636,7 @@ function renderProfileHeader(account, rel) {
             data-following="${isFollowing ? '1' : '0'}"
             data-requested="${isRequested ? '1' : '0'}"
             data-account-id="${esc(account.id)}"
-            onclick="toggleFollow('${esc(account.id)}',this)"
+            onclick="toggleFollow('${escJsSq(account.id)}',this)"
             onmouseenter="if(this.dataset.following==='1')this.textContent='Unfollow'"
             onmouseleave="if(this.dataset.following==='1')this.textContent='Following'">
             ${isFollowing ? 'Following' : (isRequested ? 'Requested' : 'Follow')}
@@ -2566,8 +2659,8 @@ function renderProfileHeader(account, rel) {
             ${account.fields?.length ? `<div class="profile-fields">${account.fields.map(f => `<div class="profile-field"><span class="profile-field-name">${esc(f.name)}</span><span class="profile-field-value${f.verified_at ? ' profile-field-verified' : ''}">${f.value || ''}</span></div>`).join('')}</div>` : ''}
             <div class="profile-stats">
                 <span><strong>${postsCount}</strong> posts</span>
-                <span class="profile-stat-link" onclick="navigate('FOLLOWERS','${esc(account.id)}')"><strong>${followersCount}</strong> followers</span>
-                <span class="profile-stat-link" onclick="navigate('FOLLOWING','${esc(account.id)}')"><strong>${followingCount}</strong> following</span>
+                <span class="profile-stat-link" onclick="navigate('FOLLOWERS','${escJsSq(account.id)}')"><strong>${followersCount}</strong> followers</span>
+                <span class="profile-stat-link" onclick="navigate('FOLLOWING','${escJsSq(account.id)}')"><strong>${followingCount}</strong> following</span>
             </div>
             <div class="profile-actions">
                 ${actionBtn}
@@ -2578,10 +2671,10 @@ function renderProfileHeader(account, rel) {
             </div>
         </div>
         <div class="profile-tabs">
-            <button class="profile-tab active" data-ptab="posts" onclick="switchProfileTab('${esc(account.id)}','posts',this)">Posts</button>
-            <button class="profile-tab" data-ptab="replies" onclick="switchProfileTab('${esc(account.id)}','replies',this)">Replies</button>
-            <button class="profile-tab" data-ptab="media" onclick="switchProfileTab('${esc(account.id)}','media',this)">Media</button>
-            ${isOwn ? `<button class="profile-tab" data-ptab="likes" onclick="switchProfileTab('${esc(account.id)}','likes',this)">Likes</button>` : ''}
+            <button class="profile-tab active" data-ptab="posts" onclick="switchProfileTab('${escJsSq(account.id)}','posts',this)">Posts</button>
+            <button class="profile-tab" data-ptab="replies" onclick="switchProfileTab('${escJsSq(account.id)}','replies',this)">Replies</button>
+            <button class="profile-tab" data-ptab="media" onclick="switchProfileTab('${escJsSq(account.id)}','media',this)">Media</button>
+            ${isOwn ? `<button class="profile-tab" data-ptab="likes" onclick="switchProfileTab('${escJsSq(account.id)}','likes',this)">Likes</button>` : ''}
         </div>
     </div>`;
 }
@@ -2590,9 +2683,9 @@ function renderProfileHeader(account, rel) {
 function renderAccount(a) {
     return `
     <div class="account-card">
-        <img src="${esc(a.avatar)}" alt="" onclick="navigate('PROFILE','${esc(a.id)}')">
+        <img src="${esc(a.avatar)}" alt="" onclick="navigate('PROFILE','${escJsSq(a.id)}')">
         <div class="account-card-info">
-            <div class="account-card-name" onclick="navigate('PROFILE','${esc(a.id)}')">${esc(a.display_name || a.username)}</div>
+            <div class="account-card-name" onclick="navigate('PROFILE','${escJsSq(a.id)}')">${esc(a.display_name || a.username)}</div>
             <div class="account-card-acct">@${esc(a.acct)}</div>
         </div>
     </div>`;
@@ -2625,6 +2718,7 @@ function focusCard(card) {
 
 // ── State & feed loading ───────────────────────────────────────────────────
 let _maxId = null, _currentEndpoint = null, _currentEndpointParams = {}, _loading = false, _searchDebounce = null;
+let _searchReqSeq = 0, _exploreSearchReqSeq = 0, _memberSearchReqSeq = 0;
 
 // ── View cache (scroll position preservation) ──────────────────────────────
 // Stores rendered content + scroll position so navigating back doesn't reload.
@@ -2763,15 +2857,17 @@ async function loadFeed(endpoint, renderFn, params = {}) {
         }
     }
     try {
-        const items = await Api.get(endpoint, p);
+        const page = await Api.getPage(endpoint, p);
+        const items = Array.isArray(page.data) ? page.data : [];
         document.querySelectorAll('#col-content .skeleton-card').forEach(el => el.remove());
         if (!items.length) {
             insertBeforeLoadMore('<div class="feed-end">No more posts.</div>');
             removeLoadMoreBtn(); _loading = false; return;
         }
-        _maxId = items[items.length - 1].id;
+        _maxId = page.nextMaxId || items[items.length - 1].id;
         _currentEndpoint = endpoint;
         items.forEach(item => insertBeforeLoadMore(renderFn(item)));
+        if (page.nextMaxId === null && items.length < p.limit) removeLoadMoreBtn();
     } catch (e) {
         document.querySelectorAll('#col-content .skeleton-card').forEach(el => el.remove());
         insertBeforeLoadMore('<div class="feed-error">Error: ' + esc(e.message) + '</div>');
@@ -2862,8 +2958,15 @@ async function refreshAfterCreate(status) {
     }
 
     if (WCFG.view === 'HOME') {
-        prependToFeed(renderStatus(status));
-        window.scrollTo({top: 0, behavior: 'smooth'});
+        // Only mutate the current feed in-place when the newly created post
+        // is actually expected to belong to the active home tab.
+        const belongsToCurrentTab =
+            _homeTab === 'home' ||
+            (_homeTab === 'local' && status.visibility === 'public');
+        if (belongsToCurrentTab) {
+            prependToFeed(renderStatus(status));
+            window.scrollTo({top: 0, behavior: 'smooth'});
+        }
         Toast.ok('Posted.');
         return;
     }
@@ -2943,7 +3046,7 @@ async function _renderHomeTabBar() {
     bar.innerHTML = tabs.map(t =>
         `<button class="ht-tab${_homeTab === t.id ? ' active' : ''}" role="tab"
             aria-selected="${_homeTab === t.id}"
-            onclick="showHome('${esc(t.id)}')">${esc(t.label)}</button>`
+            onclick="showHome('${escJsSq(t.id)}')">${esc(t.label)}</button>`
     ).join('');
     bar.style.display = 'flex';
     document.getElementById('col-header').style.display = 'none';
@@ -3085,7 +3188,7 @@ async function showProfile(id) {
         ]);
         content.innerHTML = renderProfileHeader(account, rels[0]);
         _currentRenderFn = renderStatus;
-        _maxId = null;
+        _maxId = statuses.length ? statuses[statuses.length - 1].id : null;
         _currentEndpoint = '/api/v1/accounts/' + id + '/statuses';
         _currentEndpointParams = {exclude_replies: true, exclude_reblogs: false};
         statuses.forEach(s => content.insertAdjacentHTML('beforeend', renderStatus(s)));
@@ -3117,7 +3220,7 @@ async function switchProfileTab(id, tab, btn) {
         // Clear skeletons
         while (header && header.nextSibling) header.nextSibling.remove();
         _currentRenderFn = renderStatus;
-        _maxId = null;
+        _maxId = statuses.length ? statuses[statuses.length - 1].id : null;
         _currentEndpoint = ep;
         _currentEndpointParams = tab === 'likes' ? {} : params;
         statuses.forEach(s => content.insertAdjacentHTML('beforeend', renderStatus(s)));
@@ -3141,7 +3244,14 @@ async function showSearch() {
     document.getElementById('search-input').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(_searchDebounce); doSearch(); } });
     document.getElementById('search-input').addEventListener('input', e => {
         clearTimeout(_searchDebounce);
-        if (e.target.value.trim().length > 1) _searchDebounce = setTimeout(doSearch, 450);
+        const q = e.target.value.trim();
+        if (q.length > 1) {
+            _searchDebounce = setTimeout(doSearch, 450);
+            return;
+        }
+        _searchReqSeq++;
+        const res = document.getElementById('search-results');
+        if (res) res.innerHTML = q ? '' : '<div class="feed-end">Type at least 2 characters.</div>';
     });
 }
 
@@ -3150,16 +3260,19 @@ async function doSearch() {
     if (!q) return;
     const res = document.getElementById('search-results');
     if (!res) return;
+    const reqId = ++_searchReqSeq;
     res.innerHTML = '<div class="feed-loading">Searching...</div>';
     try {
         const r = await Api.get('/api/v2/search', {q, resolve: true, limit: 10});
+        if (reqId !== _searchReqSeq) return;
         let html = '';
         if (r.accounts?.length)  { html += '<div class="search-section-title">Accounts</div>';   r.accounts.forEach(a  => html += renderAccount(a)); }
         if (r.statuses?.length)  { html += '<div class="search-section-title">Posts</div>';      r.statuses.forEach(s  => html += renderStatus(s)); }
-        if (r.hashtags?.length)  { html += '<div class="search-section-title">Hashtags</div>';    r.hashtags.forEach(h  => html += `<div class="hashtag-item"><a href="#" onclick="searchTag('${esc(h.name)}')">#${esc(h.name)}</a></div>`); }
+        if (r.hashtags?.length)  { html += '<div class="search-section-title">Hashtags</div>';    r.hashtags.forEach(h  => html += `<div class="hashtag-item"><a href="#" onclick="searchTag('${escJsSq(h.name)}')">#${esc(h.name)}</a></div>`); }
         if (!html) html = '<div class="feed-end">No results.</div>';
         res.innerHTML = html;
     } catch (e) {
+        if (reqId !== _searchReqSeq) return;
         res.innerHTML = '<div class="feed-error">Error: ' + esc(e.message) + '</div>';
     }
 }
@@ -3174,7 +3287,7 @@ async function loadRightCol() {
         trendEl.insertAdjacentHTML('beforeend', `<div class="right-card"><div class="right-card-title">Trending</div>`
             + trends.map(t => {
                 const uses = (t.history ?? []).reduce((s, h) => s + parseInt(h.uses ?? 0), 0);
-                return `<div class="right-trend-item" onclick="navigate('TAG_TIMELINE','${esc(t.name)}')">
+                return `<div class="right-trend-item" onclick="navigate('TAG_TIMELINE','${escJsSq(t.name)}')">
                     <span class="right-trend-tag">#${esc(t.name)}</span>
                     <span class="right-trend-count">${uses} posts</span>
                 </div>`;
@@ -3200,8 +3313,7 @@ async function toggleRightFollow(btn) {
 }
 
 function searchTag(tag) {
-    document.getElementById('search-input').value = '#' + tag;
-    doSearch();
+    navigate('TAG_TIMELINE', tag);
 }
 
 function syncRightSearchInput(value) {
@@ -3236,7 +3348,7 @@ function renderConversation(conv) {
         : '';
     const time = conv.last_status ? timeAgo(conv.last_status.created_at) : '';
     return `
-    <div class="conv-card" onclick="navigate('THREAD','${esc(conv.last_status?.id ?? conv.id)}')">
+    <div class="conv-card" onclick="navigate('THREAD','${escJsSq(conv.last_status?.id ?? conv.id)}')">
         <div class="conv-avatar-wrap">
             <img class="avatar" src="${esc(acct.avatar)}" alt="" loading="lazy">
             ${conv.unread ? '<span class="conv-unread-dot"></span>' : ''}
@@ -3319,14 +3431,14 @@ async function showSettings() {
             <div class="settings-label" style="color:var(--text);font-weight:700">${esc(acct.display_name || acct.username)}</div>
             <div class="settings-label">@${esc(acct.acct || acct.username)}</div>
         </div>
-        <button class="settings-chip-remove" type="button" onclick="${mode === 'mute' ? `removeMutedAccount('${esc(acct.id)}')` : `removeBlockedAccount('${esc(acct.id)}')`}">
+        <button class="settings-chip-remove" type="button" onclick="${mode === 'mute' ? `removeMutedAccount('${escJsSq(acct.id)}')` : `removeBlockedAccount('${escJsSq(acct.id)}')`}">
             ${mode === 'mute' ? 'Unmute' : 'Unblock'}
         </button>
     </div>`;
     const domainRows = blockedDomains.length
         ? blockedDomains.map(domain => `<div class="settings-chip-row">
             <div class="settings-label" style="color:var(--text)">${esc(domain)}</div>
-            <button class="settings-chip-remove" type="button" onclick="removeDomainBlock('${esc(domain)}')">Remove</button>
+            <button class="settings-chip-remove" type="button" onclick="removeDomainBlock('${escJsSq(domain)}')">Remove</button>
         </div>`).join('')
         : '<div class="settings-empty">No blocked domains.</div>';
     const filterRows = filters.length
@@ -3343,8 +3455,8 @@ async function showSettings() {
                         <div class="settings-pill-row">${ww ? '<span class="settings-pill">Whole-word matching</span>' : ''}</div>
                     </div>
                     <div style="display:flex;flex-direction:column;gap:.5rem;align-items:flex-end">
-                        <button class="settings-chip-remove" type="button" onclick="loadFilterIntoForm('${esc(filter.id)}')">Edit</button>
-                        <button class="settings-chip-remove" type="button" onclick="removeFilter('${esc(filter.id)}')">Delete</button>
+                        <button class="settings-chip-remove" type="button" onclick="loadFilterIntoForm('${escJsSq(filter.id)}')">Edit</button>
+                        <button class="settings-chip-remove" type="button" onclick="removeFilter('${escJsSq(filter.id)}')">Delete</button>
                     </div>
                 </div>
             </div>`;
@@ -3362,7 +3474,7 @@ async function showSettings() {
                 </div>
                 ${session.current
                     ? `<button class="settings-chip-remove danger" type="button" onclick="revokeCurrentSession()">Sign out</button>`
-                    : `<button class="settings-chip-remove" type="button" onclick="revokeSession('${esc(session.id)}')">Revoke</button>`}
+                    : `<button class="settings-chip-remove" type="button" onclick="revokeSession('${escJsSq(session.id)}')">Revoke</button>`}
             </div>
         </div>`).join('')
         : '<div class="settings-empty">No active web sessions.</div>';
@@ -3376,7 +3488,7 @@ async function showSettings() {
                     ${session.app_website ? `<div class="settings-panel-meta">${esc(session.app_website)}</div>` : ''}
                     <div class="settings-pill-row">${(session.scopes || []).map(scope => `<span class="settings-pill">${esc(scope)}</span>`).join('')}</div>
                 </div>
-                <button class="settings-chip-remove" type="button" onclick="revokeSession('${esc(session.id)}')">Revoke</button>
+                <button class="settings-chip-remove" type="button" onclick="revokeSession('${escJsSq(session.id)}')">Revoke</button>
             </div>
         </div>`).join('')
         : '<div class="settings-empty">No authorized applications.</div>';
@@ -3386,7 +3498,7 @@ async function showSettings() {
                 <div class="settings-label" style="color:var(--text);font-weight:700">${esc(acct.display_name || acct.username)}</div>
                 <div class="settings-label">@${esc(acct.acct || acct.username)}</div>
             </div>
-            <button class="settings-chip-remove" type="button" onclick="removeMigrationAlias('${esc(acct.acct || '')}')">Remove</button>
+            <button class="settings-chip-remove" type="button" onclick="removeMigrationAlias('${escJsSq(acct.acct || '')}')">Remove</button>
         </div>`).join('')
         : '<div class="settings-empty">No migration aliases.</div>';
     const developerAppRows = developer.apps?.length
@@ -3401,10 +3513,10 @@ async function showSettings() {
                     <div class="settings-secret"><strong>Client secret</strong><br>${esc(app.client_secret || '')}</div>
                 </div>
                 <div style="display:flex;flex-direction:column;gap:.5rem;align-items:flex-end">
-                    <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${esc(app.client_id || '')}','Client ID copied.')">Copy ID</button>
-                    <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${esc(app.client_secret || '')}','Client secret copied.')">Copy secret</button>
-                    <button class="settings-chip-remove" type="button" onclick="prefillDeveloperTokenForm('${esc(app.id)}')">New token</button>
-                    <button class="settings-chip-remove danger" type="button" onclick="deleteDeveloperApp('${esc(app.id)}')">Delete app</button>
+                    <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${escJsSq(app.client_id || '')}','Client ID copied.')">Copy ID</button>
+                    <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${escJsSq(app.client_secret || '')}','Client secret copied.')">Copy secret</button>
+                    <button class="settings-chip-remove" type="button" onclick="prefillDeveloperTokenForm('${escJsSq(app.id)}')">New token</button>
+                    <button class="settings-chip-remove danger" type="button" onclick="deleteDeveloperApp('${escJsSq(app.id)}')">Delete app</button>
                 </div>
             </div>
         </div>`).join('')
@@ -3418,7 +3530,7 @@ async function showSettings() {
                     <div class="settings-panel-meta">Created ${esc(timeAgo(token.created_at))}${token.last_used_at ? ' · Active ' + esc(timeAgo(token.last_used_at)) : ''}</div>
                     <div class="settings-pill-row">${(token.scopes || []).map(scope => `<span class="settings-pill">${esc(scope)}</span>`).join('')}</div>
                 </div>
-                <button class="settings-chip-remove danger" type="button" onclick="revokeDeveloperToken('${esc(token.id)}')">Revoke</button>
+                <button class="settings-chip-remove danger" type="button" onclick="revokeDeveloperToken('${escJsSq(token.id)}')">Revoke</button>
             </div>
         </div>`).join('')
         : '<div class="settings-empty">No personal access tokens created here.</div>';
@@ -3897,7 +4009,7 @@ function renderAccountRestrictionList(targetId, items, mode) {
             <div class="settings-label" style="color:var(--text);font-weight:700">${esc(acct.display_name || acct.username)}</div>
             <div class="settings-label">@${esc(acct.acct || acct.username)}</div>
         </div>
-        <button class="settings-chip-remove" type="button" onclick="${mode === 'mute' ? `removeMutedAccount('${esc(acct.id)}')` : `removeBlockedAccount('${esc(acct.id)}')`}">
+        <button class="settings-chip-remove" type="button" onclick="${mode === 'mute' ? `removeMutedAccount('${escJsSq(acct.id)}')` : `removeBlockedAccount('${escJsSq(acct.id)}')`}">
             ${mode === 'mute' ? 'Unmute' : 'Unblock'}
         </button>
     </div>`).join('');
@@ -3909,7 +4021,7 @@ function renderDomainBlocks(domains) {
     root.innerHTML = domains.length
         ? domains.map(domain => `<div class="settings-chip-row">
             <div class="settings-label" style="color:var(--text)">${esc(domain)}</div>
-            <button class="settings-chip-remove" type="button" onclick="removeDomainBlock('${esc(domain)}')">Remove</button>
+            <button class="settings-chip-remove" type="button" onclick="removeDomainBlock('${escJsSq(domain)}')">Remove</button>
         </div>`).join('')
         : '<div class="settings-empty">No blocked domains.</div>';
 }
@@ -3931,8 +4043,8 @@ function renderFilters(filters) {
                         <div class="settings-pill-row">${ww ? '<span class="settings-pill">Whole-word matching</span>' : ''}</div>
                     </div>
                     <div style="display:flex;flex-direction:column;gap:.5rem;align-items:flex-end">
-                        <button class="settings-chip-remove" type="button" onclick="loadFilterIntoForm('${esc(filter.id)}')">Edit</button>
-                        <button class="settings-chip-remove" type="button" onclick="removeFilter('${esc(filter.id)}')">Delete</button>
+                        <button class="settings-chip-remove" type="button" onclick="loadFilterIntoForm('${escJsSq(filter.id)}')">Edit</button>
+                        <button class="settings-chip-remove" type="button" onclick="removeFilter('${escJsSq(filter.id)}')">Delete</button>
                     </div>
                 </div>
             </div>`;
@@ -3955,7 +4067,7 @@ function renderSessions(sessions) {
             </div>
             ${session.current
                 ? `<button class="settings-chip-remove danger" type="button" onclick="revokeCurrentSession()">Sign out</button>`
-                : `<button class="settings-chip-remove" type="button" onclick="revokeSession('${esc(session.id)}')">Revoke</button>`}
+                : `<button class="settings-chip-remove" type="button" onclick="revokeSession('${escJsSq(session.id)}')">Revoke</button>`}
         </div>`).join('')
         : '<div class="settings-empty">No active web sessions.</div>';
     const appRoot = document.getElementById('settings-authorized-apps');
@@ -3970,7 +4082,7 @@ function renderSessions(sessions) {
                         ${session.app_website ? `<div class="settings-panel-meta">${esc(session.app_website)}</div>` : ''}
                         <div class="settings-pill-row">${(session.scopes || []).map(scope => `<span class="settings-pill">${esc(scope)}</span>`).join('')}</div>
                     </div>
-                    <button class="settings-chip-remove" type="button" onclick="revokeSession('${esc(session.id)}')">Revoke</button>
+                    <button class="settings-chip-remove" type="button" onclick="revokeSession('${escJsSq(session.id)}')">Revoke</button>
                 </div>
             </div>`).join('')
             : '<div class="settings-empty">No authorized applications.</div>';
@@ -3986,7 +4098,7 @@ function renderAliases(aliases) {
                 <div class="settings-label" style="color:var(--text);font-weight:700">${esc(acct.display_name || acct.username)}</div>
                 <div class="settings-label">@${esc(acct.acct || acct.username)}</div>
             </div>
-            <button class="settings-chip-remove" type="button" onclick="removeMigrationAlias('${esc(acct.acct || '')}')">Remove</button>
+            <button class="settings-chip-remove" type="button" onclick="removeMigrationAlias('${escJsSq(acct.acct || '')}')">Remove</button>
         </div>`).join('')
         : '<div class="settings-empty">No migration aliases.</div>';
 }
@@ -4004,10 +4116,10 @@ function renderDeveloperApps(apps) {
                 <div class="settings-label" style="word-break:break-all">Client Secret: ${esc(app.client_secret || '')}</div>
             </div>
             <div style="display:flex;flex-direction:column;gap:.5rem;align-items:flex-end">
-                <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${esc(app.client_id || '')}','Client ID copied.')">Copy ID</button>
-                <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${esc(app.client_secret || '')}','Client secret copied.')">Copy secret</button>
-                <button class="settings-chip-remove" type="button" onclick="createPersonalAccessToken('${esc(app.id)}')">Create token</button>
-                <button class="settings-chip-remove danger" type="button" onclick="deleteDeveloperApp('${esc(app.id)}')">Delete app</button>
+                <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${escJsSq(app.client_id || '')}','Client ID copied.')">Copy ID</button>
+                <button class="settings-chip-remove" type="button" onclick="copyDeveloperSecret('${escJsSq(app.client_secret || '')}','Client secret copied.')">Copy secret</button>
+                <button class="settings-chip-remove" type="button" onclick="createPersonalAccessToken('${escJsSq(app.id)}')">Create token</button>
+                <button class="settings-chip-remove danger" type="button" onclick="deleteDeveloperApp('${escJsSq(app.id)}')">Delete app</button>
             </div>
         </div>`).join('')
         : '<div class="settings-empty">No developer applications yet.</div>';
@@ -4030,7 +4142,7 @@ function renderDeveloperTokens(tokens) {
                 <div class="settings-label">Scopes: ${esc((token.scopes || []).join(', ') || 'none')}</div>
                 <div class="settings-label">Created ${esc(timeAgo(token.created_at))}${token.last_used_at ? ' · Active ' + esc(timeAgo(token.last_used_at)) : ''}</div>
             </div>
-            <button class="settings-chip-remove danger" type="button" onclick="revokeDeveloperToken('${esc(token.id)}')">Revoke</button>
+            <button class="settings-chip-remove danger" type="button" onclick="revokeDeveloperToken('${escJsSq(token.id)}')">Revoke</button>
         </div>`).join('')
         : '<div class="settings-empty">No personal access tokens created here.</div>';
 }
@@ -4094,7 +4206,7 @@ function setupSettingsTabs() {
 
     nav.innerHTML = groups.map(group => `
         <button type="button" class="explore-tab settings-tab-btn" data-settings-tab="${esc(group.id)}"
-            onclick="activateSettingsTab('${esc(group.id)}')">${esc(group.label)}</button>
+            onclick="activateSettingsTab('${escJsSq(group.id)}')">${esc(group.label)}</button>
     `).join('');
 
     const active = groups.some(group => group.id === window.__settingsTab) ? window.__settingsTab : groups[0]?.id;
@@ -4244,7 +4356,7 @@ async function revokeDeveloperToken(id) {
 
 async function copyDeveloperSecret(value, message) {
     try {
-        await navigator.clipboard.writeText(value);
+        await copyText(value);
         Toast.ok(message);
     } catch {
         Toast.err('Could not copy to clipboard.');
@@ -4643,7 +4755,7 @@ async function showExplore(tab) {
         if (!tags.length) { trendingArea.insertAdjacentHTML('beforeend', '<p style="padding:2rem;color:var(--text2);text-align:center">No trending hashtags</p>'); return; }
         const html = tags.map(t => {
             const uses = (t.history ?? []).reduce((s, h) => s + parseInt(h.uses ?? 0), 0);
-            return `<div class="explore-tag-item" onclick="navigate('TAG_TIMELINE','${esc(t.name)}')">
+            return `<div class="explore-tag-item" onclick="navigate('TAG_TIMELINE','${escJsSq(t.name)}')">
                 <div>
                     <div class="explore-tag-name">#${esc(t.name)}</div>
                     <div class="explore-tag-count">${uses} posts in the last 7 days</div>
@@ -4667,8 +4779,8 @@ async function showExplore(tab) {
             const requested = !!rel.requested && !following;
             const bio = a.note ? a.note.replace(/<[^>]+>/g, '').trim() : '';
             return `<div class="explore-people-item">
-                <img class="explore-people-avatar" src="${esc(a.avatar)}" alt="" loading="lazy" onclick="navigate('PROFILE','${esc(a.id)}')">
-                <div class="explore-people-info" onclick="navigate('PROFILE','${esc(a.id)}')">
+                <img class="explore-people-avatar" src="${esc(a.avatar)}" alt="" loading="lazy" onclick="navigate('PROFILE','${escJsSq(a.id)}')">
+                <div class="explore-people-info" onclick="navigate('PROFILE','${escJsSq(a.id)}')">
                     <div class="explore-people-name">${esc(a.display_name || a.username)}</div>
                     <div class="explore-people-acct">@${esc(a.acct)}</div>
                     ${bio ? `<div class="explore-people-bio">${esc(bio)}</div>` : ''}
@@ -4688,16 +4800,19 @@ async function doExploreSearch(q) {
     const sr = document.getElementById('explore-search-results');
     if (!sr || !q) return;
     syncRightSearchInput(q);
+    const reqId = ++_exploreSearchReqSeq;
     sr.innerHTML = '<div class="feed-loading">Searching...</div>';
     try {
         const r = await Api.get('/api/v2/search', {q, resolve: true, limit: 10});
+        if (reqId !== _exploreSearchReqSeq) return;
         let html = '';
         if (r.accounts?.length)  { html += '<div class="search-section-title">Accounts</div>';   r.accounts.forEach(a  => html += renderAccount(a)); }
         if (r.statuses?.length)  { html += '<div class="search-section-title">Posts</div>';      r.statuses.forEach(s  => html += renderStatus(s)); }
-        if (r.hashtags?.length)  { html += '<div class="search-section-title">Hashtags</div>';    r.hashtags.forEach(h  => html += `<div class="hashtag-item"><a href="#" onclick="navigate('TAG_TIMELINE','${esc(h.name)}')">#${esc(h.name)}</a></div>`); }
+        if (r.hashtags?.length)  { html += '<div class="search-section-title">Hashtags</div>';    r.hashtags.forEach(h  => html += `<div class="hashtag-item"><a href="#" onclick="navigate('TAG_TIMELINE','${escJsSq(h.name)}')">#${esc(h.name)}</a></div>`); }
         if (!html) html = '<div class="feed-end">No results.</div>';
         sr.innerHTML = html;
     } catch (e) {
+        if (reqId !== _exploreSearchReqSeq) return;
         sr.innerHTML = '<div class="feed-error">Error: ' + esc(e.message) + '</div>';
     }
 }
@@ -4709,15 +4824,15 @@ function renderListItem(list) {
             <svg viewBox="0 0 24 24"><path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
         </span>
         <svg class="list-item-icon" viewBox="0 0 24 24"><path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>
-        <span class="list-item-title" onclick="navigate('LIST_TIMELINE','${esc(list.id)}')">${esc(list.title)}</span>
+        <span class="list-item-title" onclick="navigate('LIST_TIMELINE','${escJsSq(list.id)}')">${esc(list.title)}</span>
         <div class="list-actions">
-            <button class="list-act-btn" title="Members" onclick="showListMembers('${esc(list.id)}','${esc(list.title)}')">
+            <button class="list-act-btn" title="Members" onclick="showListMembers('${escJsSq(list.id)}','${escJsSq(list.title)}')">
                 <svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
             </button>
-            <button class="list-act-btn" title="Edit name" onclick="editListTitle('${esc(list.id)}','${esc(list.title)}')">
+            <button class="list-act-btn" title="Edit name" onclick="editListTitle('${escJsSq(list.id)}','${escJsSq(list.title)}')">
                 <svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
             </button>
-            <button class="list-act-btn del" title="Delete list" onclick="deleteList('${esc(list.id)}','${esc(list.title)}')">
+            <button class="list-act-btn del" title="Delete list" onclick="deleteList('${escJsSq(list.id)}','${escJsSq(list.title)}')">
                 <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
             </button>
         </div>
@@ -4846,7 +4961,7 @@ async function showListMembers(listId, listTitle) {
         </div>
         <div class="members-search">
             <input type="search" id="member-search-input" placeholder="Search for an account to add..." autocomplete="off">
-            <button onclick="searchToAddMember('${esc(listId)}')">Search</button>
+            <button onclick="searchToAddMember('${escJsSq(listId)}')">Search</button>
         </div>
         <div id="member-search-results"></div>
         <div id="member-list">
@@ -4864,13 +4979,13 @@ async function showListMembers(listId, listTitle) {
 
 function renderMemberRow(account, listId, isMember) {
     const btn = isMember
-        ? `<button class="member-remove" onclick="removeListMember('${esc(listId)}','${esc(account.id)}',this)">Remove</button>`
-        : `<button class="member-add" onclick="addListMember('${esc(listId)}','${esc(account.id)}',this)">Add</button>`;
+        ? `<button class="member-remove" onclick="removeListMember('${escJsSq(listId)}','${escJsSq(account.id)}',this)">Remove</button>`
+        : `<button class="member-add" onclick="addListMember('${escJsSq(listId)}','${escJsSq(account.id)}',this)">Add</button>`;
     return `
     <div class="member-row" data-account-id="${esc(account.id)}">
-        <img src="${esc(account.avatar)}" alt="" onclick="navigate('PROFILE','${esc(account.id)}')">
+        <img src="${esc(account.avatar)}" alt="" onclick="navigate('PROFILE','${escJsSq(account.id)}')">
         <div class="member-info">
-            <div class="member-name" onclick="navigate('PROFILE','${esc(account.id)}')">${esc(account.display_name || account.username)}</div>
+            <div class="member-name" onclick="navigate('PROFILE','${escJsSq(account.id)}')">${esc(account.display_name || account.username)}</div>
             <div class="member-acct">@${esc(account.acct)}</div>
         </div>
         ${btn}
@@ -4882,12 +4997,17 @@ async function searchToAddMember(listId) {
     if (!q) return;
     const res = document.getElementById('member-search-results');
     if (!res) return;
+    const reqId = ++_memberSearchReqSeq;
     res.innerHTML = '<div class="feed-loading">Searching...</div>';
     try {
         const r = await Api.get('/api/v2/search', {q, resolve: true, limit: 5, type: 'accounts'});
+        if (reqId !== _memberSearchReqSeq) return;
         if (!r.accounts?.length) { res.innerHTML = '<div class="feed-end" style="padding:.75rem 1.25rem">No results.</div>'; return; }
         res.innerHTML = r.accounts.map(a => renderMemberRow(a, listId, false)).join('');
-    } catch (e) { res.innerHTML = '<div class="feed-error" style="padding:.75rem 1.25rem">Error: ' + esc(e.message) + '</div>'; }
+    } catch (e) {
+        if (reqId !== _memberSearchReqSeq) return;
+        res.innerHTML = '<div class="feed-error" style="padding:.75rem 1.25rem">Error: ' + esc(e.message) + '</div>';
+    }
 }
 
 async function addListMember(listId, accountId, btn) {
@@ -5244,6 +5364,7 @@ async function checkUnreadNotifications() {
             Api.get('/api/v1/notifications', {limit: 1}).catch(() => []),
         ]);
         const lastRead  = String(markers?.notifications?.last_read_id ?? '0');
+        const unreadCount = Number(markers?.notifications?.unread_count ?? NaN);
         _notifLastReadId = lastRead;
         if (!notifs.length) {
             _pendingNotifs = 0;
@@ -5257,8 +5378,13 @@ async function checkUnreadNotifications() {
             updateNotifBadge();
             return;
         }
+        if (Number.isFinite(unreadCount) && unreadCount >= 0) {
+            _pendingNotifs = unreadCount;
+            updateNotifBadge();
+            return;
+        }
         if (lastRead === '0' || notifIdGt(latestId, lastRead)) {
-            _pendingNotifs = 1; // at least 1 unread — exact count not critical
+            _pendingNotifs = 1;
             updateNotifBadge();
             return;
         }
@@ -5324,6 +5450,9 @@ function navigate(view, id = null) {
     else if (view === 'LIST_TIMELINE') url = '/web/list/' + id;
     else if (view === 'THREAD')        url = '/web/thread/' + id;
     else if (view === 'PROFILE')       url = '/web/profile/' + id;
+    else if (view === 'FOLLOWERS')     url = '/web/profile/' + id + '/followers';
+    else if (view === 'FOLLOWING')     url = '/web/profile/' + id + '/following';
+    else if (view === 'TAG_TIMELINE')  url = '/web/tag/' + encodeURIComponent(id);
     else if (view === 'CONVERSATIONS') url = '/web/conversations';
     else if (view === 'SETTINGS')      url = '/web/settings';
     else if (view === 'EDIT_PROFILE')  url = '/web/edit-profile';
@@ -5353,6 +5482,9 @@ function navigateReplace(view, id = null) {
     else if (view === 'LIST_TIMELINE') url = '/web/list/' + id;
     else if (view === 'THREAD')        url = '/web/thread/' + id;
     else if (view === 'PROFILE')       url = '/web/profile/' + id;
+    else if (view === 'FOLLOWERS')     url = '/web/profile/' + id + '/followers';
+    else if (view === 'FOLLOWING')     url = '/web/profile/' + id + '/following';
+    else if (view === 'TAG_TIMELINE')  url = '/web/tag/' + encodeURIComponent(id);
     else if (view === 'CONVERSATIONS') url = '/web/conversations';
     else if (view === 'SETTINGS')      url = '/web/settings';
     else if (view === 'EDIT_PROFILE')  url = '/web/edit-profile';
@@ -5463,13 +5595,13 @@ function showPostMenu(e, id, bookmarked, isOwn, postUrl) {
     const dd = document.createElement('div');
     dd.className = 'post-menu-dropdown';
     dd.innerHTML = `
-        <button class="repost-option" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();toggleBookmark('${id}',null)">
+        <button class="repost-option" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();toggleBookmark('${escJsSq(id)}',null,${bookmarked ? 'true' : 'false'})">
             <svg viewBox="0 0 24 24"><path d="${bookmarked
                 ? 'M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z'
                 : 'M17 3H7c-1.1 0-1.99.9-1.99 2L5 21l7-3 7 3V5c0-1.1-.9-2-2-2zm0 15l-5-2.18L7 18V5h10v13z'}"/></svg>
             ${bookmarked ? 'Remove bookmark' : 'Bookmark'}
         </button>
-        <button class="repost-option" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();navigator.clipboard.writeText('${postUrl}').then(()=>Toast.ok('Link copied'))">
+        <button class="repost-option" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();copyText('${escJsSq(postUrl)}').then(()=>Toast.ok('Link copied')).catch(()=>Toast.err('Could not copy to clipboard.'))">
             <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
             Copy link
         </button>
@@ -5478,11 +5610,11 @@ function showPostMenu(e, id, bookmarked, isOwn, postUrl) {
             Open original
         </a>
         ${isOwn ? `<div class="post-menu-divider"></div>
-        <button class="repost-option" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();editStatus('${id}')">
+        <button class="repost-option" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();editStatus('${escJsSq(id)}')">
             <svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
             Edit
         </button>
-        <button class="repost-option post-menu-danger" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();deleteStatus('${id}')">
+        <button class="repost-option post-menu-danger" onclick="event.stopPropagation();this.closest('.post-menu-dropdown').remove();deleteStatus('${escJsSq(id)}')">
             <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
             Delete
         </button>` : ''}`;
@@ -5538,12 +5670,15 @@ async function submitPollVote(event, pollId, statusId) {
     }
 }
 
-async function toggleBookmark(id, btn) {
+async function toggleBookmark(id, btn, activeHint = null) {
     try {
-        const s = await Api.get('/api/v1/statuses/' + id);
-        const active = s.bookmarked;
-        await Api.post('/api/v1/statuses/' + id + (active ? '/unbookmark' : '/bookmark'));
-        Toast.ok(active ? 'Bookmark removed' : 'Bookmarked');
+        const active = activeHint !== null
+            ? !!activeHint
+            : btn?.classList.contains('active') || false;
+        const s = await Api.post('/api/v1/statuses/' + id + (active ? '/unbookmark' : '/bookmark'));
+        const now = !!s.bookmarked;
+        btn?.classList.toggle('active', now);
+        Toast.ok(now ? 'Bookmarked' : 'Bookmark removed');
     } catch (e) { Toast.err('Error saving'); }
 }
 
@@ -5786,7 +5921,7 @@ const Compose = {
         document.getElementById('media-previews').innerHTML  = (Array.isArray(mediaAttachments) ? mediaAttachments : []).map(media => {
             const url = esc(media.preview_url || media.url || '');
             const mid = esc(media.id || '');
-            return `<div class="media-thumb" data-media-id="${mid}"><img src="${url}" alt=""><button onclick="Compose.removeMedia('${mid}',this)" type="button" aria-label="Remove">✕</button></div>`;
+            return `<div class="media-thumb" data-media-id="${mid}"><img src="${url}" alt=""><button onclick="Compose.removeMedia('${escJsSq(mid)}',this)" type="button" aria-label="Remove">✕</button></div>`;
         }).join('');
         this.resetPoll();
         if (poll) {
@@ -5893,7 +6028,7 @@ const Compose = {
                 this._mediaIds.push(media.id);
                 const url = esc(media.preview_url || media.url);
                 document.getElementById('media-previews').insertAdjacentHTML('beforeend',
-                    `<div class="media-thumb" data-media-id="${esc(media.id)}"><img src="${url}" alt=""><button onclick="Compose.removeMedia('${esc(media.id)}',this)" type="button" aria-label="Remove">✕</button></div>`);
+                    `<div class="media-thumb" data-media-id="${esc(media.id)}"><img src="${url}" alt=""><button onclick="Compose.removeMedia('${escJsSq(media.id)}',this)" type="button" aria-label="Remove">✕</button></div>`);
             } catch (e) { Toast.err('Error loading file: ' + e.message); }
         }));
     },
@@ -6117,46 +6252,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    // SPA-aware click handler for in-post links (hashtags, mentions, URLs)
-    document.addEventListener('click', e => {
-        const a = e.target.closest('.s-content a');
-        if (!a) return;
-        const href = a.getAttribute('href') || '';
-        const cls  = a.className || '';
-        // Hashtag links → navigate within SPA
-        if (cls.includes('hashtag')) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            const tag = a.textContent.replace(/^#/, '').trim();
-            if (tag) navigate('TAG_TIMELINE', tag);
-            return;
-        }
-        // Mention (handle) links → resolve via API and navigate within SPA
-        if (cls.includes('mention')) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            if (href) {
-                try {
-                    const url = new URL(href);
-                    const path = url.pathname;
-                    const user = path.match(/^\/@?([^/]+)$/)?.[1] ?? path.match(/\/users\/([^/]+)$/)?.[1];
-                    const acct = user ? user + '@' + url.hostname : '';
-                    if (acct) {
-                        Api.get('/api/v1/accounts/lookup', {acct}).then(acc => {
-                            if (acc?.id) navigate('PROFILE', acc.id);
-                        }).catch(() => window.open(href, '_blank', 'noopener'));
-                    } else {
-                        window.open(href, '_blank', 'noopener');
-                    }
-                } catch { window.open(href, '_blank', 'noopener'); }
-            }
-            return;
-        }
-        // All other links already have target="_blank" from ensure_html / text_to_html
-        // but enforce it here as a safety net
-        if (href && !a.target) a.target = '_blank';
-    });
-
     // Popstate — restore cached view if available, otherwise reload
     window.addEventListener('popstate', e => {
         const state = e.state;
@@ -6192,6 +6287,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Lightbox close
     document.getElementById('lightbox')?.addEventListener('click', e => {
         if (e.target.id === 'lightbox' || e.target.id === 'lb-close') Lightbox.close();
+    });
+    document.addEventListener('click', e => {
+        const img = e.target.closest?.('.media-item img[data-full-src]');
+        if (!img) return;
+        e.preventDefault();
+        e.stopPropagation();
+        Lightbox.open(img.dataset.fullSrc || img.src, img.dataset.alt || img.alt || '');
     });
 
     // Keyboard shortcuts

@@ -6,6 +6,7 @@ namespace App\Models;
 class RemoteActorModel
 {
     private const DNS_CACHE_TTL_SECONDS = 600;
+    private const ACTOR_ACCEPT = 'application/activity+json, application/ld+json; profile="https://www.w3.org/ns/activitystreams", application/ld+json';
 
     private static function closeCurlHandle($ch): void
     {
@@ -61,7 +62,19 @@ class RemoteActorModel
             return ['ok' => false, 'actor' => null, 'error' => $error];
         }
 
-        $http = self::httpGetDetailed($url, 'application/activity+json');
+        $http = self::httpGetDetailed($url, self::ACTOR_ACCEPT);
+        if ((!$http['ok'] || !is_array($http['data']) || empty($http['data']['id']))
+            && self::looksLikeWordpressComVanityActor($url)) {
+            $canonicalUrl = self::resolveWordpressComCanonicalActorUrl($url);
+            if ($canonicalUrl !== null && $canonicalUrl !== $url) {
+                $canonicalHttp = self::httpGetDetailed($canonicalUrl, self::ACTOR_ACCEPT);
+                if ($canonicalHttp['ok']
+                    && is_array($canonicalHttp['data'])
+                    && (($canonicalHttp['data']['id'] ?? '') === $url)) {
+                    $http = $canonicalHttp;
+                }
+            }
+        }
         if (!$http['ok']) {
             return ['ok' => false, 'actor' => null, 'error' => $http['error']];
         }
@@ -81,9 +94,10 @@ class RemoteActorModel
     public static function fetchByAcct(string $username, string $domain): ?array
     {
         if (is_local($domain)) return null;
+        $lookupUsername = strtolower($username);
 
         // Check cache first (still valid if < 1h old)
-        $cached = DB::one('SELECT * FROM remote_actors WHERE username=? AND domain=?', [$username, $domain]);
+        $cached = DB::one('SELECT * FROM remote_actors WHERE LOWER(username)=? AND domain=?', [$lookupUsername, $domain]);
         if ($cached && $cached['fetched_at'] > gmdate('Y-m-d\TH:i:s\Z', time() - 3600)) {
             return $cached;
         }
@@ -107,6 +121,41 @@ class RemoteActorModel
 
         $result = self::fetch($actorUrl, true);
         return $result ?? $cached; // return stale if fresh fetch failed
+    }
+
+    private static function looksLikeWordpressComVanityActor(string $url): bool
+    {
+        $host = strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
+        $path = (string)(parse_url($url, PHP_URL_PATH) ?? '');
+        return $host !== ''
+            && str_ends_with($host, '.wordpress.com')
+            && preg_match('#^/@[^/]+$#', $path) === 1;
+    }
+
+    private static function resolveWordpressComCanonicalActorUrl(string $url): ?string
+    {
+        $host = strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
+        if ($host === '' || !str_ends_with($host, '.wordpress.com')) {
+            return null;
+        }
+
+        $siteInfoUrl = 'https://public-api.wordpress.com/rest/v1.1/sites/'
+            . rawurlencode($host)
+            . '?fields=ID,URL';
+        $siteInfo = self::httpGetDetailed($siteInfoUrl, 'application/json', []);
+        if (!$siteInfo['ok'] || !is_array($siteInfo['data'])) {
+            return null;
+        }
+
+        $siteId = (int)($siteInfo['data']['ID'] ?? 0);
+        $siteUrl = rtrim((string)($siteInfo['data']['URL'] ?? ''), '/');
+        if ($siteId <= 0 || ($siteUrl !== '' && $siteUrl !== 'https://' . $host)) {
+            return null;
+        }
+
+        return 'https://public-api.wordpress.com/wpcom/activitypub-1.0/sites/'
+            . $siteId
+            . '/actors/0';
     }
 
     private static function upsert(array $d, bool $fetchCounts = false): ?array
@@ -184,7 +233,7 @@ class RemoteActorModel
         if (is_array($val) && isset($val['totalItems'])) return (int)$val['totalItems'];
         // String URL — only fetch when explicitly refreshing a profile
         if (is_string($val) && $doFetch) {
-            $data = self::httpGet($val, 'application/activity+json');
+            $data = self::httpGet($val, self::ACTOR_ACCEPT);
             if ($data && isset($data['totalItems'])) return (int)$data['totalItems'];
         }
         return 0;

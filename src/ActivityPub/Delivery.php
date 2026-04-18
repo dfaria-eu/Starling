@@ -75,7 +75,7 @@ class Delivery
     private static function logQueue(string $event, array $context = [], string $throttleKey = '', int $windowSeconds = 60): void
     {
         try {
-            if ($throttleKey !== '' && !throttle_allow('delivery_queue_log:' . $throttleKey, 1, $windowSeconds)) {
+            if ($throttleKey !== '' && !throttle_allow('delivery_queue_log:' . $throttleKey, $windowSeconds)) {
                 return;
             }
             $parts = [];
@@ -1023,7 +1023,7 @@ class Delivery
      */
     public static function queueToRelays(array $actor, array $activity): void
     {
-        $relays = DB::all("SELECT inbox_url FROM relay_subscriptions WHERE status='accepted'");
+        $relays = DB::all("SELECT inbox_url FROM relay_subscriptions WHERE status='accepted' AND receive_posts=1");
         foreach ($relays as $r) {
             if ($r['inbox_url']) self::enqueue($actor, $r['inbox_url'], $activity);
         }

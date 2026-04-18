@@ -75,9 +75,9 @@ class CryptoModel
      * Returns true if valid, false otherwise.
      * On cache-miss failure, re-fetches the key once and retries (handles key rotation).
      */
-    public static function verifyIncoming(array $headers, string $method, string $path, string $body = ''): bool
+    public static function verifyIncoming(array $headers, string $method, string $path, string $body = '', string $actorHint = ''): bool
     {
-        return self::verifyIncomingDetailed($headers, $method, $path, $body)['ok'];
+        return self::verifyIncomingDetailed($headers, $method, $path, $body, $actorHint)['ok'];
     }
 
     /**
@@ -85,7 +85,7 @@ class CryptoModel
      *
      * @return array{ok:bool,error:string,key_id:string,actor_url:string,algorithm:string,headers:string}
      */
-    public static function verifyIncomingDetailed(array $headers, string $method, string $path, string $body = ''): array
+    public static function verifyIncomingDetailed(array $headers, string $method, string $path, string $body = '', string $actorHint = ''): array
     {
         $sig = $headers['signature'] ?? '';
         if (!$sig) {
@@ -99,32 +99,38 @@ class CryptoModel
             ];
         }
 
-        if (!preg_match('/keyId="([^"]+)"/', $sig, $km)) {
-            return [
-                'ok' => false,
-                'error' => 'signature_missing_keyid',
-                'key_id' => '',
-                'actor_url' => '',
-                'algorithm' => '',
-                'headers' => '',
-            ];
+        $signatureInput = trim((string)($headers['signature-input'] ?? ''));
+        $modernSig = self::parseModernHttpSignature($headers, $method, $path, $body, $actorHint);
+        if ($modernSig !== null) {
+            return $modernSig;
         }
-        if (!preg_match('/headers="([^"]+)"/', $sig, $hm)) {
+
+        $keyId = '';
+        if (preg_match('/\bkeyid="([^"]+)"/i', $sig, $km)) {
+            $keyId = $km[1];
+        } elseif ($signatureInput !== '') {
+            $parsedSigInput = self::parseLegacySignatureInput($signatureInput);
+            if ($parsedSigInput !== null) {
+                $keyId = $parsedSigInput['keyid'];
+            }
+        }
+
+        if (!preg_match('/\bheaders="([^"]+)"/i', $sig, $hm)) {
             return [
                 'ok' => false,
                 'error' => 'signature_missing_headers_list',
-                'key_id' => $km[1],
-                'actor_url' => self::actorUrlFromKeyId($km[1]),
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
                 'algorithm' => '',
                 'headers' => '',
             ];
         }
-        if (!preg_match('/signature="([^"]+)"/', $sig, $sm)) {
+        if (!preg_match('/\bsignature="([^"]+)"/i', $sig, $sm)) {
             return [
                 'ok' => false,
                 'error' => 'signature_missing_signature_value',
-                'key_id' => $km[1],
-                'actor_url' => self::actorUrlFromKeyId($km[1]),
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
                 'algorithm' => '',
                 'headers' => $hm[1],
             ];
@@ -132,19 +138,20 @@ class CryptoModel
         // Reject explicitly stated algorithms outside the accepted set.
         // hs2019 = "algorithm determined by key type" (IETF draft-cavage-http-signatures-12).
         // ed25519 = explicit EdDSA; accepted and handled in _verifySig().
-        $algorithm = preg_match('/algorithm="([^"]+)"/', $sig, $am) ? strtolower($am[1]) : '';
-        if ($algorithm !== '' && !in_array($algorithm, ['rsa-sha256', 'hs2019', 'ed25519'], true)) {
+        // rsa-v1_5-sha256 is the modern HTTP Message Signatures identifier for
+        // RSA PKCS#1 v1.5 with SHA-256, which matches our OpenSSL verification.
+        $algorithm = preg_match('/\balgorithm="([^"]+)"/i', $sig, $am) ? strtolower($am[1]) : '';
+        if ($algorithm !== '' && !in_array($algorithm, ['rsa-sha256', 'rsa-v1_5-sha256', 'hs2019', 'ed25519'], true)) {
             return [
                 'ok' => false,
                 'error' => 'unsupported_algorithm:' . $algorithm,
-                'key_id' => $km[1],
-                'actor_url' => self::actorUrlFromKeyId($km[1]),
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
                 'algorithm' => $algorithm,
                 'headers' => $hm[1],
             ];
         }
 
-        $keyId   = $km[1];
         $hdrList = explode(' ', $hm[1]);
         $sigB64  = $sm[1];
 
@@ -167,7 +174,7 @@ class CryptoModel
                         'ok' => false,
                         'error' => 'signed_header_missing:' . $h,
                         'key_id' => $keyId,
-                        'actor_url' => self::actorUrlFromKeyId($keyId),
+                        'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
                         'algorithm' => $algorithm,
                         'headers' => $hm[1],
                     ];
@@ -177,31 +184,16 @@ class CryptoModel
         }
         $signingStr = implode("\n", $parts);
 
-        // If the request carries a Digest header, verify it before checking the signature.
-        // This protects the body integrity for signed inbox deliveries and matches Mastodon.
-        $digestHeader = trim((string)($headers['digest'] ?? ''));
-        if ($digestHeader !== '') {
-            if (!preg_match('/^SHA-256=(.+)$/i', $digestHeader, $dm)) {
-                return [
-                    'ok' => false,
-                    'error' => 'digest_header_invalid',
-                    'key_id' => $keyId,
-                    'actor_url' => self::actorUrlFromKeyId($keyId),
-                    'algorithm' => $algorithm,
-                    'headers' => $hm[1],
-                ];
-            }
-            $expectedDigest = base64_encode(hash('sha256', $body, true));
-            if (!hash_equals($expectedDigest, trim($dm[1]))) {
-                return [
-                    'ok' => false,
-                    'error' => 'digest_mismatch',
-                    'key_id' => $keyId,
-                    'actor_url' => self::actorUrlFromKeyId($keyId),
-                    'algorithm' => $algorithm,
-                    'headers' => $hm[1],
-                ];
-            }
+        $digestError = self::verifyIncomingDigestHeaders($headers, $body);
+        if ($digestError !== '') {
+            return [
+                'ok' => false,
+                'error' => $digestError,
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
         }
 
         // Reject requests with a stale Date header — allow ±12 hours (matches Mastodon).
@@ -214,7 +206,7 @@ class CryptoModel
                     'ok' => false,
                     'error' => 'date_header_invalid',
                     'key_id' => $keyId,
-                    'actor_url' => self::actorUrlFromKeyId($keyId),
+                    'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
                     'algorithm' => $algorithm,
                     'headers' => $hm[1],
                 ];
@@ -224,17 +216,35 @@ class CryptoModel
                     'ok' => false,
                     'error' => 'date_header_stale',
                     'key_id' => $keyId,
-                    'actor_url' => self::actorUrlFromKeyId($keyId),
+                    'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
                     'algorithm' => $algorithm,
                     'headers' => $hm[1],
                 ];
             }
         }
 
-        $actorUrl = self::actorUrlFromKeyId($keyId);
+        $actorUrl = $keyId !== '' ? self::actorUrlFromKeyId($keyId) : $actorHint;
+        if ($actorUrl === '') {
+            return [
+                'ok' => false,
+                'error' => 'signature_missing_keyid',
+                'key_id' => '',
+                'actor_url' => '',
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
+        }
 
-        // First attempt with cached key (look up by specific keyId when available)
-        $pub = self::fetchPublicKey($actorUrl, $keyId);
+        // First attempt with cached key (look up by specific keyId when available).
+        // Without keyId, only accept actors that expose a single unambiguous public key.
+        $pub = $keyId !== ''
+            ? self::fetchPublicKey($actorUrl, $keyId)
+            : self::fetchSingleActorPublicKey($actorUrl);
+        if (!$pub && $actorHint !== '' && rtrim($actorHint, '/') !== rtrim($actorUrl, '/')) {
+            $pub = $keyId !== ''
+                ? (self::fetchPublicKey($actorHint, $keyId) ?: self::fetchSingleActorPublicKey($actorHint))
+                : self::fetchSingleActorPublicKey($actorHint);
+        }
         if ($pub && self::_verifySig($signingStr, $sigB64, $pub)) {
             return [
                 'ok' => true,
@@ -253,6 +263,12 @@ class CryptoModel
         $cacheKey = $keyId ?: $actorUrl;
         unset(self::$keyCache[$cacheKey]);
         $actor = RemoteActorModel::fetch($actorUrl, true); // force refresh
+        if (!$actor && $actorHint !== '' && rtrim($actorHint, '/') !== rtrim($actorUrl, '/')) {
+            $actor = RemoteActorModel::fetch($actorHint, true);
+            if ($actor) {
+                $actorUrl = $actorHint;
+            }
+        }
         if (!$actor) {
             return [
                 'ok' => false,
@@ -263,12 +279,13 @@ class CryptoModel
                 'headers' => $hm[1],
             ];
         }
-        $freshPem = self::extractKeyByIdFromRawJson($actor['raw_json'] ?? '', $keyId)
-                 ?: ($actor['public_key'] ?? '');
+        $freshPem = $keyId !== ''
+            ? self::extractKeyByIdFromRawJson($actor['raw_json'] ?? '', $keyId)
+            : self::extractOnlyPublicKeyFromRawJson($actor['raw_json'] ?? '');
         if (!$freshPem) {
             return [
                 'ok' => false,
-                'error' => 'public_key_missing_for_keyid',
+                'error' => $keyId !== '' ? 'public_key_missing_for_keyid' : 'public_key_ambiguous_without_keyid',
                 'key_id' => $keyId,
                 'actor_url' => $actorUrl,
                 'algorithm' => $algorithm,
@@ -296,6 +313,202 @@ class CryptoModel
             'algorithm' => $algorithm,
             'headers' => $hm[1],
         ];
+    }
+
+    /**
+     * Minimal support for RFC 9421 HTTP Message Signatures.
+     *
+     * @return array{ok:bool,error:string,key_id:string,actor_url:string,algorithm:string,headers:string}|null
+     */
+    private static function parseModernHttpSignature(array $headers, string $method, string $path, string $body = '', string $actorHint = ''): ?array
+    {
+        $signatureInput = trim((string)($headers['signature-input'] ?? ''));
+        $signature = trim((string)($headers['signature'] ?? ''));
+        if ($signatureInput === '' || $signature === '') return null;
+
+        if (!preg_match('/^\s*([A-Za-z][A-Za-z0-9_-]*)=\(([^)]*)\)(.*)$/', $signatureInput, $m)) {
+            return null;
+        }
+        $label = $m[1];
+        $componentsRaw = trim($m[2]);
+        $paramsRaw = $m[3] ?? '';
+        if (!preg_match('/(?:^|,)\s*' . preg_quote($label, '/') . '=:(.+?):\s*(?:,|$)/', $signature, $sm)) {
+            return null;
+        }
+
+        $params = [];
+        if (preg_match_all('/;([a-zA-Z0-9_-]+)=("(?:[^"\\\\]|\\\\.)*"|[0-9]+|[A-Za-z][A-Za-z0-9_:\-\/#.]*)/', $paramsRaw, $pm, PREG_SET_ORDER)) {
+            foreach ($pm as $row) {
+                $value = $row[2];
+                if (strlen($value) >= 2 && $value[0] === '"' && substr($value, -1) === '"') {
+                    $value = stripcslashes(substr($value, 1, -1));
+                }
+                $params[strtolower($row[1])] = $value;
+            }
+        }
+
+        $keyId = trim((string)($params['keyid'] ?? ''));
+        $alg = strtolower(trim((string)($params['alg'] ?? '')));
+        if ($alg !== '' && !in_array($alg, ['rsa-sha256', 'rsa-v1_5-sha256', 'hs2019', 'ed25519'], true)) {
+            return [
+                'ok' => false,
+                'error' => 'unsupported_algorithm:' . $alg,
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : '',
+                'algorithm' => $alg,
+                'headers' => $componentsRaw,
+            ];
+        }
+
+        $components = preg_split('/\s+/', $componentsRaw) ?: [];
+        $parts = [];
+        $covered = [];
+        foreach ($components as $component) {
+            $component = trim($component);
+            if ($component === '') continue;
+            if (strlen($component) >= 2 && $component[0] === '"' && substr($component, -1) === '"') {
+                $component = substr($component, 1, -1);
+            }
+            $covered[] = $component;
+            if ($component === '@method') {
+                $parts[] = "\"@method\": " . strtoupper($method);
+            } elseif ($component === '@target-uri') {
+                $scheme = is_https_request() ? 'https' : 'http';
+                $host = (string)($headers['host'] ?? AP_DOMAIN);
+                $parts[] = "\"@target-uri\": " . $scheme . '://' . $host . $path;
+            } elseif ($component === '@path') {
+                $parts[] = "\"@path\": " . (string)(parse_url($path, PHP_URL_PATH) ?? '/');
+            } elseif ($component === '@query') {
+                $query = (string)(parse_url($path, PHP_URL_QUERY) ?? '');
+                $parts[] = "\"@query\": ?" . $query;
+            } elseif ($component === '@authority') {
+                if (!array_key_exists('host', $headers)) {
+                    return [
+                        'ok' => false,
+                        'error' => 'signed_header_missing:host',
+                        'key_id' => $keyId,
+                        'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : '',
+                        'algorithm' => $alg,
+                        'headers' => $componentsRaw,
+                    ];
+                }
+                $parts[] = "\"@authority\": " . $headers['host'];
+            } elseif (str_starts_with($component, '@')) {
+                return null;
+            } else {
+                if (!array_key_exists($component, $headers)) {
+                    return [
+                        'ok' => false,
+                        'error' => 'signed_header_missing:' . $component,
+                        'key_id' => $keyId,
+                        'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : '',
+                        'algorithm' => $alg,
+                        'headers' => $componentsRaw,
+                    ];
+                }
+                $parts[] = '"' . $component . '": ' . $headers[$component];
+            }
+        }
+
+        // RFC 9421 signs @signature-params exactly as serialized in
+        // Signature-Input. Parameter order is significant; reordering
+        // keyid/alg/created breaks signatures from implementations such as tags.pub.
+        $parts[] = '"@signature-params": (' . $componentsRaw . ')' . $paramsRaw;
+        $signingStr = implode("\n", $parts);
+
+        $digestError = self::verifyIncomingDigestHeaders($headers, $body);
+        if ($digestError !== '') {
+            return [
+                'ok' => false,
+                'error' => $digestError,
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
+                'algorithm' => $alg,
+                'headers' => $componentsRaw,
+            ];
+        }
+
+        $actorUrl = $keyId !== '' ? self::actorUrlFromKeyId($keyId) : $actorHint;
+        if ($actorUrl === '') {
+            return [
+                'ok' => false,
+                'error' => 'signature_missing_keyid',
+                'key_id' => '',
+                'actor_url' => '',
+                'algorithm' => $alg,
+                'headers' => $componentsRaw,
+            ];
+        }
+
+        $pub = $keyId !== ''
+            ? self::fetchPublicKey($actorUrl, $keyId)
+            : self::fetchSingleActorPublicKey($actorUrl);
+        if (!$pub) {
+            return [
+                'ok' => false,
+                'error' => $keyId !== '' ? 'public_key_fetch_failed' : 'public_key_ambiguous_without_keyid',
+                'key_id' => $keyId,
+                'actor_url' => $actorUrl,
+                'algorithm' => $alg,
+                'headers' => $componentsRaw,
+            ];
+        }
+
+        return self::_verifySig($signingStr, $sm[1], $pub)
+            ? [
+                'ok' => true,
+                'error' => '',
+                'key_id' => $keyId,
+                'actor_url' => $actorUrl,
+                'algorithm' => $alg,
+                'headers' => $componentsRaw,
+            ]
+            : [
+                'ok' => false,
+                'error' => 'signature_mismatch',
+                'key_id' => $keyId,
+                'actor_url' => $actorUrl,
+                'algorithm' => $alg,
+                'headers' => $componentsRaw,
+            ];
+    }
+
+    /**
+     * Extract `keyid` from Signature-Input for legacy-style fallback logging/verification.
+     *
+     * @return array{keyid:string}|null
+     */
+    private static function parseLegacySignatureInput(string $signatureInput): ?array
+    {
+        if (!preg_match('/;keyid="([^"]+)"/i', $signatureInput, $m)) return null;
+        return ['keyid' => $m[1]];
+    }
+
+    private static function verifyIncomingDigestHeaders(array $headers, string $body = ''): string
+    {
+        $digestHeader = trim((string)($headers['digest'] ?? ''));
+        if ($digestHeader !== '') {
+            if (!preg_match('/^SHA-256=(.+)$/i', $digestHeader, $dm)) {
+                return 'digest_header_invalid';
+            }
+            $expectedDigest = base64_encode(hash('sha256', $body, true));
+            if (!hash_equals($expectedDigest, trim($dm[1]))) {
+                return 'digest_mismatch';
+            }
+        }
+
+        $contentDigest = trim((string)($headers['content-digest'] ?? ''));
+        if ($contentDigest !== '') {
+            if (!preg_match('/sha-256=:(.+):/i', $contentDigest, $cm)) {
+                return 'content_digest_header_invalid';
+            }
+            $expectedDigest = base64_encode(hash('sha256', $body, true));
+            if (!hash_equals($expectedDigest, trim($cm[1]))) {
+                return 'content_digest_mismatch';
+            }
+        }
+
+        return '';
     }
 
     /**
@@ -336,8 +549,12 @@ class CryptoModel
         $payload = self::jcsEncode($unsigned);
         if ($payload === null) return false;
 
+        if (!defined('SODIUM_CRYPTO_SIGN_BYTES') || !function_exists('sodium_crypto_sign_verify_detached')) {
+            return false;
+        }
+
         $sig = self::decodeMultibase($proofValue);
-        if ($sig === '' || strlen($sig) !== SODIUM_CRYPTO_SIGN_BYTES) return false;
+        if ($sig === '' || strlen($sig) !== \SODIUM_CRYPTO_SIGN_BYTES) return false;
 
         $key = openssl_pkey_get_public($pub);
         if (!$key) return false;
@@ -375,12 +592,15 @@ class CryptoModel
             // Extract raw 32-byte public key from Ed25519 SubjectPublicKeyInfo DER.
             // DER layout: 30 2a 30 05 06 03 2b 65 70 03 21 00 <32 bytes key>
             $stripped = str_replace(["\n", "\r", "-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----"], '', $pubPem);
-            $der = base64_decode(trim($stripped));
-            if (strlen($der) < 32) return false;
-            return sodium_crypto_sign_verify_detached(base64_decode($sigB64), $signingStr, substr($der, -32));
+            $der = base64_decode(trim($stripped), true);
+            $sigRaw = base64_decode($sigB64, true);
+            if ($der === false || $sigRaw === false || strlen($der) < 32) return false;
+            return sodium_crypto_sign_verify_detached($sigRaw, $signingStr, substr($der, -32));
         }
 
-        return openssl_verify($signingStr, base64_decode($sigB64), $key, OPENSSL_ALGO_SHA256) === 1;
+        $sigRaw = base64_decode($sigB64, true);
+        if ($sigRaw === false) return false;
+        return openssl_verify($signingStr, $sigRaw, $key, OPENSSL_ALGO_SHA256) === 1;
     }
 
     /**
@@ -453,18 +673,7 @@ class CryptoModel
         if (!$rawJson) return '';
         $d = json_decode($rawJson, true);
         if (!is_array($d)) return '';
-        $candidates = [];
-        foreach (['publicKey', 'assertionMethod'] as $field) {
-            $value = $d[$field] ?? null;
-            if (!is_array($value)) continue;
-            if (isset($value['publicKeyPem']) || isset($value['publicKeyMultibase']) || isset($value['id'])) {
-                $candidates[] = $value;
-                continue;
-            }
-            foreach ($value as $item) {
-                if (is_array($item)) $candidates[] = $item;
-            }
-        }
+        $candidates = self::extractKeyCandidates($d);
 
         $first = '';
         foreach ($candidates as $k) {
@@ -479,6 +688,60 @@ class CryptoModel
             if (!$first) $first = $pem;
         }
         return $keyId ? '' : $first;
+    }
+
+    private static function extractOnlyPublicKeyFromRawJson(string $rawJson): string
+    {
+        if (!$rawJson) return '';
+        $d = json_decode($rawJson, true);
+        if (!is_array($d)) return '';
+        $candidates = self::extractKeyCandidates($d);
+        $unique = [];
+        foreach ($candidates as $k) {
+            $pem = '';
+            if (is_string($k['publicKeyPem'] ?? null)) {
+                $pem = (string)$k['publicKeyPem'];
+            } elseif (is_string($k['publicKeyMultibase'] ?? null)) {
+                $pem = self::multibaseToPem((string)$k['publicKeyMultibase']);
+            }
+            if ($pem === '') continue;
+            $unique[sha1($pem)] = $pem;
+        }
+        return count($unique) === 1 ? (string)reset($unique) : '';
+    }
+
+    private static function extractKeyCandidates(array $d): array
+    {
+        $candidates = [];
+        foreach (['publicKey', 'assertionMethod'] as $field) {
+            $value = $d[$field] ?? null;
+            if (!is_array($value)) continue;
+            if (isset($value['publicKeyPem']) || isset($value['publicKeyMultibase']) || isset($value['id'])) {
+                $candidates[] = $value;
+                continue;
+            }
+            foreach ($value as $item) {
+                if (is_array($item)) $candidates[] = $item;
+            }
+        }
+        return $candidates;
+    }
+
+    private static function fetchSingleActorPublicKey(string $actorUrl): ?string
+    {
+        if ($actorUrl === '') return null;
+        $row = DB::one('SELECT raw_json, public_key FROM remote_actors WHERE id=?', [$actorUrl]);
+        if ($row) {
+            $pem = self::extractOnlyPublicKeyFromRawJson((string)($row['raw_json'] ?? ''));
+            if ($pem !== '') return $pem;
+            if (trim((string)($row['public_key'] ?? '')) !== '' && trim((string)($row['raw_json'] ?? '')) === '') {
+                return trim((string)$row['public_key']);
+            }
+        }
+        $actor = RemoteActorModel::fetch($actorUrl, true);
+        if (!$actor) return null;
+        $pem = self::extractOnlyPublicKeyFromRawJson((string)($actor['raw_json'] ?? ''));
+        return $pem !== '' ? $pem : null;
     }
 
     private static function multibaseToPem(string $multibase): string

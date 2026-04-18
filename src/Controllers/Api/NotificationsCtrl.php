@@ -390,7 +390,7 @@ class NotificationsCtrl
         $this->normalizeNotificationIds($user['id']);
         $this->backfillReadStateFromMarker($user['id']);
         $this->backfillMissingEngagementNotifications($user['id']);
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -451,7 +451,7 @@ class NotificationsCtrl
         $this->normalizeNotificationIds($user['id']);
         $this->backfillReadStateFromMarker($user['id']);
         $this->backfillMissingEngagementNotifications($user['id']);
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -553,7 +553,7 @@ class NotificationsCtrl
         $this->normalizeNotificationIds($user['id']);
         $this->backfillReadStateFromMarker($user['id']);
         $this->backfillMissingEngagementNotifications($user['id']);
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;

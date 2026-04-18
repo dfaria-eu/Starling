@@ -975,7 +975,7 @@ class AdminCtrl
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{$e($title)} — Admin · {$domain}</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="{$e(\site_favicon_url())}">
 <style>
 :root {
   --bg:      #fff;
@@ -2032,7 +2032,13 @@ HTML;
     {
         $e    = fn($v) => htmlspecialchars((string)$v, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         $json = json_encode(json_decode($r['raw_json']), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $sigHeaders = json_decode((string)($r['sig_headers'] ?? '{}'), true);
+        $sigJson = '';
+        if (is_array($sigHeaders) && $sigHeaders) {
+            $sigJson = json_encode($sigHeaders, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
         $errHtml = $r['error'] ? "<div class='flash flash-error' style='margin-bottom:1rem'><strong>Error:</strong> {$e($r['error'])}</div>" : '';
+        $sigHtml = $sigJson !== '' ? "<div class=\"section-title\">Signature headers</div>\n<pre class=\"code\">{$e($sigJson)}</pre>" : '';
 
         return <<<HTML
 <div style="margin-bottom:1rem"><a href="/admin/inbox-log" class="btn btn-ghost btn-sm">← Back</a></div>
@@ -2042,6 +2048,7 @@ HTML;
   <div class="card"><div class="card-label">Date</div><div class="card-value" style="font-size:.9rem">{$e($this->fmtDateTime($r['created_at'] ?? ''))}</div></div>
   <div class="card"><div class="card-label">Actor</div><div class="card-value" style="font-size:.7rem;word-break:break-all">{$e($r['actor_url'])}</div></div>
 </div>
+{$sigHtml}
 <div class="section-title">Raw activity JSON</div>
 <pre class="code">{$e($json)}</pre>
 HTML;
@@ -2366,11 +2373,16 @@ HTML;
             }
             $domain   = $e(parse_url($r['inbox_url'], PHP_URL_HOST) ?? $r['inbox_url']);
             $attempts = (int)$r['attempts'];
+            $lastBucket = trim((string)($r['last_error_bucket'] ?? ''));
+            $isTerminalBucket = in_array($lastBucket, ['unsafe_url', 'dns_nxdomain', 'http_400', 'http_403', 'http_404', 'http_405', 'http_410', 'http_422'], true);
             $attClass = $attempts === 0 ? 'badge-green' : ($attempts >= 8 ? 'badge-red' : 'badge-amber');
-            $attLabel = $attempts === 0 ? 'pending' : ($attempts >= 8 ? 'terminal failure' : "attempt $attempts");
+            $attLabel = $attempts === 0
+                ? 'pending'
+                : ($attempts >= 8
+                    ? ($isTerminalBucket ? 'terminal failure' : 'retries exhausted')
+                    : "attempt $attempts");
             $lastCode = (int)($r['last_http_code'] ?? 0);
             $lastError = trim((string)($r['last_error'] ?? ''));
-            $lastBucket = trim((string)($r['last_error_bucket'] ?? ''));
             $lastDetail = trim((string)($r['last_error_detail'] ?? ''));
             $lastBody = trim((string)($r['last_response_body'] ?? ''));
             $lastResult = $lastCode > 0 ? ('HTTP ' . $lastCode) : ($lastError !== '' ? $lastError : '—');
@@ -2615,7 +2627,7 @@ HTML;
 <!DOCTYPE html><html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Admin — {$domain}</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="{$e(\site_favicon_url())}">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#fff;--surface:#fff;--hover:#F3F3F8;--blue:#0085FF;--blue2:#0070E0;--blue-bg:#E0EDFF;--border:#E5E7EB;--text:#0F1419;--text2:#66788A;--text3:#8D99A5;--red:#EC4040}

@@ -134,6 +134,16 @@ class StatusModel
         $host   = strtolower((string)($parsed['host'] ?? ''));
         if ($host === '' || !is_local($host)) return null;
 
+        $baseParsed = parse_url((string)AP_BASE_URL);
+        $baseScheme = strtolower((string)($baseParsed['scheme'] ?? 'https'));
+        $baseHost   = strtolower((string)($baseParsed['host'] ?? ''));
+        $basePort   = (int)($baseParsed['port'] ?? ($baseScheme === 'http' ? 80 : 443));
+        $uriScheme  = strtolower((string)($parsed['scheme'] ?? $baseScheme));
+        $uriPort    = (int)($parsed['port'] ?? ($uriScheme === 'http' ? 80 : 443));
+        if ($host !== $baseHost || $uriScheme !== $baseScheme || $uriPort !== $basePort) {
+            return null;
+        }
+
         $path = rawurldecode((string)($parsed['path'] ?? ''));
         if ($path === '') return null;
 

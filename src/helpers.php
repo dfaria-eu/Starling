@@ -481,9 +481,14 @@ function authed_user(): ?array
 
 function auth_context(): ?array
 {
-    // Accept token via Authorization header OR ?access_token= query param.
-    // Clients use the query param for SSE streaming (EventSource cannot send headers).
-    $tok = bearer() ?? ($_GET['access_token'] ?? null) ?? ($_COOKIE['ap_auth'] ?? null) ?? null;
+    // Accept token via Authorization header.
+    // Only the SSE endpoint may use ?access_token= because EventSource cannot send headers.
+    $queryToken = null;
+    $path = (string)parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
+    if ($path === '/api/v1/streaming/user') {
+        $queryToken = $_GET['access_token'] ?? null;
+    }
+    $tok = bearer() ?? $queryToken ?? ($_COOKIE['ap_auth'] ?? null) ?? null;
     if (!$tok) return null;
 
     $row = \App\Models\OAuthModel::tokenByValue($tok);
@@ -540,31 +545,42 @@ function flake_id(): string
 {
     static $lastMs = 0;
     static $seq    = 0;
+    static $worker = null;
+
+    if ($worker === null) {
+        $scope = (defined('ROOT') ? (string)ROOT : getcwd()) . '|' . getmypid();
+        $worker = crc32($scope) & 0x3F; // 6-bit worker id, stable per process/workspace
+    }
 
     $ms = (int)(microtime(true) * 1000);
     if ($ms === $lastMs) {
-        $seq = ($seq + 1) & 0xFFFF;
+        $seq = ($seq + 1) & 0x3FF; // 10-bit per-millisecond sequence
     } else {
         $seq    = 0;
         $lastMs = $ms;
     }
 
-    // 64-bit safe: ~3.14×10^16 for 2025 timestamps, well within PHP_INT_MAX
-    $id = (($ms - 1262304000000) << 16) | $seq;
+    // 64-bit safe: timestamp ms + 6-bit worker + 10-bit sequence
+    $id = (($ms - 1262304000000) << 16) | ($worker << 10) | $seq;
     return (string)$id;
 }
 
 function flake_id_at(?string $ts, int $seq = 0): string
 {
     if (!$ts) return flake_id();
+    static $worker = null;
+    if ($worker === null) {
+        $scope = (defined('ROOT') ? (string)ROOT : getcwd()) . '|' . getmypid();
+        $worker = crc32($scope) & 0x3F;
+    }
     try {
         $dt = new DateTimeImmutable($ts);
         $ms = ((int)$dt->format('U')) * 1000 + (int)$dt->format('v');
     } catch (Throwable) {
         return flake_id();
     }
-    $seq = max(0, min(0xFFFF, $seq));
-    $id = (($ms - 1262304000000) << 16) | $seq;
+    $seq = max(0, min(0x3FF, $seq));
+    $id = (($ms - 1262304000000) << 16) | ($worker << 10) | $seq;
     return (string)$id;
 }
 
@@ -642,6 +658,11 @@ function html_to_plain(string $html): string
     // Normalise whitespace
     $text = preg_replace('/\n{3,}/', "\n\n", trim($text));
     return $text;
+}
+
+function site_favicon_url(): string
+{
+    return 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22%3E%E2%8B%B0%E2%8B%B1%3C/text%3E%3C/svg%3E';
 }
 
 function text_to_html(string $text): string
@@ -790,22 +811,25 @@ function ensure_html(string $content): string
         // strip_tags keeps all attributes on allowed tags, so we must do this explicitly.
         $html = preg_replace('/\s+on\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]*)/i', '', $html);
         $html = preg_replace('/\s+style\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]*)/i', '', $html);
-        // Sanitize href attributes: strip any href that is not a plain https?:// URL.
-        // Handles quoted (single and double) and unquoted values.
-        $html = preg_replace(
-            '~\shref=(?:"(?!https?://)[^"]*"|\'(?!https?://)[^\']*\')~i',
-            '',
-            $html
-        );
         // Ensure all <a> links are safe: add noopener + blank target so remote links
         // don't inherit our browsing context. Applies to all <a> tags after sanitisation.
         $html = preg_replace_callback(
             '/<a\b([^>]*)>/i',
             function ($m) {
                 $attrs = $m[1];
+                $safeHref = '';
+                if (preg_match('/\shref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))/i', $attrs, $hrefMatch)) {
+                    $href = html_entity_decode((string)($hrefMatch[1] ?: $hrefMatch[2] ?: $hrefMatch[3] ?: ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    if (preg_match('~^https?://~i', $href)) {
+                        $safeHref = htmlspecialchars($href, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    }
+                }
+                // Rebuild the link so unquoted or dangerous href values do not survive.
+                $attrs = preg_replace('/\s+href\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]*)/i', '', $attrs);
                 // Remove existing rel/target so we can re-add them canonically
                 $attrs = preg_replace('/\s+(?:rel|target)\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]*)/i', '', $attrs);
-                return '<a' . $attrs . ' rel="nofollow noopener noreferrer" target="_blank">';
+                $hrefAttr = $safeHref !== '' ? ' href="' . $safeHref . '"' : '';
+                return '<a' . $attrs . $hrefAttr . ' rel="nofollow noopener noreferrer" target="_blank">';
             },
             $html
         );

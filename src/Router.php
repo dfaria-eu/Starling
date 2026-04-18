@@ -285,6 +285,9 @@ class Router
         $this->get('/web/search',             'WebClientCtrl@search');
         $this->get('/web/thread/:id',         'WebClientCtrl@thread');
         $this->get('/web/profile/:id',        'WebClientCtrl@profile');
+        $this->get('/web/profile/:id/followers', 'WebClientCtrl@followers');
+        $this->get('/web/profile/:id/following', 'WebClientCtrl@following');
+        $this->get('/web/tag/:id',            'WebClientCtrl@tagTimeline');
         $this->get('/web/favourites',         'WebClientCtrl@favourites');
         $this->get('/web/bookmarks',          'WebClientCtrl@bookmarks');
         $this->get('/web/explore',            'WebClientCtrl@explore');

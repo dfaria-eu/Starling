@@ -46,6 +46,7 @@ HTML;
 
         $empty = $rows === '' ? '<div class="members-empty">No local profiles yet.</div>' : $rows;
         $title = htmlspecialchars(AP_NAME . ' members', ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $favicon = htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
         echo <<<HTML
 <!DOCTYPE html><html lang="en">
@@ -53,7 +54,7 @@ HTML;
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>$title</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="$favicon">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#fff;--surface:#fff;--hover:#F3F3F8;--blue:#0085FF;--blue2:#0070E0;--border:#E5E7EB;--text:#0F1419;--text2:#66788A;--text3:#8D99A5}
@@ -616,13 +617,14 @@ MORE;
             ? "background:url('$headerImg') center/cover no-repeat"
             : 'background:linear-gradient(135deg,#0085FF 0%,#0070E0 100%)';
 
+        $favicon = htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         echo <<<HTML
 <!DOCTYPE html><html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>$displayName ($handle)</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="$favicon">
 <link rel="canonical" href="$canonicalProfileUrl">
 <link rel="alternate" type="application/activity+json" href="$apUrl">
 <link rel="alternate" type="application/rss+xml" title="$displayName RSS" href="$rssUrl">
@@ -1137,13 +1139,15 @@ HTML;
         rate_limit_enforce('user_inbox_actor:' . $actorHost, 120, 300, 'Rate limit exceeded for inbox');
 
         $headers = get_request_headers();
-        $path    = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        $path    = (string)parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        $query   = (string)parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_QUERY);
+        if ($query !== '') $path .= '?' . $query;
 
         InboxProcessor::process($activity, $headers, 'POST', $path, $raw);
 
         defer_after_response(static function (): void {
             if (throttle_allow('delivery_retry_queue', 10)) {
-                \App\ActivityPub\Delivery::processRetryQueue(\App\ActivityPub\Delivery::INBOX_DRAIN_BATCH);
+                \App\ActivityPub\Delivery::processRetryQueue(\App\ActivityPub\Delivery::inboxDrainBatch());
             }
         });
 

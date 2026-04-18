@@ -163,7 +163,7 @@ class OAuthCtrl
         if (!in_array($challengeMethod, ['S256', 'plain'], true)) $challengeMethod = 'S256';
         $csrf = (string)($d['csrf'] ?? '');
         $sessionCsrf = (string)($_SESSION['oauth_csrf'] ?? '');
-        if ($sessionCsrf !== '' && $csrf !== '' && !hash_equals($sessionCsrf, $csrf)) {
+        if ($sessionCsrf === '' || $csrf === '' || !hash_equals($sessionCsrf, $csrf)) {
             $_SESSION['oauth_csrf'] = bin2hex(random_bytes(16));
             header('Content-Type: text/html; charset=utf-8');
             echo $this->form($app, $redir, $scope, 'Session expired. Please authorize again.', $state, $codeChallenge, $challengeMethod, $_SESSION['oauth_csrf']);
@@ -188,7 +188,7 @@ class OAuthCtrl
             header('Content-Type: text/html; charset=utf-8');
             $c = htmlspecialchars($code);
             echo "<!DOCTYPE html><html lang=\"en\"><head><meta charset=utf-8><title>Authorization code</title>"
-               . "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>\">"
+               . "<link rel=\"icon\" href=\"" . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . "\">"
                . "<style>:root{--bg:#fff;--surface:#fff;--blue:#0085FF;--border:#E5E7EB;--text:#0F1419;--text2:#66788A;--blue-bg:#E0EDFF}"
                . "@media(prefers-color-scheme:dark){:root{--bg:#0A0E14;--surface:#161823;--border:#2E3039;--text:#F1F3F5;--text2:#7B8794;--blue-bg:#0C1B3A}}"
                . "body{font-family:'Inter',system-ui,sans-serif;max-width:480px;margin:3rem auto;padding:1rem;background:var(--bg);color:var(--text)}"
@@ -206,7 +206,7 @@ class OAuthCtrl
         $safeLoc = htmlspecialchars($loc, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         echo "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
            . "<title>Returning to app</title>"
-           . "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>\">"
+           . "<link rel=\"icon\" href=\"" . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . "\">"
            . "<meta http-equiv=\"refresh\" content=\"0;url=$safeLoc\">"
            . "<style>:root{--bg:#fff;--surface:#fff;--blue:#0085FF;--border:#E5E7EB;--text:#0F1419;--text2:#66788A;--blue-bg:#E0EDFF}"
            . "@media(prefers-color-scheme:dark){:root{--bg:#0A0E14;--surface:#161823;--border:#2E3039;--text:#F1F3F5;--text2:#7B8794;--blue-bg:#0C1B3A}}"
@@ -245,7 +245,7 @@ class OAuthCtrl
 <!DOCTYPE html><html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Authorize {$e($app['name'])}</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="{$e(\site_favicon_url())}">
 <style>
 :root{--bg:#fff;--surface:#fff;--hover:#F3F3F8;--blue:#0085FF;--blue2:#0070E0;--blue-bg:#E0EDFF;--border:#E5E7EB;--text:#0F1419;--text2:#66788A;--red:#EC4040}
 @media(prefers-color-scheme:dark){:root{--bg:#0A0E14;--surface:#161823;--hover:#1E2030;--border:#2E3039;--text:#F1F3F5;--text2:#7B8794;--blue-bg:#0C1B3A}}

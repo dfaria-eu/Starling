@@ -33,7 +33,7 @@ class TimelinesCtrl
     public function home(array $p): void
     {
         $user    = require_auth('read');
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -58,7 +58,7 @@ class TimelinesCtrl
     public function public(array $p): void
     {
         $viewer  = authed_user();
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -87,7 +87,7 @@ class TimelinesCtrl
     {
         $viewer  = authed_user();
         $tag     = mb_strtolower((string)$p['hashtag'], 'UTF-8');
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -105,14 +105,26 @@ class TimelinesCtrl
         $par = [$tag, now_iso()];
         if ($maxId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$maxId]);
+            if (!$ref && ctype_digit($maxId)) {
+                $ms  = ((int)$maxId >> 16) + 1262304000000;
+                $ref = ['created_at' => gmdate('Y-m-d\TH:i:s.000\Z', (int)($ms / 1000)), 'id' => $maxId];
+            }
             if ($ref) { $sql .= ' AND (s.created_at < ? OR (s.created_at = ? AND s.id < ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
         }
         if ($sinceId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$sinceId]);
+            if (!$ref && ctype_digit($sinceId)) {
+                $ms  = ((int)$sinceId >> 16) + 1262304000000;
+                $ref = ['created_at' => gmdate('Y-m-d\TH:i:s.000\Z', (int)($ms / 1000)), 'id' => $sinceId];
+            }
             if ($ref) { $sql .= ' AND (s.created_at > ? OR (s.created_at = ? AND s.id > ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
         }
         if ($minId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$minId]);
+            if (!$ref && ctype_digit($minId)) {
+                $ms  = ((int)$minId >> 16) + 1262304000000;
+                $ref = ['created_at' => gmdate('Y-m-d\TH:i:s.000\Z', (int)($ms / 1000)), 'id' => $minId];
+            }
             if ($ref) { $sql .= ' AND (s.created_at > ? OR (s.created_at = ? AND s.id > ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
         }
         if ($minId) {
@@ -145,7 +157,7 @@ class TimelinesCtrl
         $list  = DB::one('SELECT * FROM lists WHERE id=? AND user_id=?', [$p['id'], $user['id']]);
         if (!$list) err_out('Not found', 404);
 
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;

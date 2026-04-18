@@ -8,7 +8,7 @@ class Schema
     private static bool $done = false;
 
     /** Increment this when adding new tables or columns. */
-    private const SCHEMA_VERSION = 19;
+    private const SCHEMA_VERSION = 20;
 
     public static function install(): void
     {
@@ -459,8 +459,10 @@ class Schema
             type       TEXT NOT NULL,
             raw_json   TEXT NOT NULL,
             error      TEXT NOT NULL DEFAULT '',
+            sig_headers TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL
         )");
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN sig_headers TEXT NOT NULL DEFAULT '{}'"); } catch (\Throwable) {}
 
         // Featured tags (shown on profile)
         $db->exec("CREATE TABLE IF NOT EXISTS featured_tags (
@@ -619,6 +621,7 @@ class Schema
         )"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE tombstones ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE tombstones ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN sig_headers TEXT NOT NULL DEFAULT '{}'"); } catch (\Throwable) {}
         try { $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_status_idempotency ON statuses(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"); } catch (\Throwable) {}
         try { $db->exec("CREATE INDEX IF NOT EXISTS idx_status_expires ON statuses(expires_at)"); } catch (\Throwable) {}
     }

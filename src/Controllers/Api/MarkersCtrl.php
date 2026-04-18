@@ -45,10 +45,21 @@ class MarkersCtrl
                 [$user['id'], $tl]
             );
             if ($row) {
-                $out->$tl = [
+                $payload = [
                     'last_read_id' => $row['last_read_id'],
                     'version'      => (int)$row['version'],
                     'updated_at'   => iso_z($row['updated_at']),
+                ];
+                if ($tl === 'notifications') {
+                    $payload['unread_count'] = DB::count('notifications', 'user_id=? AND read_at IS NULL', [$user['id']]);
+                }
+                $out->$tl = $payload;
+            } elseif ($tl === 'notifications') {
+                $out->$tl = [
+                    'last_read_id' => '0',
+                    'version'      => 0,
+                    'updated_at'   => null,
+                    'unread_count' => DB::count('notifications', 'user_id=? AND read_at IS NULL', [$user['id']]),
                 ];
             }
         }
@@ -117,6 +128,9 @@ class MarkersCtrl
                 'version'      => $version,
                 'updated_at'   => iso_z($now),
             ];
+            if ($tl === 'notifications') {
+                $out->$tl['unread_count'] = DB::count('notifications', 'user_id=? AND read_at IS NULL', [$user['id']]);
+            }
         }
         json_out($out);
     }

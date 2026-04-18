@@ -7,6 +7,22 @@ use App\Models\{DB, UserModel, StatusModel, RemoteActorModel, CryptoModel, PollM
 
 class InboxProcessor
 {
+    private static function isCurrentInstanceActorUrl(string $url): bool
+    {
+        $parsed = parse_url($url);
+        $host   = strtolower((string)($parsed['host'] ?? ''));
+        if ($host === '' || !is_local($host)) return false;
+
+        $baseParsed = parse_url((string)AP_BASE_URL);
+        $baseScheme = strtolower((string)($baseParsed['scheme'] ?? 'https'));
+        $baseHost   = strtolower((string)($baseParsed['host'] ?? ''));
+        $basePort   = (int)($baseParsed['port'] ?? ($baseScheme === 'http' ? 80 : 443));
+        $uriScheme  = strtolower((string)($parsed['scheme'] ?? $baseScheme));
+        $uriPort    = (int)($parsed['port'] ?? ($uriScheme === 'http' ? 80 : 443));
+
+        return $host === $baseHost && $uriScheme === $baseScheme && $uriPort === $basePort;
+    }
+
     private static function isLegacyGhostBodySignatureCompatible(array $activity, string $actorId, string $type): bool
     {
         if (!in_array($type, ['Follow', 'Accept', 'Reject'], true)) return false;
@@ -131,7 +147,7 @@ class InboxProcessor
 
         $hasHttpSignature = !empty($headers['signature']);
         $httpSigResult    = $hasHttpSignature
-            ? CryptoModel::verifyIncomingDetailed($headers, $method, $path, $rawBody)
+            ? CryptoModel::verifyIncomingDetailed($headers, $method, $path, $rawBody, $actorId)
             : ['ok' => false, 'error' => '', 'key_id' => '', 'actor_url' => '', 'algorithm' => '', 'headers' => ''];
         $httpSigOk        = (bool)$httpSigResult['ok'];
         $proofSigOk       = false;
@@ -140,14 +156,14 @@ class InboxProcessor
             if (!$httpSigOk) {
                 $proofSigOk = CryptoModel::verifyObjectSignature($activity, $actorId);
                 if ($proofSigOk) {
-                    $sigError = 'Verified via DataIntegrityProof fallback';
+                    $sigError = '';
                 } else {
                     $rsaSigResult = CryptoModel::verifyRsaSignature2017Detailed($activity, $actorId);
                     if ($rsaSigResult['ok']) {
                     $proofSigOk = true;
-                    $sigError = 'Verified via RsaSignature2017 body signature';
+                    $sigError = '';
                     } elseif (self::isLegacyGhostBodySignatureCompatible($activity, $actorId, (string)$type)) {
-                    $sigError = 'Accepted via Ghost legacy body signature compatibility';
+                    $sigError = '';
                     } elseif ($isAccountDelete) {
                     // Verification failed because the actor is gone — accept anyway.
                     // Log without error so it doesn't flood the error list.
@@ -168,7 +184,7 @@ class InboxProcessor
                     if ($rsaDetail !== '') $sigError .= ' rsa=' . $rsaDetail;
                     if ($algo !== '') $sigError .= ' alg=' . $algo;
                     if ($headersList !== '') $sigError .= ' headers=' . $headersList;
-                    self::log($actorId, $type, $activity, $sigError);
+                    self::log($actorId, $type, $activity, $sigError, $headers);
                     return false;
                     }
                 }
@@ -176,30 +192,30 @@ class InboxProcessor
         } else {
             $proofSigOk = CryptoModel::verifyObjectSignature($activity, $actorId);
             if ($proofSigOk) {
-                $sigError = 'Verified via DataIntegrityProof';
+                $sigError = '';
             } else {
                 $rsaSigResult = CryptoModel::verifyRsaSignature2017Detailed($activity, $actorId);
                 if ($rsaSigResult['ok']) {
                 $proofSigOk = true;
-                $sigError = 'Verified via RsaSignature2017 body signature';
+                $sigError = '';
                 } elseif (self::isLegacyGhostBodySignatureCompatible($activity, $actorId, (string)$type)) {
-                $sigError = 'Accepted via Ghost legacy body signature compatibility';
+                $sigError = '';
                 } elseif (!$isAccountDelete) {
                 // Unsigned requests are only tolerated for actor tombstones. Accepting unsigned
                 // post Deletes would let anyone forge a cache purge for arbitrary remote content.
                 $sigError = 'Missing HTTP Signature — rejected';
                 $rsaDetail = trim((string)($rsaSigResult['error'] ?? ''));
                 if ($rsaDetail !== '') $sigError .= ' rsa=' . $rsaDetail;
-                self::log($actorId, $type, $activity, $sigError);
+                self::log($actorId, $type, $activity, $sigError, $headers);
                 return false;
                 } else {
-                $sigError = 'No HTTP Signature (Delete exempted)';
+                $sigError = '';
                 }
             }
         }
 
         // ── 3. Log ────────────────────────────────────────────
-        self::log($actorId, $type, $activity, $sigError);
+        self::log($actorId, $type, $activity, $sigError, $headers);
 
         // ── 4. Ensure actor is cached ────────────────────────
         if ($actorId) RemoteActorModel::fetch($actorId);
@@ -329,11 +345,11 @@ class InboxProcessor
                         'status_id'   => null,
                         'type'        => $type,
                         'url'         => $url,
-                        'preview_url' => $url,
-                        'description' => self::apStr($att['name'] ?? ''),
+                        'preview_url' => self::attachmentPreviewUrl($att, $obj['preview'] ?? null) ?: $url,
+                        'description' => self::attachmentDescription($att, $obj['preview'] ?? null),
                         'blurhash'    => self::apStr($att['blurhash'] ?? ''),
-                        'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
-                        'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                        'width'       => self::attachmentDimension($att, $obj['preview'] ?? null, 'width'),
+                        'height'      => self::attachmentDimension($att, $obj['preview'] ?? null, 'height'),
                         'created_at'  => $now,
                     ]);
                     DB::insertIgnore('status_media', [
@@ -497,11 +513,11 @@ class InboxProcessor
                 'status_id'   => null,
                 'type'        => $type,
                 'url'         => $url,
-                'preview_url' => $url,
-                'description' => self::apStr($att['name'] ?? ''),
+                'preview_url' => self::attachmentPreviewUrl($att, $obj['preview'] ?? null) ?: $url,
+                'description' => self::attachmentDescription($att, $obj['preview'] ?? null),
                 'blurhash'    => self::apStr($att['blurhash'] ?? ''),
-                'width'       => is_int($att['width']  ?? null) ? $att['width']  : null,
-                'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                'width'       => self::attachmentDimension($att, $obj['preview'] ?? null, 'width'),
+                'height'      => self::attachmentDimension($att, $obj['preview'] ?? null, 'height'),
                 'created_at'  => $now,
             ]);
             DB::insertIgnore('status_media', [
@@ -712,11 +728,11 @@ class InboxProcessor
                     'status_id'   => null,
                     'type'        => $type,
                     'url'         => $url,
-                    'preview_url' => $url,
-                    'description' => self::apStr($att['name'] ?? ''),
+                    'preview_url' => self::attachmentPreviewUrl($att, $data['preview'] ?? null) ?: $url,
+                    'description' => self::attachmentDescription($att, $data['preview'] ?? null),
                     'blurhash'    => self::apStr($att['blurhash'] ?? ''),
-                    'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
-                    'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                    'width'       => self::attachmentDimension($att, $data['preview'] ?? null, 'width'),
+                    'height'      => self::attachmentDimension($att, $data['preview'] ?? null, 'height'),
                     'created_at'  => $now,
                 ]);
                 DB::insertIgnore('status_media', ['status_id' => $existing['id'], 'media_id' => $mid, 'position' => $pos]);
@@ -822,11 +838,11 @@ class InboxProcessor
                 'status_id'   => null,
                 'type'        => $type,
                 'url'         => $url,
-                'preview_url' => $url,
-                'description' => self::apStr($att['name'] ?? ''),
+                'preview_url' => self::attachmentPreviewUrl($att, $data['preview'] ?? null) ?: $url,
+                'description' => self::attachmentDescription($att, $data['preview'] ?? null),
                 'blurhash'    => self::apStr($att['blurhash'] ?? ''),
-                'width'       => is_int($att['width']  ?? null) ? $att['width']  : null,
-                'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                'width'       => self::attachmentDimension($att, $data['preview'] ?? null, 'width'),
+                'height'      => self::attachmentDimension($att, $data['preview'] ?? null, 'height'),
                 'created_at'  => $now,
             ]);
             DB::insertIgnore('status_media', ['status_id' => $sid, 'media_id' => $mid, 'position' => $pos]);
@@ -1054,11 +1070,11 @@ class InboxProcessor
                         'status_id'   => null,
                         'type'        => $type,
                         'url'         => $url,
-                        'preview_url' => $url,
-                        'description' => self::apStr($att['name'] ?? ''),
+                        'preview_url' => self::attachmentPreviewUrl($att, $obj['preview'] ?? null) ?: $url,
+                        'description' => self::attachmentDescription($att, $obj['preview'] ?? null),
                         'blurhash'    => self::apStr($att['blurhash'] ?? ''),
-                        'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
-                        'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                        'width'       => self::attachmentDimension($att, $obj['preview'] ?? null, 'width'),
+                        'height'      => self::attachmentDimension($att, $obj['preview'] ?? null, 'height'),
                         'created_at'  => $now,
                     ]);
                     DB::insertIgnore('status_media', ['status_id' => $existing['id'], 'media_id' => $mid, 'position' => $pos]);
@@ -1378,7 +1394,7 @@ class InboxProcessor
     private static function onAnnounce(array $a, string $actorId): bool
     {
         // Skip boosts from local actors — already handled by StatusesCtrl::reblog()
-        if ($actorId && is_local(parse_url($actorId, PHP_URL_HOST) ?? '')) {
+        if ($actorId && self::isCurrentInstanceActorUrl($actorId)) {
             return true;
         }
 
@@ -1509,11 +1525,12 @@ class InboxProcessor
                         $mid  = uuid();
                         DB::insertIgnore('media_attachments', [
                             'id' => $mid, 'user_id' => $origActorId, 'status_id' => null,
-                            'type' => $type, 'url' => $url, 'preview_url' => $url,
-                            'description' => self::apStr($att['name'] ?? ''),
+                            'type' => $type, 'url' => $url,
+                            'preview_url' => self::attachmentPreviewUrl($att, $data['preview'] ?? null) ?: $url,
+                            'description' => self::attachmentDescription($att, $data['preview'] ?? null),
                             'blurhash' => self::apStr($att['blurhash'] ?? ''),
-                            'width' => is_int($att['width'] ?? null) ? $att['width'] : null,
-                            'height' => is_int($att['height'] ?? null) ? $att['height'] : null,
+                            'width' => self::attachmentDimension($att, $data['preview'] ?? null, 'width'),
+                            'height' => self::attachmentDimension($att, $data['preview'] ?? null, 'height'),
                             'created_at' => $now2,
                         ]);
                         DB::insertIgnore('status_media', ['status_id' => $origId, 'media_id' => $mid, 'position' => $pos]);
@@ -1779,6 +1796,43 @@ class InboxProcessor
         return $fallback;
     }
 
+    private static function attachmentPreviewUrl(array $att, mixed $preview = null): string
+    {
+        $candidate = is_array($preview) ? self::attachmentUrl($preview) : '';
+        if ($candidate !== '') return $candidate;
+
+        foreach (['preview', 'icon', 'image'] as $key) {
+            if (!is_array($att[$key] ?? null)) continue;
+            $candidate = self::attachmentUrl($att[$key]);
+            if ($candidate !== '') return $candidate;
+        }
+
+        return '';
+    }
+
+    private static function attachmentDimension(array $att, mixed $preview, string $key): ?int
+    {
+        $value = $att[$key] ?? null;
+        if (is_int($value)) return $value;
+        if (is_numeric($value)) return (int)$value;
+        if (is_array($preview)) {
+            $value = $preview[$key] ?? null;
+            if (is_int($value)) return $value;
+            if (is_numeric($value)) return (int)$value;
+        }
+        return null;
+    }
+
+    private static function attachmentDescription(array $att, mixed $preview = null): string
+    {
+        $description = self::apStr($att['name'] ?? '');
+        if ($description !== '') return $description;
+        if (is_array($preview)) {
+            return self::apStr($preview['name'] ?? '');
+        }
+        return '';
+    }
+
     private static function apVisibility(mixed $to, mixed $cc): string
     {
         // JSON-LD allows to/cc as a single string or an array; normalise both cases
@@ -1805,15 +1859,21 @@ class InboxProcessor
         return 'direct';
     }
 
-    private static function log(string $actor, string $type, array $activity, string $error = ''): void
+    private static function log(string $actor, string $type, array $activity, string $error = '', array $headers = []): void
     {
         try {
+            $sigHeaders = [];
+            foreach (['signature', 'signature-input', 'digest', 'content-digest', 'date', 'host', 'user-agent', 'content-type'] as $name) {
+                $value = trim((string)($headers[$name] ?? ''));
+                if ($value !== '') $sigHeaders[$name] = $value;
+            }
             DB::insert('inbox_log', [
                 'id'         => uuid(),
                 'actor_url'  => $actor,
                 'type'       => $type,
                 'raw_json'   => json_encode($activity),
                 'error'      => $error,
+                'sig_headers'=> json_encode($sigHeaders, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
                 'created_at' => now_iso(),
             ]);
         } catch (\Throwable) { /* non-fatal */ }

@@ -60,8 +60,11 @@ class SearchCtrl
                         );
                         if (!$hidden) $accounts[] = UserModel::toMasto($u);
                     }
-                } elseif ($resolve) {
-                    $ra = RemoteActorModel::fetchByAcct($username, $domain);
+                } else {
+                    $ra = DB::one('SELECT * FROM remote_actors WHERE LOWER(username)=? AND domain=?', [strtolower($username), $domain]);
+                    if (!$ra && $resolve) {
+                        $ra = RemoteActorModel::fetchByAcct($username, $domain);
+                    }
                     if ($ra) {
                         $hidden = $vid && (
                             DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$vid, $ra['id']])
@@ -283,7 +286,7 @@ class BookmarksCtrl
     public function index(array $p): void
     {
         $user    = require_auth('read');
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $scanLimit = max(100, min(5000, $limit * 10));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
@@ -349,7 +352,7 @@ class FavouritesCtrl
     public function index(array $p): void
     {
         $user    = require_auth('read');
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $scanLimit = max(100, min(5000, $limit * 10));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
@@ -471,7 +474,7 @@ class ConversationsCtrl
     public function index(array $p): void
     {
         $user  = require_auth('read');
-        $limit = min((int)($_GET['limit'] ?? 20), 40);
+        $limit = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId = $_GET['max_id'] ?? null;
         $blockedDomains = StatusModel::blockedDomains($user['id']);
 
@@ -758,7 +761,7 @@ class FollowRequestsCtrl
     public function index(array $p): void
     {
         $user = require_auth('read');
-        $limit = min((int)($_GET['limit'] ?? 40), 80);
+        $limit = max(1, min((int)($_GET['limit'] ?? 40), 80));
         $rows = DB::all(
             'SELECT follower_id FROM follows WHERE following_id=? AND pending=1 ORDER BY created_at DESC LIMIT ?',
             [$user['id'], $limit]

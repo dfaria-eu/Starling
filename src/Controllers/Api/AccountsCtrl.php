@@ -113,11 +113,11 @@ use App\ActivityPub\{Builder, Delivery};
                     'status_id'   => null,
                     'type'        => $type,
                     'url'         => $url,
-                    'preview_url' => $url,
-                    'description' => self::apStr($att['name'] ?? ''),
+                    'preview_url' => self::attachmentPreviewUrl($att, $obj['preview'] ?? null) ?: $url,
+                    'description' => self::attachmentDescription($att, $obj['preview'] ?? null),
                     'blurhash'    => self::apStr($att['blurhash'] ?? ''),
-                    'width'       => is_int($att['width'] ?? null) ? $att['width'] : null,
-                    'height'      => is_int($att['height'] ?? null) ? $att['height'] : null,
+                    'width'       => self::attachmentDimension($att, $obj['preview'] ?? null, 'width'),
+                    'height'      => self::attachmentDimension($att, $obj['preview'] ?? null, 'height'),
                     'created_at'  => $now,
                 ]);
                 DB::insertIgnore('status_media', [
@@ -141,6 +141,17 @@ use App\ActivityPub\{Builder, Delivery};
             if (($obj['type'] ?? '') === 'Question') {
                 \App\Models\PollModel::syncRemoteQuestion($statusId, $obj);
             }
+        }
+
+        $cachedCount = (int)(DB::one(
+            'SELECT COUNT(*) n FROM statuses WHERE user_id=?',
+            [$remote['id']]
+        )['n'] ?? 0);
+        if ($cachedCount > (int)($remote['status_count'] ?? 0)) {
+            DB::run(
+                'UPDATE remote_actors SET status_count=?, fetched_at=? WHERE id=?',
+                [$cachedCount, $now, $remote['id']]
+            );
         }
     }
 
@@ -211,6 +222,43 @@ use App\ActivityPub\{Builder, Delivery};
                     if ($href !== '') return $href;
                 }
             }
+        }
+        return '';
+    }
+
+    private static function attachmentPreviewUrl(array $att, mixed $preview = null): string
+    {
+        $candidate = self::attachmentUrl(is_array($preview) ? $preview : []);
+        if ($candidate !== '') return $candidate;
+
+        $previewObj = $att['preview'] ?? $att['icon'] ?? null;
+        if (is_array($previewObj)) {
+            $candidate = self::attachmentUrl($previewObj);
+            if ($candidate !== '') return $candidate;
+        }
+
+        return '';
+    }
+
+    private static function attachmentDimension(array $att, mixed $preview, string $key): ?int
+    {
+        $value = $att[$key] ?? null;
+        if (is_int($value)) return $value;
+        if (is_numeric($value)) return (int)$value;
+        if (is_array($preview)) {
+            $value = $preview[$key] ?? null;
+            if (is_int($value)) return $value;
+            if (is_numeric($value)) return (int)$value;
+        }
+        return null;
+    }
+
+    private static function attachmentDescription(array $att, mixed $preview = null): string
+    {
+        $description = self::apStr($att['name'] ?? '');
+        if ($description !== '') return $description;
+        if (is_array($preview)) {
+            return self::apStr($preview['name'] ?? '');
         }
         return '';
     }
@@ -367,7 +415,7 @@ use App\ActivityPub\{Builder, Delivery};
                 err_out('Not found', 404);
             }
             // Remote: try cached first, then fetch via WebFinger
-            $ra = DB::one('SELECT * FROM remote_actors WHERE username=? AND domain=?', [strtolower($username), $domain]);
+            $ra = DB::one('SELECT * FROM remote_actors WHERE LOWER(username)=? AND domain=?', [strtolower($username), $domain]);
             if (!$ra) {
                 $ra = \App\Models\RemoteActorModel::fetchByAcct($username, $domain);
             } elseif ((int)$ra['follower_count'] === 0 && (int)$ra['following_count'] === 0
@@ -424,7 +472,7 @@ use App\ActivityPub\{Builder, Delivery};
         [$local, $remote] = $this->resolve($p['id']);
         if (!$local && !$remote) err_out('Not found', 404);
 
-        $limit   = min((int)($_GET['limit'] ?? 20), 40);
+        $limit   = max(1, min((int)($_GET['limit'] ?? 20), 40));
         $maxId   = $_GET['max_id']   ?? null;
         $sinceId = $_GET['since_id'] ?? null;
         $minId   = $_GET['min_id']   ?? null;
@@ -506,14 +554,26 @@ use App\ActivityPub\{Builder, Delivery};
         // Paginação por (created_at, id) — cursor composto evita duplicados
         if ($maxId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$maxId]);
+            if (!$ref && ctype_digit($maxId)) {
+                $ms  = ((int)$maxId >> 16) + 1262304000000;
+                $ref = ['created_at' => gmdate('Y-m-d\TH:i:s.000\Z', (int)($ms / 1000)), 'id' => $maxId];
+            }
             if ($ref) { $sql .= ' AND (s.created_at < ? OR (s.created_at = ? AND s.id < ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
         }
         if ($sinceId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$sinceId]);
+            if (!$ref && ctype_digit($sinceId)) {
+                $ms  = ((int)$sinceId >> 16) + 1262304000000;
+                $ref = ['created_at' => gmdate('Y-m-d\TH:i:s.000\Z', (int)($ms / 1000)), 'id' => $sinceId];
+            }
             if ($ref) { $sql .= ' AND (s.created_at > ? OR (s.created_at = ? AND s.id > ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
         }
         if ($minId) {
             $ref = DB::one('SELECT created_at, id FROM statuses WHERE id=?', [$minId]);
+            if (!$ref && ctype_digit($minId)) {
+                $ms  = ((int)$minId >> 16) + 1262304000000;
+                $ref = ['created_at' => gmdate('Y-m-d\TH:i:s.000\Z', (int)($ms / 1000)), 'id' => $minId];
+            }
             if ($ref) { $sql .= ' AND (s.created_at > ? OR (s.created_at = ? AND s.id > ?))'; $par[] = $ref['created_at']; $par[] = $ref['created_at']; $par[] = $ref['id']; }
         }
         if ($exRep) $sql .= ' AND s.reply_to_id IS NULL';
@@ -536,7 +596,7 @@ use App\ActivityPub\{Builder, Delivery};
             array_map(fn($s) => StatusModel::toMasto($s, $viewer['id'] ?? null), $rows)
         ));
         if ($minId && $out) $out = array_reverse($out);
-        if ($out) {
+        if ($rows) {
             $base       = ap_url('api/v1/accounts/' . $p['id'] . '/statuses');
             $common     = array_filter([
                 'limit'            => $limit,
@@ -546,8 +606,10 @@ use App\ActivityPub\{Builder, Delivery};
                 'pinned'           => $pinned ? 'true' : null,
                 'tagged'           => $tagged ?: null,
             ]);
-            $nextParams = http_build_query(array_merge($common, ['max_id' => end($out)['id']]));
-            $prevParams = http_build_query(array_merge($common, ['min_id' => reset($out)['id']]));
+            $nextId = $minId ? reset($rows)['id'] : end($rows)['id'];
+            $prevId = $minId ? end($rows)['id'] : reset($rows)['id'];
+            $nextParams = http_build_query(array_merge($common, ['max_id' => $nextId]));
+            $prevParams = http_build_query(array_merge($common, ['min_id' => $prevId]));
             header(sprintf('Link: <%s?%s>; rel="next", <%s?%s>; rel="prev"', $base, $nextParams, $base, $prevParams));
         }
         json_out($out);
@@ -562,12 +624,12 @@ use App\ActivityPub\{Builder, Delivery};
 
         // Remote account: fetch followers collection from their server
         if (!$local && $remote) {
-            $limit = min((int)($_GET['limit'] ?? 40), 80);
+            $limit = max(1, min((int)($_GET['limit'] ?? 40), 80));
             json_out($this->remoteCollection($remote['followers_url'] ?? '', $limit, $viewerId));
             return;
         }
 
-        $limit = min((int)($_GET['limit'] ?? 40), 80);
+        $limit = max(1, min((int)($_GET['limit'] ?? 40), 80));
         $maxId = $_GET['max_id'] ?? null;
 
         $sql = 'SELECT follower_id, id FROM follows WHERE following_id=? AND pending=0';
@@ -609,12 +671,12 @@ use App\ActivityPub\{Builder, Delivery};
 
         // Remote account: fetch following collection from their server
         if (!$local && $remote) {
-            $limit = min((int)($_GET['limit'] ?? 40), 80);
+            $limit = max(1, min((int)($_GET['limit'] ?? 40), 80));
             json_out($this->remoteCollection($remote['following_url'] ?? '', $limit, $viewerId));
             return;
         }
 
-        $limit = min((int)($_GET['limit'] ?? 40), 80);
+        $limit = max(1, min((int)($_GET['limit'] ?? 40), 80));
         $maxId = $_GET['max_id'] ?? null;
 
         $sql = 'SELECT following_id, id FROM follows WHERE follower_id=? AND pending=0';
@@ -942,6 +1004,8 @@ use App\ActivityPub\{Builder, Delivery};
         $viewerId = $viewer['id'] ?? null;
         $q = trim($_GET['q'] ?? '');
         if (!$q) { json_out([]); return; }
+        $followingOnly = filter_var($_GET['following'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if ($followingOnly && !$viewerId) { json_out([]); return; }
         $limit = max(1, min((int)($_GET['limit'] ?? 5), 40));
         $blockedDomains = StatusModel::blockedDomains($viewerId);
 
@@ -951,6 +1015,10 @@ use App\ActivityPub\{Builder, Delivery};
         // Local users
         $localSql = "SELECT * FROM users WHERE (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\') AND is_suspended=0";
         $localParams = [$qLike, $qLike];
+        if ($followingOnly) {
+            $localSql .= " AND id IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)";
+            $localParams[] = $viewerId;
+        }
         if ($viewerId) {
             $localSql .= " AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)";
             $localSql .= " AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)";
@@ -970,21 +1038,29 @@ use App\ActivityPub\{Builder, Delivery};
                 if (is_local($dom)) {
                     $u = UserModel::byUsername($un);
                     if ($u) {
+                        $isFollowed = !$followingOnly || (bool)DB::one(
+                            'SELECT 1 FROM follows WHERE follower_id=? AND following_id=? AND pending=0',
+                            [$viewerId, $u['id']]
+                        );
                         $hidden = $viewerId && (
                             DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $u['id']])
                             || DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $u['id']])
                         );
-                        if (!$hidden) $out[] = UserModel::toMasto($u);
+                        if (!$hidden && $isFollowed) $out[] = UserModel::toMasto($u);
                     }
                 } elseif (!$viewerId || !in_array($dom, $blockedDomains, true)) {
                     $ra = RemoteActorModel::fetchByAcct($un, $dom);
                     if ($ra) {
+                        $isFollowed = !$followingOnly || (bool)DB::one(
+                            'SELECT 1 FROM follows WHERE follower_id=? AND following_id=? AND pending=0',
+                            [$viewerId, $ra['id']]
+                        );
                         $hidden = $viewerId && (
                             DB::one('SELECT 1 FROM blocks WHERE user_id=? AND target_id=?', [$viewerId, $ra['id']])
                             || DB::one('SELECT 1 FROM mutes WHERE user_id=? AND target_id=?', [$viewerId, $ra['id']])
                             || in_array(strtolower((string)($ra['domain'] ?? '')), $blockedDomains, true)
                         );
-                        if (!$hidden) $out[] = UserModel::remoteToMasto($ra);
+                        if (!$hidden && $isFollowed) $out[] = UserModel::remoteToMasto($ra);
                     }
                 }
             }
@@ -993,6 +1069,10 @@ use App\ActivityPub\{Builder, Delivery};
                  WHERE domain != ?
                    AND (username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\')";
             $remoteParams = [AP_DOMAIN, $qLike, $qLike];
+            if ($followingOnly) {
+                $remoteSql .= ' AND id IN (SELECT following_id FROM follows WHERE follower_id=? AND pending=0)';
+                $remoteParams[] = $viewerId;
+            }
             if ($viewerId) {
                 $remoteSql .= ' AND id NOT IN (SELECT target_id FROM blocks WHERE user_id=?)';
                 $remoteSql .= ' AND id NOT IN (SELECT target_id FROM mutes WHERE user_id=?)';

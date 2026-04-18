@@ -12,7 +12,10 @@ class SharedInboxCtrl {
         $actorHost = parse_url($actorUrl, PHP_URL_HOST) ?: 'unknown';
         rate_limit_enforce('shared_inbox_ip:' . client_ip(), 120, 300, 'Rate limit exceeded for inbox');
         rate_limit_enforce('shared_inbox_actor:' . $actorHost, 120, 300, 'Rate limit exceeded for inbox');
-        InboxProcessor::process($activity, get_request_headers(), 'POST', '/inbox', $raw);
+        $path = (string)parse_url($_SERVER['REQUEST_URI'] ?? '/inbox', PHP_URL_PATH);
+        $query = (string)parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_QUERY);
+        if ($query !== '') $path .= '?' . $query;
+        InboxProcessor::process($activity, get_request_headers(), 'POST', $path ?: '/inbox', $raw);
         // Process the retry queue after the 202 is sent — the remote server
         // gets an immediate response and we deliver in the background.
         defer_after_response(static function (): void {

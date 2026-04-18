@@ -1338,8 +1338,6 @@ class AdminModel
 
         if ($hour >= 3 && throttle_allow('auto_maintenance_daily:' . $day, 86400)) {
             try {
-                $db = DB::pdo();
-                $db->beginTransaction();
                 $results = [
                     'inbox'  => self::pruneInboxLog(self::AGGRESSIVE_DEFAULTS['inbox_days']),
                     'posts'  => self::pruneRemotePosts(self::AGGRESSIVE_DEFAULTS['remote_posts_days']),
@@ -1352,15 +1350,11 @@ class AdminModel
                     'delivery_log' => self::pruneDeliveryAttemptLog(),
                     'consistency' => self::cleanupDataConsistency(),
                 ];
-                $db->commit();
                 if (self::shouldVacuumAfterCleanup($results)
                     && throttle_allow('auto_maintenance_vacuum', self::VACUUM_AUTO_COOLDOWN_SECS)) {
                     self::vacuumWithLock();
                 }
             } catch (\Throwable $e) {
-                if (isset($db) && $db->inTransaction()) {
-                    $db->rollBack();
-                }
                 error_log('Auto maintenance daily failed: ' . $e->getMessage());
             }
         }

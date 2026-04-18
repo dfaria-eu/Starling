@@ -163,6 +163,7 @@ class WebCtrl
         $heroRegisterCta = AP_OPEN_REG ? '<a href="/web/register" class="btn">Create account</a>' : '';
         $heroLoginCta = '<a href="/web/login" class="btn ' . (AP_OPEN_REG ? 'btn-outline' : '') . '">Log in</a>';
 
+        $favicon = htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         header('Content-Type: text/html; charset=utf-8');
         echo <<<HTML
 <!DOCTYPE html><html lang="en">
@@ -170,7 +171,7 @@ class WebCtrl
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>$name</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="$favicon">
 <meta name="description" content="$desc">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -341,7 +342,7 @@ SECTION;
                 $snippetHtml = (int)($displayPost['local'] ?? 1) === 1
                     ? text_to_html((string)($displayPost['content'] ?? ''))
                     : ensure_html((string)($displayPost['content'] ?? ''));
-                $snippetSource = trim((string)(($displayPost['cw'] ?? '') ?: strip_tags($snippetHtml)));
+                $snippetSource = trim((string)(($displayPost['cw'] ?? '') ?: \html_to_plain($snippetHtml)));
                 $snippet = htmlspecialchars(mb_substr($snippetSource, 0, 180), ENT_QUOTES | ENT_HTML5, 'UTF-8');
                 $recentRows .= <<<ROW
 <a href="$postUrl" class="post-row">
@@ -655,6 +656,7 @@ HTML;
 
         $v = AP_VERSION;
 
+        $favicon = htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         header('Content-Type: text/html; charset=utf-8');
         echo <<<HTML
 <!DOCTYPE html><html lang="en">
@@ -662,7 +664,7 @@ HTML;
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>$uname — Post</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>">
+<link rel="icon" href="$favicon">
 <meta name="description" content="$ogDesc">
 <link rel="canonical" href="$canonicalUrl">
 <meta property="og:type" content="article">
@@ -973,7 +975,7 @@ HTML;
         $sourceLink = $sourceUrl !== '' ? '<a href="' . $sourceUrl . '" target="_blank" rel="noopener">Source code</a>' : '';
         header('Content-Type: text/html; charset=utf-8');
         echo "<!DOCTYPE html><html lang=\"en\"><head><meta charset=utf-8><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>About – $name</title>"
-           . "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>\">"
+           . "<link rel=\"icon\" href=\"" . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . "\">"
            . "<style>:root{--blue:#0085FF;--blue-bg:#E0EDFF;--text:#0F1419;--text2:#66788A;--text3:#8D99A5;--bg:#fff;--surface:#F3F3F8;--border:#E5E7EB}@media(prefers-color-scheme:dark){:root{--text:#F1F3F5;--text2:#7B8794;--text3:#545864;--bg:#0A0E14;--surface:#161823;--border:#2E3039;--blue-bg:#0C1B3A}}*{box-sizing:border-box}body{font-family:'Inter',system-ui,-apple-system,BlinkMacSystemFont,sans-serif;max-width:860px;margin:0 auto;padding:2.25rem 1rem 3rem;background:var(--bg);color:var(--text);line-height:1.6}a{color:var(--blue)}.back{display:inline-flex;align-items:center;gap:.4rem;margin-bottom:1.25rem;color:var(--text2);text-decoration:none}.hero{margin-bottom:1.6rem}.eyebrow{display:inline-flex;align-items:center;gap:.45rem;background:var(--blue-bg);color:var(--blue);font-weight:800;font-size:.8rem;padding:.38rem .8rem;border-radius:999px;margin-bottom:.9rem}.hero h1{font-size:2rem;line-height:1.1;margin:0 0 .7rem}.hero p{margin:0;color:var(--text2);max-width:720px}.cta-row{display:flex;gap:.7rem;flex-wrap:wrap;margin-top:1.1rem}.cta{display:inline-flex;align-items:center;justify-content:center;padding:.65rem 1rem;border-radius:999px;border:1px solid var(--border);text-decoration:none;font-weight:700;color:var(--text)}.cta.primary{background:var(--blue);border-color:var(--blue);color:#fff}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;margin:1.5rem 0}.card,.section{background:var(--surface);border:1px solid var(--border);border-radius:18px}.card{padding:1rem 1.1rem}.card h2{font-size:1rem;margin:0 0 .45rem}.card p{margin:0;color:var(--text2);font-size:.95rem}.card .facts{margin-top:.2rem}.card .facts dt,.card .facts dd,.card ul{font-size:.92rem}.section{padding:1.15rem 1.2rem;margin-top:1rem}.section h2{font-size:1rem;margin:0 0 .65rem}.facts{display:grid;grid-template-columns:max-content 1fr;gap:.45rem .9rem;font-size:.95rem}.facts dt{color:var(--text3)}.facts dd{margin:0;word-break:break-word}.chips{display:flex;gap:.55rem;flex-wrap:wrap}.chip{display:inline-flex;align-items:center;padding:.45rem .75rem;border-radius:999px;background:var(--bg);border:1px solid var(--border);font-size:.9rem;color:var(--text2)}ul{margin:.4rem 0 0 1.1rem;color:var(--text2)}li+li{margin-top:.32rem}</style></head>"
            . "<body>"
            . "<a class=\"back\" href=\"/\">&larr; Back</a>"
@@ -1013,7 +1015,7 @@ HTML;
             : '<p style="color:var(--text2)">This page has not been configured yet.</p>';
         header('Content-Type: text/html; charset=utf-8');
         echo "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{$pageTitle} - " . htmlspecialchars(AP_NAME, ENT_QUOTES | ENT_HTML5, 'UTF-8') . "</title>"
-            . "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22>⋰⋱</text></svg>\"><style>:root{--blue:#0085FF;--text:#0F1419;--text2:#66788A;--bg:#fff;--surface:#F3F3F8;--border:#E5E7EB}@media(prefers-color-scheme:dark){:root{--text:#F1F3F5;--text2:#7B8794;--bg:#0A0E14;--surface:#161823;--border:#2E3039}}body{font-family:'Inter',system-ui,-apple-system,BlinkMacSystemFont,sans-serif;max-width:760px;margin:3rem auto;padding:1rem;background:var(--bg);color:var(--text)}article{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1.4rem 1.5rem;line-height:1.7}h1{margin-bottom:1rem}p{margin-bottom:1rem}a{color:var(--blue)}</style></head>"
+            . "<link rel=\"icon\" href=\"" . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . "\"><style>:root{--blue:#0085FF;--text:#0F1419;--text2:#66788A;--bg:#fff;--surface:#F3F3F8;--border:#E5E7EB}@media(prefers-color-scheme:dark){:root{--text:#F1F3F5;--text2:#7B8794;--bg:#0A0E14;--surface:#161823;--border:#2E3039}}body{font-family:'Inter',system-ui,-apple-system,BlinkMacSystemFont,sans-serif;max-width:760px;margin:3rem auto;padding:1rem;background:var(--bg);color:var(--text)}article{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1.4rem 1.5rem;line-height:1.7}h1{margin-bottom:1rem}p{margin-bottom:1rem}a{color:var(--blue)}</style></head>"
             . "<body><h1>{$pageTitle}</h1><article>{$bodyHtml}</article><p><a href=\"/\">&larr; Back</a></p></body></html>";
         exit;
     }

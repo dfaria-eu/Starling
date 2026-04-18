@@ -6,6 +6,8 @@ namespace App\Models;
 class DB
 {
     private static ?\PDO $pdo = null;
+    private const BUSY_RETRY_MAX_ATTEMPTS = 5;
+    private const BUSY_RETRY_BASE_DELAY_US = 100000;
 
     public static function pdo(): \PDO
     {
@@ -16,6 +18,7 @@ class DB
             self::$pdo = new \PDO('sqlite:' . AP_DB_PATH);
             self::$pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
             self::$pdo->setAttribute(\PDO::ATTR_DEFAULT_FETCH_MODE, \PDO::FETCH_ASSOC);
+            self::$pdo->setAttribute(\PDO::ATTR_TIMEOUT, 5);
             self::$pdo->exec('PRAGMA journal_mode=WAL');
             self::$pdo->exec('PRAGMA foreign_keys=ON');
             self::$pdo->exec('PRAGMA synchronous=NORMAL');
@@ -28,9 +31,19 @@ class DB
 
     public static function run(string $sql, array $p = []): \PDOStatement
     {
-        $st = self::pdo()->prepare($sql);
-        $st->execute($p);
-        return $st;
+        $attempt = 0;
+        while (true) {
+            try {
+                $st = self::pdo()->prepare($sql);
+                $st->execute($p);
+                return $st;
+            } catch (\PDOException $e) {
+                if (!self::shouldRetryBusy($e, ++$attempt)) {
+                    throw $e;
+                }
+                usleep(self::busyRetryDelayUs($attempt));
+            }
+        }
     }
 
     public static function one(string $sql, array $p = []): ?array
@@ -73,5 +86,23 @@ class DB
     public static function count(string $table, string $where = '1', array $p = []): int
     {
         return (int)(self::one("SELECT COUNT(*) n FROM $table WHERE $where", $p)['n'] ?? 0);
+    }
+
+    private static function shouldRetryBusy(\PDOException $e, int $attempt): bool
+    {
+        if ($attempt >= self::BUSY_RETRY_MAX_ATTEMPTS) {
+            return false;
+        }
+
+        $message = strtolower($e->getMessage());
+        return str_contains($message, 'database is locked')
+            || str_contains($message, 'database table is locked')
+            || str_contains($message, 'database schema is locked')
+            || str_contains($message, 'sqlstate[hy000]: general error: 5');
+    }
+
+    private static function busyRetryDelayUs(int $attempt): int
+    {
+        return self::BUSY_RETRY_BASE_DELAY_US * $attempt;
     }
 }
