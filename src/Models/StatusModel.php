@@ -538,6 +538,27 @@ class StatusModel
         // Build mentions list from content
         $mentions = self::buildMentions($rawContent);
 
+        $createdAt = best_iso_timestamp($s['created_at'] ?? null, $s['updated_at'] ?? null, $s['id'] ?? null);
+        $oldCreatedRaw = $s['created_at'] ?? null;
+        $storedCreatedAt = iso_z($s['created_at'] ?? null);
+        if ($storedCreatedAt !== null && $storedCreatedAt !== $createdAt) {
+            $storedTs  = strtotime($storedCreatedAt);
+            $createdTs = strtotime($createdAt);
+            if ($storedTs !== false && $createdTs !== false && $storedTs > time() + 300 && $createdTs <= time() + 300) {
+                DB::run(
+                    'UPDATE statuses
+                        SET created_at=?,
+                            updated_at=CASE WHEN updated_at=? THEN ? ELSE updated_at END
+                      WHERE id=? AND created_at=?',
+                    [$createdAt, $s['created_at'], $createdAt, $s['id'], $s['created_at']]
+                );
+                $s['created_at'] = $createdAt;
+                if (($s['updated_at'] ?? null) === $oldCreatedRaw) {
+                    $s['updated_at'] = $createdAt;
+                }
+            }
+        }
+
         // edited_at: only set if updated_at differs from created_at
         $editedAt = ($s['updated_at'] && $s['updated_at'] !== $s['created_at']) ? $s['updated_at'] : null;
 
@@ -591,7 +612,7 @@ class StatusModel
 
         return [
             'id'                     => $s['id'],
-            'created_at'             => best_iso_timestamp($s['created_at'] ?? null, $s['updated_at'] ?? null, $s['id'] ?? null),
+            'created_at'             => $createdAt,
             'in_reply_to_id'         => self::resolveStatusId($s['reply_to_id']),
             'in_reply_to_account_id' => self::resolveAccountId($s['reply_to_uid']),
             'sensitive'              => (bool)$s['sensitive'],

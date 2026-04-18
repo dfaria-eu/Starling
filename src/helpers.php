@@ -625,10 +625,22 @@ function flake_iso(?string $id): ?string
 
 function best_iso_timestamp(?string $primary, ?string $secondary = null, ?string $flakeId = null): string
 {
-    return iso_z($primary)
-        ?? iso_z($secondary)
-        ?? flake_iso($flakeId)
-        ?? now_iso();
+    $flake = flake_iso($flakeId);
+
+    foreach ([$primary, $secondary] as $candidate) {
+        $iso = iso_z($candidate);
+        if ($iso === null) continue;
+
+        $ts = strtotime($iso);
+        if ($ts !== false && $ts > time() + 300) {
+            if ($flake !== null) return $flake;
+            continue;
+        }
+
+        return $iso;
+    }
+
+    return $flake ?? now_iso();
 }
 
 function now_iso(): string

@@ -1750,6 +1750,9 @@ class InboxProcessor
         if ($raw === '') return $default;
         try {
             $dt = new \DateTimeImmutable($raw);
+            if ((int)$dt->format('U') > time() + 300) {
+                return $default;
+            }
             return $dt->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d\TH:i:s.v\Z');
         } catch (\Throwable) {
             return $default;
