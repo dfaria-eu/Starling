@@ -277,64 +277,109 @@ class UserModel
         return false;
     }
 
-    public static function verifyRelMe(string $value, string $actorUrl): ?string
+    public static function verifyRelMe(string $value, string $actorUrl, ?array $acceptUrls = null): ?string
     {
-        if (!filter_var($value, FILTER_VALIDATE_URL)) return null;
-        if (!str_starts_with($value, 'https://') && !str_starts_with($value, 'http://')) return null;
+        $currentUrl = normalize_http_url($value);
+        if (!filter_var($currentUrl, FILTER_VALIDATE_URL)) return null;
+        if (!str_starts_with($currentUrl, 'https://')) return null;
 
-        // SSRF protection
-        $host = parse_url($value, PHP_URL_HOST) ?? '';
-        if (!$host) return null;
-        $ip = gethostbyname($host);
-        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) return null;
-        // Explicit block for addresses gethostbyname can't resolve (IPv6 literals passed through)
-        // and ranges FILTER_FLAG_NO_PRIV_RANGE may not cover (link-local fe80::/10, ULA fc00::/7).
-        if (in_array($ip, ['127.0.0.1', '0.0.0.0', '::1']) || str_starts_with($ip, '169.254.')) return null;
-        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-            // Reject loopback (::1), link-local (fe80::/10), ULA (fc00::/7)
-            $iphex = bin2hex(inet_pton($ip) ?: '');
-            if (!$iphex) return null;
-            $prefix10 = substr($iphex, 0, 3); // first 10 bits = first 10 bits of first 2 hex chars
-            $first16  = hexdec(substr($iphex, 0, 4)); // first 16-bit group
-            if ($ip === '::1') return null;                              // loopback
-            if (($first16 & 0xFFC0) === 0xFE80) return null;            // fe80::/10 link-local
-            if (($first16 & 0xFE00) === 0xFC00) return null;            // fc00::/7 unique local
+        $finalUrl = $currentUrl;
+        $html = '';
+        $lastCode = 0;
+        for ($redirects = 0; $redirects <= 3; $redirects++) {
+            if (!RemoteActorModel::isSafeUrl($currentUrl)) return null;
+
+            $ch = curl_init($currentUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_TIMEOUT        => 10,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_HEADER         => true,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_USERAGENT      => AP_SOFTWARE . '/' . AP_VERSION . ' (+https://' . AP_DOMAIN . ')',
+                CURLOPT_HTTPHEADER     => ['Accept: text/html'],
+            ]);
+            $response = curl_exec($ch);
+            $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $lastCode = $code;
+            $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            if (PHP_VERSION_ID < 80000) {
+                curl_close($ch);
+            }
+
+            if (!is_string($response) || $response === '') return null;
+            $headerBlock = substr($response, 0, $headerSize);
+            $html = substr($response, $headerSize);
+            $finalUrl = $currentUrl;
+
+            if ($code >= 300 && $code < 400) {
+                if (!preg_match('/^Location:\s*(.+)$/im', $headerBlock, $m)) return null;
+                $nextUrl = absolute_url($currentUrl, trim($m[1]));
+                if ($nextUrl === '' || !RemoteActorModel::isSafeUrl($nextUrl)) return null;
+                $currentUrl = $nextUrl;
+                continue;
+            }
+
+            if ($code >= 400) return null;
+            break;
         }
-
-        $ch = curl_init($value);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_TIMEOUT        => 10,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS      => 3,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_USERAGENT      => AP_SOFTWARE . '/' . AP_VERSION . ' (+https://' . AP_DOMAIN . ')',
-            CURLOPT_HTTPHEADER     => ['Accept: text/html'],
-        ]);
-        $html     = (string)curl_exec($ch);
-        $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-        if (PHP_VERSION_ID < 80000) {
-            curl_close($ch);
-        }
-
+        if ($lastCode >= 300 && $lastCode < 400) return null;
         if (!$html) return null;
 
-        // Check redirect destination for SSRF
-        if ($finalUrl && $finalUrl !== $value) {
-            $fHost = parse_url($finalUrl, PHP_URL_HOST) ?? '';
-            if ($fHost) {
-                $fIp = gethostbyname($fHost);
-                if (filter_var($fIp, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) return null;
-            }
+        if ($acceptUrls === null) {
+            // All accepted URLs for this local profile (both /users/df and /@df formats)
+            $username = parse_url($actorUrl, PHP_URL_PATH);
+            $atUrl    = AP_BASE_URL . '/@' . ltrim(basename($username), '@');
+            $acceptUrls = [$actorUrl, $atUrl];
         }
 
-        // All accepted URLs for this profile (both /users/df and /@df formats)
-        $username = parse_url($actorUrl, PHP_URL_PATH);
-        $atUrl    = AP_BASE_URL . '/@' . ltrim(basename($username), '@');
-        return self::htmlHasRelMeLink($html, [$actorUrl, $atUrl], (string)($finalUrl ?: $value))
+        return self::htmlHasRelMeLink($html, $acceptUrls, (string)($finalUrl ?: $value))
             ? now_iso()
             : null;
+    }
+
+    public static function verifiableUrlFromFieldValue(string $value): string
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '') return '';
+
+        if ($trimmed === strip_tags($trimmed)) {
+            return preg_match('~^https://~i', $trimmed) && filter_var($trimmed, FILTER_VALIDATE_URL)
+                ? self::normalizeProfileFieldValue($trimmed)
+                : '';
+        }
+
+        if (!class_exists(\DOMDocument::class)) return '';
+
+        $prev = libxml_use_internal_errors(true);
+        $doc = new \DOMDocument();
+        $domHtml = '<?xml encoding="UTF-8"><body>' . mb_encode_numericentity($trimmed, [0x80, 0x10FFFF, 0, 0x10FFFF], 'UTF-8') . '</body>';
+        if (!@$doc->loadHTML($domHtml, LIBXML_NOWARNING | LIBXML_NOERROR)) {
+            libxml_clear_errors();
+            libxml_use_internal_errors($prev);
+            return '';
+        }
+
+        $links = $doc->getElementsByTagName('a');
+        if ($links->length !== 1) {
+            libxml_clear_errors();
+            libxml_use_internal_errors($prev);
+            return '';
+        }
+
+        $link = $links->item(0);
+        $href = trim((string)$link->getAttribute('href'));
+        $text = trim((string)$link->textContent);
+        libxml_clear_errors();
+        libxml_use_internal_errors($prev);
+
+        if ($href === '' || $text === '') return '';
+        $href = self::normalizeProfileFieldValue($href);
+        $text = self::normalizeProfileFieldValue($text);
+
+        return $href === $text && str_starts_with(strtolower($href), 'https://') ? $href : '';
     }
 
     public static function fieldValueToHtml(string $value): string
@@ -349,10 +394,49 @@ class UserModel
             $displayValue = preg_replace('~^https?://~i', '', $trimmed) ?? $trimmed;
             $display = htmlspecialchars(ltrim($displayValue, '/'));
             $href    = htmlspecialchars($normalized);
-            return '<a href="' . $href . '" rel="me nofollow noopener noreferrer" target="_blank">' . $display . '</a>';
+            $rel = str_starts_with(strtolower($normalized), 'https://')
+                ? 'me nofollow noopener noreferrer'
+                : 'nofollow noopener noreferrer';
+            return '<a href="' . $href . '" rel="' . $rel . '" target="_blank">' . $display . '</a>';
         }
         // Plain text
         return htmlspecialchars($trimmed);
+    }
+
+    public static function fieldValueToActivityPubHtml(string $value): string
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '') return '';
+        if ($trimmed !== strip_tags($trimmed)) return ensure_html($trimmed);
+        if (preg_match('~^https?://~i', $trimmed) && filter_var($trimmed, FILTER_VALIDATE_URL)) {
+            $normalized = self::normalizeProfileFieldValue($trimmed);
+            $href = htmlspecialchars($normalized);
+            $rel = str_starts_with(strtolower($normalized), 'https://')
+                ? 'me nofollow noopener noreferrer'
+                : 'nofollow noopener noreferrer';
+            return '<a href="' . $href . '" rel="' . $rel . '" target="_blank">' . self::activityPubUrlLinkText($normalized) . '</a>';
+        }
+        return htmlspecialchars($trimmed);
+    }
+
+    private static function activityPubUrlLinkText(string $url): string
+    {
+        $parts = parse_url($url);
+        $scheme = strtolower((string)($parts['scheme'] ?? ''));
+        if (($scheme !== 'http' && $scheme !== 'https') || empty($parts['host'])) {
+            return htmlspecialchars($url);
+        }
+
+        $prefix = $scheme . '://';
+        $rest = substr($url, strlen($prefix));
+        $suffix = str_ends_with($rest, '/') ? '/' : '';
+        if ($suffix !== '') {
+            $rest = substr($rest, 0, -1);
+        }
+
+        return '<span class="invisible">' . htmlspecialchars($prefix) . '</span>'
+            . '<span class="">' . htmlspecialchars($rest) . '</span>'
+            . '<span class="invisible">' . htmlspecialchars($suffix) . '</span>';
     }
 
     public static function normalizeProfileFieldValue(string $value): string

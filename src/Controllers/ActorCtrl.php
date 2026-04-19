@@ -116,6 +116,13 @@ HTML;
         return $page > 0 ? $page : 0;
     }
 
+    private function isPubliclyRenderableStatus(?array $status): bool
+    {
+        return $status !== null
+            && in_array((string)($status['visibility'] ?? ''), ['public', 'unlisted'], true)
+            && ((string)($status['expires_at'] ?? '') === '' || (string)$status['expires_at'] > now_iso());
+    }
+
     private function formatPollExpiry(?string $iso): ?string
     {
         if (!$iso) return null;
@@ -213,7 +220,7 @@ HTML;
         $ownerHandle = '@' . $owner['username'] . '@' . AP_DOMAIN;
         if (!empty($status['reblog_of_id'])) {
             $orig = StatusModel::byId((string)$status['reblog_of_id']);
-            if ($orig) {
+            if ($this->isPubliclyRenderableStatus($orig)) {
                 $origHandle = $this->rssAuthorHandle((string)$orig['user_id']);
                 return 'Repost by ' . $ownerHandle . ($origHandle !== '' ? ' of ' . $origHandle : '');
             }
@@ -244,7 +251,7 @@ HTML;
         $prefix = '';
         if (!empty($status['reblog_of_id'])) {
             $orig = StatusModel::byId((string)$status['reblog_of_id']);
-            if ($orig) {
+            if ($this->isPubliclyRenderableStatus($orig)) {
                 $statusForContent = $orig;
                 $origHandle = $this->rssAuthorHandle((string)$orig['user_id']);
                 $prefix = '<p><strong>Reposted by @' . htmlspecialchars($owner['username'], ENT_QUOTES | ENT_HTML5, 'UTF-8') . '@' . htmlspecialchars(AP_DOMAIN, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</strong>'
@@ -281,10 +288,17 @@ HTML;
 
         $itemsXml = '';
         foreach ($rows as $s) {
+            $boostOrig = null;
+            if (!empty($s['reblog_of_id'])) {
+                $boostOrig = StatusModel::byId((string)$s['reblog_of_id']);
+                if (!$this->isPubliclyRenderableStatus($boostOrig)) {
+                    continue;
+                }
+            }
             $linkRaw = ap_url('@' . $u['username'] . '/' . $s['id']);
             $guidRaw = $linkRaw;
             if (!empty($s['reblog_of_id'])) {
-                $orig = StatusModel::byId((string)$s['reblog_of_id']);
+                $orig = $boostOrig;
                 if ($orig && (int)($orig['local'] ?? 0) === 1) {
                     $guidRaw = AP_BASE_URL . '/objects/' . rawurlencode((string)$orig['id']);
                 } elseif ($orig && !empty($orig['uri'])) {
@@ -414,6 +428,9 @@ HTML;
 
             if ($kind === 'boost' && $s['reblog_of_id']) {
                 $orig = DB::one('SELECT * FROM statuses WHERE id=?', [$s['reblog_of_id']]);
+                if (!$this->isPubliclyRenderableStatus($orig)) {
+                    return '';
+                }
                 $content = $orig ? ((int)($orig['local'] ?? 0) ? text_to_html($orig['content']) : ensure_html($orig['content'])) : '';
                 if ($orig && (int)($orig['local'] ?? 0)) {
                     $origAuthor = DB::one('SELECT username FROM users WHERE id=? AND is_suspended=0', [$orig['user_id']]);
@@ -1079,19 +1096,42 @@ HTML;
         $coll  = actor_url($u['username']) . '/outbox';
         $page  = $this->collectionPageParam();
         $total = (int)(DB::one(
-            "SELECT COUNT(*) as n FROM statuses WHERE user_id=? AND visibility IN ('public','unlisted') AND (expires_at IS NULL OR expires_at='' OR expires_at>?)",
-            [$u['id'], now_iso()]
+            "SELECT COUNT(*) as n FROM statuses s
+             WHERE s.user_id=? AND s.visibility IN ('public','unlisted')
+               AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+               AND (
+                   s.reblog_of_id IS NULL
+                   OR EXISTS (
+                       SELECT 1 FROM statuses os
+                        WHERE os.id=s.reblog_of_id
+                          AND os.visibility IN ('public','unlisted')
+                          AND (os.expires_at IS NULL OR os.expires_at='' OR os.expires_at>?)
+                   )
+               )",
+            [$u['id'], now_iso(), now_iso()]
         )['n'] ?? 0);
         if (!$page) { ap_json_out(Builder::collection($coll, $total)); }
 
         $rows = DB::all(
-            "SELECT * FROM statuses WHERE user_id=? AND visibility IN ('public','unlisted') AND (expires_at IS NULL OR expires_at='' OR expires_at>?) ORDER BY created_at DESC LIMIT 20 OFFSET ?",
-            [$u['id'], now_iso(), ($page-1)*20]
+            "SELECT s.* FROM statuses s
+             WHERE s.user_id=? AND s.visibility IN ('public','unlisted')
+               AND (s.expires_at IS NULL OR s.expires_at='' OR s.expires_at>?)
+               AND (
+                   s.reblog_of_id IS NULL
+                   OR EXISTS (
+                       SELECT 1 FROM statuses os
+                        WHERE os.id=s.reblog_of_id
+                          AND os.visibility IN ('public','unlisted')
+                          AND (os.expires_at IS NULL OR os.expires_at='' OR os.expires_at>?)
+                   )
+               )
+             ORDER BY s.created_at DESC LIMIT 20 OFFSET ?",
+            [$u['id'], now_iso(), now_iso(), ($page-1)*20]
         );
         $items = array_map(function ($s) use ($u) {
             if (!empty($s['reblog_of_id'])) {
                 $orig = \App\Models\StatusModel::byId($s['reblog_of_id']);
-                return $orig ? Builder::announce($s, $orig, $u) : null;
+                return $this->isPubliclyRenderableStatus($orig) ? Builder::announce($s, $orig, $u) : null;
             }
             return Builder::create($s, $u);
         }, $rows);
@@ -1128,8 +1168,12 @@ HTML;
 
     public function inbox(array $p): void
     {
+        $maxBody = 2 * 1024 * 1024;
+        $contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+        if ($contentLength > $maxBody) err_out('Payload too large', 413);
         $raw = raw_input_body();
         if (!$raw) err_out('Empty body', 400);
+        if (strlen($raw) > $maxBody) err_out('Payload too large', 413);
 
         $activity = json_decode($raw, true);
         if (!is_array($activity)) err_out('Invalid JSON', 400);

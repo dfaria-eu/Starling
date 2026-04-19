@@ -38,10 +38,36 @@ class StatusModel
             if ($onlyUnowned && !empty($m['status_id'])) continue;
             foreach ([$m['url'] ?? '', $m['preview_url'] ?? ''] as $mediaUrl) {
                 if (!is_string($mediaUrl) || $mediaUrl === '') continue;
-                $path = AP_MEDIA_DIR . '/' . basename(parse_url($mediaUrl, PHP_URL_PATH) ?? $mediaUrl);
-                if (is_file($path)) @unlink($path);
+                $path = self::localMediaPathFromUrl($mediaUrl);
+                if ($path !== null && is_file($path)) @unlink($path);
             }
         }
+    }
+
+    private static function localMediaPathFromUrl(string $mediaUrl): ?string
+    {
+        $mediaBase = parse_url((string)AP_MEDIA_URL) ?: [];
+        $urlParts = parse_url($mediaUrl) ?: [];
+        $pathPart = (string)($urlParts['path'] ?? $mediaUrl);
+        $basePath = rtrim((string)($mediaBase['path'] ?? '/media'), '/') . '/';
+
+        if (!str_starts_with($pathPart, $basePath)) {
+            return null;
+        }
+
+        $host = strtolower((string)($urlParts['host'] ?? ''));
+        if ($host !== '') {
+            $baseHost = strtolower((string)($mediaBase['host'] ?? ''));
+            $scheme = strtolower((string)($urlParts['scheme'] ?? ''));
+            $baseScheme = strtolower((string)($mediaBase['scheme'] ?? ''));
+            if ($host !== $baseHost || ($baseScheme !== '' && $scheme !== $baseScheme)) {
+                return null;
+            }
+        }
+
+        $base = basename($pathPart);
+        if ($base === '' || $base === '.' || $base === '..') return null;
+        return AP_MEDIA_DIR . '/' . $base;
     }
 
     private static function looksBrokenCard(?array $row): bool
@@ -544,7 +570,7 @@ class StatusModel
         if ($storedCreatedAt !== null && $storedCreatedAt !== $createdAt) {
             $storedTs  = strtotime($storedCreatedAt);
             $createdTs = strtotime($createdAt);
-            if ($storedTs !== false && $createdTs !== false && $storedTs > time() + 300 && $createdTs <= time() + 300) {
+            if ($storedTs !== false && $createdTs !== false && $storedTs > $createdTs + 300 && $createdTs <= time() + 300) {
                 DB::run(
                     'UPDATE statuses
                         SET created_at=?,
@@ -625,7 +651,7 @@ class StatusModel
             'reblogs_count'          => (int)$s['reblog_count'],
             'favourites_count'       => (int)$s['favourite_count'],
             'quotes_count'           => $quotesCount,
-            'edited_at'              => $editedAt ? (iso_z($editedAt) ?? best_iso_timestamp($s['updated_at'] ?? null, $s['created_at'] ?? null, $s['id'] ?? null)) : null,
+            'edited_at'              => $editedAt ? best_iso_timestamp($editedAt, $s['created_at'] ?? null, null) : null,
             'expires_at'             => iso_z($s['expires_at'] ?? null),
             'content'                => $content,
             'text'                   => ($isLocal && $viewerId === $s['user_id']) ? ($s['content'] ?? null) : null,

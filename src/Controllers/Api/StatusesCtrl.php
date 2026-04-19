@@ -54,6 +54,18 @@ class StatusesCtrl
         return '';
     }
 
+    private static function safeCardImageUrl(string $baseUrl, string $imageUrl): string
+    {
+        $imageUrl = trim($imageUrl);
+        if ($imageUrl === '') return '';
+
+        $absolute = absolute_url($baseUrl, $imageUrl);
+        if ($absolute === '' || !preg_match('#^https?://#i', $absolute)) return '';
+        if (!RemoteActorModel::isSafeUrl($absolute)) return '';
+
+        return $absolute;
+    }
+
     private function requireVisibleStatus(string $id, ?string $viewerId): array
     {
         $s = StatusModel::byId($id);
@@ -256,7 +268,7 @@ class StatusesCtrl
 
     public function create(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         rate_limit_enforce('statuses_create:' . $user['id'], 20, 300, 'Rate limit exceeded for posting');
         $d    = req_body();
         $rawStatus = $d['status'] ?? '';
@@ -458,7 +470,7 @@ class StatusesCtrl
 
     public function delete(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         $s    = StatusModel::byId($p['id']);
         if (!$s) err_out('Not found', 404);
         if ($s['user_id'] !== $user['id']) err_out('Forbidden', 403);
@@ -472,7 +484,7 @@ class StatusesCtrl
 
     public function edit(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         $s    = StatusModel::byId($p['id']);
         if (!$s || $s['user_id'] !== $user['id']) err_out('Not found or forbidden', 403);
         if (!empty($s['reblog_of_id'])) err_out('Cannot edit a boost', 422);
@@ -600,7 +612,7 @@ class StatusesCtrl
 
     public function reblog(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         $orig = StatusModel::byId($p['id']);
         if (!$orig) err_out('Not found', 404);
         if (!in_array($orig['visibility'], ['public', 'unlisted'])) err_out('Forbidden', 403);
@@ -641,7 +653,7 @@ class StatusesCtrl
 
     public function unreblog(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         $orig = StatusModel::byId($p['id']);
         if (!$orig) err_out('Not found', 404);
 
@@ -664,7 +676,7 @@ class StatusesCtrl
 
     public function favourite(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:favourites']);
         $s    = $this->requireVisibleStatus($p['id'], $user['id']);
 
         $alreadyFavourited = (bool)DB::one('SELECT 1 FROM favourites WHERE user_id=? AND status_id=?', [$user['id'], $s['id']]);
@@ -693,7 +705,7 @@ class StatusesCtrl
 
     public function unfavourite(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:favourites']);
         $s    = $this->requireVisibleStatus($p['id'], $user['id']);
 
         $wasFavourited = (bool)DB::one('SELECT 1 FROM favourites WHERE user_id=? AND status_id=?', [$user['id'], $s['id']]);
@@ -717,7 +729,7 @@ class StatusesCtrl
 
     public function bookmark(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:bookmarks']);
         $s    = $this->requireVisibleStatus($p['id'], $user['id']);
         DB::insertIgnore('bookmarks', ['id' => uuid(), 'user_id' => $user['id'], 'status_id' => $s['id'], 'created_at' => now_iso()]);
         json_out(StatusModel::toMasto($s, $user['id']));
@@ -725,7 +737,7 @@ class StatusesCtrl
 
     public function unbookmark(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:bookmarks']);
         $s    = $this->requireVisibleStatus($p['id'], $user['id']);
         DB::delete('bookmarks', 'user_id=? AND status_id=?', [$user['id'], $s['id']]);
         json_out(StatusModel::toMasto($s, $user['id']));
@@ -748,6 +760,7 @@ class StatusesCtrl
     {
         $isLocal    = (int)($s['local'] ?? 1);
         $rawContent = $s['content'] ?? '';
+        $canTrend   = $increment && (string)($s['visibility'] ?? 'public') === 'public';
 
         // Extrair URL: para posts remotos em HTML, tentar <a href> primeiro (excluindo menções/hashtags)
         $url = null;
@@ -780,7 +793,7 @@ class StatusesCtrl
                ?? DB::one('SELECT * FROM link_cards WHERE url=?', [$normalizedUrl]);
         if ($cached && !self::looksBrokenCard($cached)) {
             // Refresh fetched_at so recently re-shared links stay inside the trending window
-            if ($increment) DB::pdo()->prepare(
+            if ($canTrend) DB::pdo()->prepare(
                 "UPDATE link_cards SET share_count = share_count + 1, fetched_at = ? WHERE url = ?"
             )->execute([now_iso(), $cached['url']]);
             return self::cardObject($cached);
@@ -811,7 +824,7 @@ class StatusesCtrl
         if ($finalUrl && $finalUrl !== $normalizedUrl) {
             $cached = DB::one('SELECT * FROM link_cards WHERE url=?', [$finalUrl]);
             if ($cached && !self::looksBrokenCard($cached)) {
-                if ($increment) DB::pdo()->prepare(
+                if ($canTrend) DB::pdo()->prepare(
                     "UPDATE link_cards SET share_count = share_count + 1, fetched_at = ? WHERE url = ?"
                 )->execute([now_iso(), $finalUrl]);
                 // Store the original URL as a cache alias only. It must not duplicate the
@@ -843,14 +856,14 @@ class StatusesCtrl
         $provider = trim(html_entity_decode($provider, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         $image = trim($image);
         if ($image !== '') {
-            $image = absolute_url($finalUrl ?: $url, $image);
+            $image = self::safeCardImageUrl($finalUrl ?: $url, $image);
         }
         if (self::looksBrokenCard(['title' => $title, 'description' => $desc, 'provider' => $provider, 'image' => $image])) {
             return null;
         }
 
         // Armazenar pelo URL original (para que lookups futuros pelo mesmo URL encontrem o cache)
-        $row = ['url' => $url, 'title' => mb_substr($title, 0, 255), 'description' => mb_substr($desc, 0, 500), 'image' => $image, 'provider' => mb_substr($provider, 0, 100), 'card_type' => 'link', 'share_count' => $increment ? 1 : 0, 'fetched_at' => now_iso()];
+        $row = ['url' => $url, 'title' => mb_substr($title, 0, 255), 'description' => mb_substr($desc, 0, 500), 'image' => $image, 'provider' => mb_substr($provider, 0, 100), 'card_type' => 'link', 'share_count' => $canTrend ? 1 : 0, 'fetched_at' => now_iso()];
         DB::insertIgnore('link_cards', $row);
         if ($normalizedUrl !== $url) {
             DB::insertIgnore('link_cards', array_merge($row, ['url' => $normalizedUrl, 'share_count' => 0]));
@@ -877,7 +890,7 @@ class StatusesCtrl
             'html'              => '',
             'width'             => 0,
             'height'            => 0,
-            'image'             => (($r['image'] ?? '') !== '' ? (absolute_url($r['url'] ?? '', (string)$r['image']) ?: null) : null),
+            'image'             => (($r['image'] ?? '') !== '' ? (self::safeCardImageUrl((string)($r['url'] ?? ''), (string)$r['image']) ?: null) : null),
             'image_description' => '',
             'embed_url'         => '',
             'blurhash'          => null,

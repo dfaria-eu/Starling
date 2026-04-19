@@ -94,12 +94,55 @@ class TrendsCtrl
         return false;
     }
 
+    private static function registrableDomain(string $url): string
+    {
+        $host = strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
+        if ($host === '') return '';
+        if (str_starts_with($host, 'www.')) $host = substr($host, 4);
+        return $host;
+    }
+
+    private static function looksLikeLowQualityNewsCard(array $row): bool
+    {
+        $url = trim((string)($row['url'] ?? ''));
+        $title = trim((string)($row['title'] ?? ''));
+        $description = trim((string)($row['description'] ?? ''));
+        $provider = trim((string)($row['provider'] ?? ''));
+        $image = trim((string)($row['image'] ?? ''));
+        $host = self::registrableDomain($url);
+        $path = strtolower(rawurldecode((string)(parse_url($url, PHP_URL_PATH) ?? '')));
+
+        if ($url === '' || $title === '') return true;
+
+        if (preg_match('~^(?:just a moment|redirecting|301 moved permanently|302 found|403 forbidden|404 not found|access denied|handle redirect|error)$~iu', $title)) {
+            return true;
+        }
+
+        if (preg_match('~\b(?:donate|donation|fundrais|contribute|chip in|petition|sign up)\b~iu', $title . ' ' . $description . ' ' . $provider)) {
+            return true;
+        }
+
+        if ($host !== '' && preg_match('~(?:^|\.)bsky\.brid\.gy$~i', $host)) {
+            return true;
+        }
+
+        if (preg_match('~/(?:ap|users|profile|profiles|@[^/]+)(?:/|$)~i', $path) && self::looksLikeProfileUrl($url)) {
+            return true;
+        }
+
+        if ($description === '' && $image === '' && $provider === '') {
+            return true;
+        }
+
+        return false;
+    }
+
     private static function newsTrendScore(array $row): float
     {
         $shareCount = max(0, (int)($row['share_count'] ?? 0));
         $fetchedAt = strtotime((string)($row['fetched_at'] ?? '')) ?: time();
         $ageHours = max(0.0, (time() - $fetchedAt) / 3600.0);
-        $baseScore = ($shareCount + 1) * exp(-$ageHours * 0.693147 / 8.0);
+        $baseScore = log($shareCount + 1) * exp(-$ageHours * 0.693147 / 8.0);
 
         $url = trim((string)($row['url'] ?? ''));
         $title = trim((string)($row['title'] ?? ''));
@@ -137,6 +180,14 @@ class TrendsCtrl
 
         if ($provider !== '' && mb_strtolower($title) === mb_strtolower($provider)) {
             $multiplier *= 0.75;
+        }
+
+        if ($description === '') {
+            $multiplier *= 0.75;
+        }
+
+        if (trim((string)($row['image'] ?? '')) === '') {
+            $multiplier *= 0.9;
         }
 
         return $baseScore * $multiplier;
@@ -374,6 +425,9 @@ class TrendsCtrl
             if (self::looksGenericNewsUrl((string)($r['url'] ?? ''))) {
                 continue;
             }
+            if (self::looksLikeLowQualityNewsCard($r)) {
+                continue;
+            }
             $r['_news_score'] = self::newsTrendScore($r);
             $scored[] = $r;
         }
@@ -385,7 +439,14 @@ class TrendsCtrl
         });
 
         $out = [];
+        $domainCounts = [];
         foreach ($scored as $r) {
+            $domain = self::registrableDomain((string)($r['url'] ?? ''));
+            $domainCounts[$domain] = ($domainCounts[$domain] ?? 0) + 1;
+            if ($domain !== '' && $domainCounts[$domain] > 3) {
+                continue;
+            }
+
             $out[] = [
                 'url'               => $r['url'],
                 'title'             => $r['title'],

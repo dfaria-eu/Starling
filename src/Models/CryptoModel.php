@@ -159,6 +159,17 @@ class CryptoModel
         // pseudo-headers whose values come from the Signature header parameters, not HTTP headers.
         $created = preg_match('/\bcreated=(\d+)\b/', $sig, $cm) ? $cm[1] : null;
         $expires = preg_match('/\bexpires=(\d+)\b/', $sig, $em) ? $em[1] : null;
+        $timeError = self::validateSignatureTimeBounds($created, $expires);
+        if ($timeError !== '') {
+            return [
+                'ok' => false,
+                'error' => $timeError,
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
+                'algorithm' => $algorithm,
+                'headers' => $hm[1],
+            ];
+        }
 
         $parts = [];
         foreach ($hdrList as $h) {
@@ -359,6 +370,20 @@ class CryptoModel
                 'headers' => $componentsRaw,
             ];
         }
+        $timeError = self::validateSignatureTimeBounds(
+            array_key_exists('created', $params) ? (string)$params['created'] : null,
+            array_key_exists('expires', $params) ? (string)$params['expires'] : null
+        );
+        if ($timeError !== '') {
+            return [
+                'ok' => false,
+                'error' => $timeError,
+                'key_id' => $keyId,
+                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : '',
+                'algorithm' => $alg,
+                'headers' => $componentsRaw,
+            ];
+        }
 
         $components = preg_split('/\s+/', $componentsRaw) ?: [];
         $parts = [];
@@ -506,6 +531,31 @@ class CryptoModel
             if (!hash_equals($expectedDigest, trim($cm[1]))) {
                 return 'content_digest_mismatch';
             }
+        }
+
+        return '';
+    }
+
+    private static function validateSignatureTimeBounds(?string $created, ?string $expires): string
+    {
+        $now = time();
+        $createdTs = null;
+        $expiresTs = null;
+
+        if ($created !== null) {
+            if (!preg_match('/^\d+$/', $created)) return 'signature_created_invalid';
+            $createdTs = (int)$created;
+            if (abs($now - $createdTs) > 43200) return 'signature_created_stale';
+        }
+
+        if ($expires !== null) {
+            if (!preg_match('/^\d+$/', $expires)) return 'signature_expires_invalid';
+            $expiresTs = (int)$expires;
+            if ($expiresTs < $now) return 'signature_expired';
+        }
+
+        if ($createdTs !== null && $expiresTs !== null && $expiresTs < $createdTs) {
+            return 'signature_expires_before_created';
         }
 
         return '';

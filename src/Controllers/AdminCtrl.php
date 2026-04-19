@@ -609,6 +609,11 @@ class AdminCtrl
                 $n = AdminModel::pruneRemotePosts($days);
                 return "Deleted <strong>$n</strong> remote posts (>{$days} days, no active follows).";
             })(),
+            'prune_followed_remote_posts' => (function() {
+                $days = max(1, (int)($_POST['days'] ?? AdminModel::AGGRESSIVE_DEFAULTS['followed_remote_posts_days']));
+                $n = AdminModel::pruneFollowedRemotePosts($days);
+                return "Deleted <strong>$n</strong> followed remote posts (>{$days} days, protected local references kept).";
+            })(),
             'prune_remote_actors' => (function() {
                 $days = max(1, (int)($_POST['days'] ?? 60));
                 $n = AdminModel::pruneRemoteActors($days);
@@ -670,7 +675,8 @@ class AdminCtrl
                 }
                 return implode(' · ', array_filter([
                     $r['inbox']  ? "<strong>{$r['inbox']}</strong> inbox log entries"        : null,
-                    $r['posts']  ? "<strong>{$r['posts']}</strong> remote posts"             : null,
+                    $r['posts']  ? "<strong>{$r['posts']}</strong> unfollowed remote posts"  : null,
+                    $r['followed_posts'] ? "<strong>{$r['followed_posts']}</strong> followed remote posts" : null,
                     $r['actors'] ? "<strong>{$r['actors']}</strong> remote actors"           : null,
                     $r['notifs'] ? "<strong>{$r['notifs']}</strong> notifications"           : null,
                     $r['media']['files'] ? "<strong>{$r['media']['files']}</strong> orphaned media files" : null,
@@ -2079,6 +2085,20 @@ HTML;
         foreach ($disk['tableStats'] as $tbl => $cnt) {
             $tableRows .= "<tr><td class='td-mono'>{$e($tbl)}</td><td class='td-dim'>{$e($cnt)} rows</td></tr>";
         }
+        $statusRows = '';
+        foreach ([
+            'Local statuses' => $disk['localStatusRows'] ?? 0,
+            'Remote statuses' => $disk['remoteStatusRows'] ?? 0,
+            'Remote from followed actors' => $disk['remoteFollowedStatusRows'] ?? 0,
+            'Remote from unfollowed actors' => $disk['remoteUnfollowedStatusRows'] ?? 0,
+            'Followed remote candidates >' . $d['followed_remote_posts_days'] . 'd' => $disk['followedRemotePostsOld'] ?? 0,
+            'Followed remote prunable >' . $d['followed_remote_posts_days'] . 'd' => $disk['followedRemotePostsPrunable'] ?? 0,
+            'Followed remote protected >' . $d['followed_remote_posts_days'] . 'd' => $disk['followedRemotePostsProtected'] ?? 0,
+            'Unfollowed remote candidates >' . $d['remote_posts_days'] . 'd' => $disk['remotePostsOld'] ?? 0,
+            'Unfollowed remote prunable >' . $d['remote_posts_days'] . 'd' => $disk['remotePostsPrunable'] ?? 0,
+        ] as $label => $cnt) {
+            $statusRows .= "<tr><td>{$e($label)}</td><td class='td-dim'>{$e($cnt)} rows</td></tr>";
+        }
 
         return <<<HTML
 <div class="section">
@@ -2102,7 +2122,8 @@ HTML;
   <div class="section-title">Potentially recoverable space</div>
   <div class="cards" style="grid-template-columns:repeat(3,auto);gap:.6rem">
     <div class="card amber"><div class="card-label">Prunable inbox log &gt;{$e($d['inbox_days'])}d</div><div class="card-value">{$fb($disk['inboxLogSize'])}</div></div>
-    <div class="card"><div class="card-label">Prunable remote posts</div><div class="card-value">{$e($disk['remotePostsPrunable'])}</div><div class="card-sub">from {$e($disk['remotePostsOld'])} candidates &gt;{$e($d['remote_posts_days'])}d</div></div>
+    <div class="card"><div class="card-label">Unfollowed remote posts</div><div class="card-value">{$e($disk['remotePostsPrunable'])}</div><div class="card-sub">from {$e($disk['remotePostsOld'])} candidates &gt;{$e($d['remote_posts_days'])}d</div></div>
+    <div class="card amber"><div class="card-label">Followed remote posts</div><div class="card-value">{$e($disk['followedRemotePostsPrunable'])}</div><div class="card-sub">from {$e($disk['followedRemotePostsOld'])} candidates &gt;{$e($d['followed_remote_posts_days'])}d · {$e($disk['followedRemotePostsProtected'])} protected</div></div>
     <div class="card"><div class="card-label">Prunable orphaned media</div><div class="card-value">{$e($disk['orphanMedia'])}</div><div class="card-sub">files &gt;{$e($d['orphan_media_hours'])}h</div></div>
     <div class="card"><div class="card-label">Prunable runtime</div><div class="card-value">{$e($disk['runtimePrunable'])}</div><div class="card-sub">files &gt;{$e($d['runtime_days'])}d</div></div>
   </div>
@@ -2112,7 +2133,7 @@ HTML;
   <div class="section-title">Full cleanup</div>
   <div class="maint-card" style="border-color:var(--blue);margin-bottom:1.5rem">
     <h3>🧹 Full cleanup (aggressive space-saving mode)</h3>
-    <p>Runs every cleanup operation in sequence with aggressive defaults for very small shared-hosting instances: inbox log &gt;{$e($d['inbox_days'])}d, remote posts &gt;{$e($d['remote_posts_days'])}d (protects bookmarks, favourites, and referenced posts), actors &gt;{$e($d['remote_actors_days'])}d, notifications &gt;{$e($d['notifications_days'])}d, orphaned media &gt;{$e($d['orphan_media_hours'])}h, OAuth tokens &gt;{$e($d['tokens_days'])}d, link cards &gt;{$e($d['link_cards_days'])}d, and old runtime artifacts &gt;{$e($d['runtime_days'])}d. If the cleanup frees enough space, database compaction (VACUUM) starts automatically in the background right after it finishes.</p>
+    <p>Runs every cleanup operation in sequence with aggressive defaults for very small shared-hosting instances: inbox log &gt;{$e($d['inbox_days'])}d, unfollowed remote posts &gt;{$e($d['remote_posts_days'])}d, followed remote posts &gt;{$e($d['followed_remote_posts_days'])}d (protects bookmarks, favourites, notifications, pins, active polls, and locally referenced posts), actors &gt;{$e($d['remote_actors_days'])}d, notifications &gt;{$e($d['notifications_days'])}d, orphaned media &gt;{$e($d['orphan_media_hours'])}h, OAuth tokens &gt;{$e($d['tokens_days'])}d, link cards &gt;{$e($d['link_cards_days'])}d, and old runtime artifacts &gt;{$e($d['runtime_days'])}d. If the cleanup frees enough space, database compaction (VACUUM) starts automatically in the background right after it finishes.</p>
     <form method="POST" action="/admin/maintenance">
       <input type="hidden" name="action" value="prune_all">
       <button class="btn btn-primary">Run full cleanup</button>
@@ -2147,11 +2168,22 @@ HTML;
 
     <div class="maint-card">
       <h3>📨 Remote posts</h3>
-      <p>Posts from remote actors stored for the home timeline. Keeps only posts from actors currently followed by local users.</p>
+      <p>Posts from remote actors no local user currently follows. Protected local references are kept.</p>
       <form method="POST" action="/admin/maintenance" class="maint-form">
         <input type="hidden" name="action" value="prune_remote_posts">
         <label style="font-size:.75rem;color:var(--text2)">Delete remote posts older than</label>
         <input type="number" name="days" value="{$e($d['remote_posts_days'])}" min="1"> days
+        <button class="btn btn-danger">Clean up</button>
+      </form>
+    </div>
+
+    <div class="maint-card">
+      <h3>📮 Followed remote posts</h3>
+      <p>Old cached home timeline posts from actors still followed locally. Keeps bookmarks, favourites, notifications, pins, active polls, and posts referenced by local replies, boosts, or quotes.</p>
+      <form method="POST" action="/admin/maintenance" class="maint-form">
+        <input type="hidden" name="action" value="prune_followed_remote_posts">
+        <label style="font-size:.75rem;color:var(--text2)">Delete followed remote posts older than</label>
+        <input type="number" name="days" value="{$e($d['followed_remote_posts_days'])}" min="1"> days
         <button class="btn btn-danger">Clean up</button>
       </form>
     </div>
@@ -2246,6 +2278,11 @@ HTML;
 </div>
 
 <div class="section">
+  <div class="section-title">Status rows breakdown</div>
+  <div class="tbl-wrap" style="max-width:560px;margin-bottom:1.5rem">
+    <table><thead><tr><th>Group</th><th>Rows</th></tr></thead>
+    <tbody>{$statusRows}</tbody></table>
+  </div>
   <div class="section-title">Rows per table</div>
   <div class="tbl-wrap" style="max-width:400px">
     <table><thead><tr><th>Table</th><th>Rows</th></tr></thead>

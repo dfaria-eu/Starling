@@ -8,6 +8,7 @@ class AdminModel
     public const AGGRESSIVE_DEFAULTS = [
         'inbox_days'         => 3,
         'remote_posts_days'  => 10,
+        'followed_remote_posts_days' => 15,
         'remote_actors_days' => 21,
         'orphan_media_hours' => 6,
         'notifications_days' => 21,
@@ -789,33 +790,82 @@ class AdminModel
     {
         $before = gmdate('Y-m-d\TH:i:s\Z', time() - $days * 86400);
         $cond   = "local=0 AND created_at<?
-            AND user_id NOT IN (
-                SELECT following_id FROM follows
-                WHERE follower_id IN (SELECT id FROM users WHERE is_suspended=0)
-            )
-            AND id NOT IN (SELECT status_id FROM bookmarks)
+            AND user_id NOT IN (" . self::activeFollowedActorSql() . ")
+            " . self::remotePostCacheProtectionSql();
+
+        return self::deleteRemotePostsMatching($cond, [$before]);
+    }
+
+    /**
+     * Apaga posts remotos antigos de actores que continuam seguidos localmente.
+     * Esta é uma limpeza de cache da home timeline: posts com qualquer estado ou
+     * referência local continuam protegidos e podem ser re-fetchados por URI.
+     */
+    public static function pruneFollowedRemotePosts(int $days): int
+    {
+        $before = gmdate('Y-m-d\TH:i:s\Z', time() - $days * 86400);
+        $cond   = "local=0 AND created_at<?
+            AND user_id IN (" . self::activeFollowedActorSql() . ")
+            " . self::remotePostCacheProtectionSql();
+
+        return self::deleteRemotePostsMatching($cond, [$before]);
+    }
+
+    private static function activeFollowedActorSql(): string
+    {
+        return "SELECT following_id FROM follows
+            WHERE pending=0
+              AND follower_id IN (SELECT id FROM users WHERE is_suspended=0)";
+    }
+
+    private static function remotePostCacheProtectionSql(): string
+    {
+        $now = now_iso();
+        return "AND id NOT IN (SELECT status_id FROM bookmarks WHERE status_id IS NOT NULL AND status_id<>'')
             AND id NOT IN (
                 SELECT status_id FROM favourites
-                WHERE user_id IN (SELECT id FROM users)
+                WHERE status_id IS NOT NULL AND status_id<>'' AND user_id IN (SELECT id FROM users)
+            )
+            AND id NOT IN (
+                SELECT status_id FROM status_pins
+                WHERE status_id IS NOT NULL AND status_id<>''
+            )
+            AND id NOT IN (
+                SELECT status_id FROM notifications
+                WHERE status_id IS NOT NULL AND status_id<>''
+            )
+            AND id NOT IN (
+                SELECT status_id FROM reblogs
+                WHERE status_id IS NOT NULL AND status_id<>''
+            )
+            AND id NOT IN (
+                SELECT reblog_status_id FROM reblogs
+                WHERE reblog_status_id IS NOT NULL AND reblog_status_id<>''
+            )
+            AND id NOT IN (
+                SELECT status_id FROM polls
+                WHERE status_id IS NOT NULL AND status_id<>'' AND (closed_at IS NULL OR closed_at='') AND (expires_at IS NULL OR expires_at='' OR expires_at>='$now')
             )
             AND id NOT IN (
                 SELECT reply_to_id FROM statuses
-                WHERE local=1 AND reply_to_id IS NOT NULL
+                WHERE local=1 AND reply_to_id IS NOT NULL AND reply_to_id<>''
             )
             AND id NOT IN (
                 SELECT reblog_of_id FROM statuses
-                WHERE local=1 AND reblog_of_id IS NOT NULL
+                WHERE local=1 AND reblog_of_id IS NOT NULL AND reblog_of_id<>''
             )
             AND id NOT IN (
                 SELECT quote_of_id FROM statuses
-                WHERE local=1 AND quote_of_id IS NOT NULL
+                WHERE local=1 AND quote_of_id IS NOT NULL AND quote_of_id<>''
             )";
+    }
 
-        // Collect IDs to cascade-delete associated rows first
-        $ids = array_column(DB::all("SELECT id FROM statuses WHERE $cond", [$before]), 'id');
+    private static function deleteRemotePostsMatching(string $cond, array $params): int
+    {
+        $ids = array_column(DB::all("SELECT id FROM statuses WHERE $cond", $params), 'id');
         $affectedStatusIds = array_values(array_unique(array_filter(array_merge(
-            array_column(DB::all("SELECT reply_to_id FROM statuses WHERE $cond AND reply_to_id IS NOT NULL AND reply_to_id<>''", [$before]), 'reply_to_id'),
-            array_column(DB::all("SELECT reblog_of_id FROM statuses WHERE $cond AND reblog_of_id IS NOT NULL AND reblog_of_id<>''", [$before]), 'reblog_of_id')
+            array_column(DB::all("SELECT reply_to_id FROM statuses WHERE $cond AND reply_to_id IS NOT NULL AND reply_to_id<>''", $params), 'reply_to_id'),
+            array_column(DB::all("SELECT reblog_of_id FROM statuses WHERE $cond AND reblog_of_id IS NOT NULL AND reblog_of_id<>''", $params), 'reblog_of_id')
         ))));
         $count = count($ids);
 
@@ -838,6 +888,14 @@ class AdminModel
                         if (is_file($path)) @unlink($path);
                     }
                 }
+                $pollIds = array_column(DB::all("SELECT id FROM polls WHERE status_id IN ($ph)", $chunk), 'id');
+                if ($pollIds) {
+                    foreach (array_chunk($pollIds, 200) as $pollChunk) {
+                        $pollPh = implode(',', array_fill(0, count($pollChunk), '?'));
+                        DB::run("DELETE FROM poll_votes   WHERE poll_id IN ($pollPh)", $pollChunk);
+                        DB::run("DELETE FROM poll_options WHERE poll_id IN ($pollPh)", $pollChunk);
+                    }
+                }
                 // Null-out quote_of_id references in other posts
                 DB::run("UPDATE statuses SET quote_of_id=NULL WHERE quote_of_id IN ($ph)", $chunk);
                 // Delete media_attachments linked via status_media
@@ -849,6 +907,9 @@ class AdminModel
                 DB::run("DELETE FROM favourites      WHERE status_id IN ($ph)", $chunk);
                 DB::run("DELETE FROM bookmarks       WHERE status_id IN ($ph)", $chunk);
                 DB::run("DELETE FROM notifications   WHERE status_id IN ($ph)", $chunk);
+                DB::run("DELETE FROM status_edits     WHERE status_id IN ($ph)", $chunk);
+                DB::run("DELETE FROM polls            WHERE status_id IN ($ph)", $chunk);
+                DB::run("DELETE FROM reblogs          WHERE status_id IN ($ph) OR reblog_status_id IN ($ph)", array_merge($chunk, $chunk));
                 DB::run("DELETE FROM statuses        WHERE id        IN ($ph)", $chunk);
             }
             self::reconcileStatusCounters($affectedStatusIds);
@@ -1027,7 +1088,7 @@ class AdminModel
             $created = iso_z((string)($row['created_at'] ?? ''));
             $updated = iso_z((string)($row['updated_at'] ?? ''));
             $normalizedCreated = $created ?? best_iso_timestamp($row['updated_at'] ?? null, null, $row['id'] ?? null);
-            $normalizedUpdated = $updated ?? best_iso_timestamp($row['updated_at'] ?? null, $normalizedCreated, $row['id'] ?? null);
+            $normalizedUpdated = $updated ?? best_iso_timestamp($row['updated_at'] ?? null, $normalizedCreated, null);
             if ($normalizedCreated !== ($row['created_at'] ?? '') || $normalizedUpdated !== ($row['updated_at'] ?? '')) {
                 DB::update('statuses', [
                     'created_at' => $normalizedCreated,
@@ -1282,6 +1343,7 @@ class AdminModel
             $results = [
                 'inbox'  => self::pruneInboxLog(self::AGGRESSIVE_DEFAULTS['inbox_days']),
                 'posts'  => self::pruneRemotePosts(self::AGGRESSIVE_DEFAULTS['remote_posts_days']),
+                'followed_posts' => self::pruneFollowedRemotePosts(self::AGGRESSIVE_DEFAULTS['followed_remote_posts_days']),
                 'actors' => self::pruneRemoteActors(self::AGGRESSIVE_DEFAULTS['remote_actors_days']),
                 'notifs' => self::pruneNotifications(self::AGGRESSIVE_DEFAULTS['notifications_days']),
                 'media'  => self::pruneOrphanMedia(self::AGGRESSIVE_DEFAULTS['orphan_media_hours']),
@@ -1303,6 +1365,7 @@ class AdminModel
     {
         $deleted = (int)($results['inbox'] ?? 0)
             + (int)($results['posts'] ?? 0)
+            + (int)($results['followed_posts'] ?? 0)
             + (int)($results['actors'] ?? 0)
             + (int)($results['notifs'] ?? 0)
             + (int)($results['tokens'] ?? 0)
@@ -1341,6 +1404,7 @@ class AdminModel
                 $results = [
                     'inbox'  => self::pruneInboxLog(self::AGGRESSIVE_DEFAULTS['inbox_days']),
                     'posts'  => self::pruneRemotePosts(self::AGGRESSIVE_DEFAULTS['remote_posts_days']),
+                    'followed_posts' => self::pruneFollowedRemotePosts(self::AGGRESSIVE_DEFAULTS['followed_remote_posts_days']),
                     'actors' => self::pruneRemoteActors(self::AGGRESSIVE_DEFAULTS['remote_actors_days']),
                     'notifs' => self::pruneNotifications(self::AGGRESSIVE_DEFAULTS['notifications_days']),
                     'media'  => self::pruneOrphanMedia(self::AGGRESSIVE_DEFAULTS['orphan_media_hours']),
@@ -1617,36 +1681,32 @@ class AdminModel
         // Espaço potencialmente recuperável / apagável com os defaults atuais
         $inboxBefore     = gmdate('Y-m-d\TH:i:s\Z', time() - $d['inbox_days'] * 86400);
         $remoteBefore    = gmdate('Y-m-d\TH:i:s\Z', time() - $d['remote_posts_days'] * 86400);
+        $followedRemoteBefore = gmdate('Y-m-d\TH:i:s\Z', time() - $d['followed_remote_posts_days'] * 86400);
         $orphanBefore    = gmdate('Y-m-d\TH:i:s\Z', time() - $d['orphan_media_hours'] * 3600);
 
         $inboxLogSize    = (int)(DB::one("SELECT SUM(LENGTH(raw_json)) n FROM inbox_log WHERE created_at<?", [$inboxBefore])['n'] ?? 0);
-        $remotePostsOld  = DB::count('statuses', "local=0 AND created_at<?", [$remoteBefore]);
-        $remotePostsPrunable = count(array_column(DB::all(
-            "SELECT id FROM statuses
+        $activeFollowSql = self::activeFollowedActorSql();
+        $localStatusRows = DB::count('statuses', 'local=1');
+        $remoteFollowedStatusRows = DB::count('statuses', "local=0 AND user_id IN ($activeFollowSql)");
+        $remoteUnfollowedStatusRows = DB::count('statuses', "local=0 AND user_id NOT IN ($activeFollowSql)");
+        $remoteStatusRows = $remoteFollowedStatusRows + $remoteUnfollowedStatusRows;
+        $remotePostsOld  = DB::count('statuses', "local=0 AND created_at<? AND user_id NOT IN ($activeFollowSql)", [$remoteBefore]);
+        $remotePostsPrunable = (int)(DB::one(
+            "SELECT COUNT(*) c FROM statuses
              WHERE local=0 AND created_at<?
-               AND user_id NOT IN (
-                   SELECT following_id FROM follows
-                   WHERE follower_id IN (SELECT id FROM users WHERE is_suspended=0)
-               )
-               AND id NOT IN (SELECT status_id FROM bookmarks)
-               AND id NOT IN (
-                   SELECT status_id FROM favourites
-                   WHERE user_id IN (SELECT id FROM users)
-               )
-               AND id NOT IN (
-                   SELECT reply_to_id FROM statuses
-                   WHERE local=1 AND reply_to_id IS NOT NULL
-               )
-               AND id NOT IN (
-                   SELECT reblog_of_id FROM statuses
-                   WHERE local=1 AND reblog_of_id IS NOT NULL
-               )
-               AND id NOT IN (
-                   SELECT quote_of_id FROM statuses
-                   WHERE local=1 AND quote_of_id IS NOT NULL
-               )",
+               AND user_id NOT IN ($activeFollowSql)
+               " . self::remotePostCacheProtectionSql(),
             [$remoteBefore]
-        ), 'id'));
+        )['c'] ?? 0);
+        $followedRemotePostsOld = DB::count('statuses', "local=0 AND created_at<? AND user_id IN ($activeFollowSql)", [$followedRemoteBefore]);
+        $followedRemotePostsPrunable = (int)(DB::one(
+            "SELECT COUNT(*) c FROM statuses
+             WHERE local=0 AND created_at<?
+               AND user_id IN ($activeFollowSql)
+               " . self::remotePostCacheProtectionSql(),
+            [$followedRemoteBefore]
+        )['c'] ?? 0);
+        $followedRemotePostsProtected = max(0, $followedRemotePostsOld - $followedRemotePostsPrunable);
         $orphanMedia = DB::count(
             'media_attachments',
             "status_id IS NULL AND created_at<? AND id NOT IN (SELECT media_id FROM status_media)",
@@ -1678,7 +1738,10 @@ class AdminModel
         return compact(
             'dbSize','mediaSize','mediaCount','runtimeSize','runtimeCount',
             'tableStats','inboxLogSize',
-            'remotePostsOld','remotePostsPrunable','orphanMedia','runtimePrunable',
+            'localStatusRows','remoteStatusRows','remoteFollowedStatusRows','remoteUnfollowedStatusRows',
+            'remotePostsOld','remotePostsPrunable',
+            'followedRemotePostsOld','followedRemotePostsPrunable','followedRemotePostsProtected',
+            'orphanMedia','runtimePrunable',
             'freeSpace','totalSpace'
         );
     }
@@ -1706,7 +1769,25 @@ class AdminModel
     private static function mediaPathFromUrl(string $mediaUrl): ?string
     {
         if ($mediaUrl === '') return null;
-        $pathPart = parse_url($mediaUrl, PHP_URL_PATH) ?? $mediaUrl;
+        $mediaBase = parse_url((string)AP_MEDIA_URL) ?: [];
+        $urlParts = parse_url($mediaUrl) ?: [];
+        $pathPart = (string)($urlParts['path'] ?? $mediaUrl);
+        $basePath = rtrim((string)($mediaBase['path'] ?? '/media'), '/') . '/';
+
+        if (!str_starts_with($pathPart, $basePath)) {
+            return null;
+        }
+
+        $host = strtolower((string)($urlParts['host'] ?? ''));
+        if ($host !== '') {
+            $baseHost = strtolower((string)($mediaBase['host'] ?? ''));
+            $scheme = strtolower((string)($urlParts['scheme'] ?? ''));
+            $baseScheme = strtolower((string)($mediaBase['scheme'] ?? ''));
+            if ($host !== $baseHost || ($baseScheme !== '' && $scheme !== $baseScheme)) {
+                return null;
+            }
+        }
+
         $base = basename($pathPart);
         if ($base === '' || $base === '.' || $base === '..') return null;
         return AP_MEDIA_DIR . '/' . $base;

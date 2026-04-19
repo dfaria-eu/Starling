@@ -23,7 +23,7 @@ class PollsCtrl
 
     public function vote(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         $poll = PollModel::byId($p['id']);
         if (!$poll) err_out('Not found', 404);
 

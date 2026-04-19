@@ -246,6 +246,10 @@ class InboxProcessor
 
         $uri = $obj['id'] ?? '';
         if (!$uri) return true;
+        if (!self::objectAttributedToMatchesActor($obj, $actorId)) {
+            self::log($actorId, 'Create-rejected', $a, 'object attributedTo does not match actor');
+            return false;
+        }
 
         if (self::onPollVoteCreate($obj, $actorId)) {
             return true;
@@ -656,6 +660,17 @@ class InboxProcessor
         $existing = StatusModel::byUri($noteUri);
         if ($existing) {
             if (!$refreshExisting) return $existing;
+            $attributedActorIds = self::objectAttributedActorIds($data);
+            if ($attributedActorIds !== []) {
+                $ownsExisting = false;
+                foreach ($attributedActorIds as $attributedActorId) {
+                    if (rtrim($attributedActorId, '/') === rtrim((string)($existing['user_id'] ?? ''), '/')) {
+                        $ownsExisting = true;
+                        break;
+                    }
+                }
+                if (!$ownsExisting) return $existing;
+            }
 
             $now = now_iso();
             $oldParent = null;
@@ -1007,6 +1022,14 @@ class InboxProcessor
             $existing = StatusModel::byUri($uri);
             if (!$existing) return true; // not cached locally, ignore
             if ((int)($existing['local'] ?? 0) === 1) return true;
+            if ((string)($existing['user_id'] ?? '') !== $actorId) {
+                self::log($actorId, 'Update-rejected', $a, 'actor does not own cached status');
+                return false;
+            }
+            if (!self::objectAttributedToMatchesActor($obj, $actorId)) {
+                self::log($actorId, 'Update-rejected', $a, 'object attributedTo does not match actor');
+                return false;
+            }
 
             $now = now_iso();
             $newContent = self::apExtractContent($obj);
@@ -1029,7 +1052,7 @@ class InboxProcessor
                                     : self::apStr($obj['language'] ?? ($existing['language'] ?? 'en'), $existing['language'] ?? 'en'),
                 'sensitive'  => (int)($obj['sensitive'] ?? $existing['sensitive']),
                 'updated_at' => self::apTimestamp($obj['updated'] ?? null, $now),
-            ], 'uri=?', [$uri]);
+            ], 'uri=? AND user_id=?', [$uri, $actorId]);
 
             if (($obj['type'] ?? '') === 'Question') {
                 \App\Models\PollModel::syncRemoteQuestion($existing['id'], $obj);
@@ -1768,6 +1791,40 @@ class InboxProcessor
     {
         if (!is_array($value)) return [];
         return array_is_list($value) ? $value : [$value];
+    }
+
+    private static function objectAttributedToMatchesActor(array $obj, string $actorId): bool
+    {
+        if ($actorId === '' || !array_key_exists('attributedTo', $obj)) return true;
+
+        foreach (self::objectAttributedActorIds($obj) as $id) {
+            if (rtrim($id, '/') === rtrim($actorId, '/')) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function objectAttributedActorIds(array $obj): array
+    {
+        if (!array_key_exists('attributedTo', $obj)) return [];
+
+        $ids = [];
+        $attributedTo = $obj['attributedTo'];
+        $items = is_string($attributedTo) ? [$attributedTo] : self::apList($attributedTo);
+        foreach ($items as $item) {
+            $id = is_string($item)
+                ? $item
+                : (is_array($item) ? (string)($item['id'] ?? '') : '');
+            $id = trim($id);
+            if ($id !== '') $ids[] = $id;
+        }
+
+        return array_values(array_unique($ids));
     }
 
     /**

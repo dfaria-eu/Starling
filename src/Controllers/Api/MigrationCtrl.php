@@ -51,7 +51,7 @@ class MigrationCtrl
 
     public function addAlias(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:accounts']);
         $d    = req_body();
         $acct = trim($d['acct'] ?? '');
         if (!$acct) err_out('acct required', 422);
@@ -84,7 +84,7 @@ class MigrationCtrl
 
     public function removeAlias(array $p): void
     {
-        $user  = require_auth('write');
+        $user  = require_auth(['write', 'write:accounts']);
         $acct  = urldecode($p['acct'] ?? '');
         $aka   = json_decode($user['also_known_as'] ?? '[]', true) ?: [];
 
@@ -111,7 +111,7 @@ class MigrationCtrl
 
     public function move(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:accounts']);
         $d    = req_body();
 
         // Require current password confirmation

@@ -10,7 +10,7 @@ class PinsCtrl
 {
     public function pin(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         $s    = StatusModel::byId($p['id']);
         if (!$s) err_out('Not found', 404);
         if ($s['user_id'] !== $user['id']) err_out('Forbidden', 403);
@@ -42,7 +42,7 @@ class PinsCtrl
 
     public function unpin(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses']);
         $s    = StatusModel::byId($p['id']);
         if (!$s) err_out('Not found', 404);
         if ($s['user_id'] !== $user['id']) err_out('Forbidden', 403);

@@ -7,6 +7,15 @@ use App\Models\DB;
 
 class MarkersCtrl
 {
+    private function notificationUnreadCount(array $user): int
+    {
+        try {
+            return (new NotificationsCtrl())->unreadCount($user);
+        } catch (\Throwable) {
+            return DB::count('notifications', 'user_id=? AND read_at IS NULL', [$user['id']]);
+        }
+    }
+
     private function maxMarkerId(string $current, string $incoming): string
     {
         if ($current === '') return $incoming;
@@ -51,7 +60,7 @@ class MarkersCtrl
                     'updated_at'   => iso_z($row['updated_at']),
                 ];
                 if ($tl === 'notifications') {
-                    $payload['unread_count'] = DB::count('notifications', 'user_id=? AND read_at IS NULL', [$user['id']]);
+                    $payload['unread_count'] = $this->notificationUnreadCount($user);
                 }
                 $out->$tl = $payload;
             } elseif ($tl === 'notifications') {
@@ -59,7 +68,7 @@ class MarkersCtrl
                     'last_read_id' => '0',
                     'version'      => 0,
                     'updated_at'   => null,
-                    'unread_count' => DB::count('notifications', 'user_id=? AND read_at IS NULL', [$user['id']]),
+                    'unread_count' => $this->notificationUnreadCount($user),
                 ];
             }
         }
@@ -72,7 +81,7 @@ class MarkersCtrl
      */
     public function update(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:statuses', 'write:notifications']);
         $d    = req_body();
         $now  = now_iso();
         $out  = new \stdClass();
@@ -129,7 +138,7 @@ class MarkersCtrl
                 'updated_at'   => iso_z($now),
             ];
             if ($tl === 'notifications') {
-                $out->$tl['unread_count'] = DB::count('notifications', 'user_id=? AND read_at IS NULL', [$user['id']]);
+                $out->$tl['unread_count'] = $this->notificationUnreadCount($user);
             }
         }
         json_out($out);

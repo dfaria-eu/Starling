@@ -307,26 +307,27 @@ SECTION;
                     $kindIcon = '↻';
                     $kindLabel = 'Repost';
                     $orig = StatusModel::byId((string)$rp['reblog_of_id']);
-                    if ($orig) {
-                        $displayPost = $orig;
-                        if ((int)($orig['local'] ?? 0) === 1) {
-                            $origAuthor = DB::one(
-                                'SELECT username, display_name, avatar FROM users WHERE id=? AND is_suspended=0',
-                                [$orig['user_id']]
-                            );
-                            if ($origAuthor) {
-                                $displayNameRaw = (string)($origAuthor['display_name'] ?: $origAuthor['username']);
-                                $displayAvatarRaw = (string)($origAuthor['avatar'] ?? '');
-                            }
-                        } else {
-                            $remoteAuthor = DB::one(
-                                'SELECT username, display_name, avatar FROM remote_actors WHERE id=?',
-                                [$orig['user_id']]
-                            );
-                            if ($remoteAuthor) {
-                                $displayNameRaw = (string)($remoteAuthor['display_name'] ?: $remoteAuthor['username']);
-                                $displayAvatarRaw = (string)($remoteAuthor['avatar'] ?? '');
-                            }
+                    if (!$orig || !in_array((string)($orig['visibility'] ?? ''), ['public', 'unlisted'], true)) {
+                        continue;
+                    }
+                    $displayPost = $orig;
+                    if ((int)($orig['local'] ?? 0) === 1) {
+                        $origAuthor = DB::one(
+                            'SELECT username, display_name, avatar FROM users WHERE id=? AND is_suspended=0',
+                            [$orig['user_id']]
+                        );
+                        if ($origAuthor) {
+                            $displayNameRaw = (string)($origAuthor['display_name'] ?: $origAuthor['username']);
+                            $displayAvatarRaw = (string)($origAuthor['avatar'] ?? '');
+                        }
+                    } else {
+                        $remoteAuthor = DB::one(
+                            'SELECT username, display_name, avatar FROM remote_actors WHERE id=?',
+                            [$orig['user_id']]
+                        );
+                        if ($remoteAuthor) {
+                            $displayNameRaw = (string)($remoteAuthor['display_name'] ?: $remoteAuthor['username']);
+                            $displayAvatarRaw = (string)($remoteAuthor['avatar'] ?? '');
                         }
                     }
                 } elseif (!empty($rp['reply_to_id'])) {
@@ -437,6 +438,15 @@ HTML;
             header('Content-Type: text/html; charset=utf-8');
             echo '<!DOCTYPE html><html><head><meta charset=utf-8><title>' . ($tomb ? '410' : '404') . '</title></head><body><h1>Post not found</h1></body></html>';
             exit;
+        }
+        if (!empty($s['reblog_of_id'])) {
+            $boostTarget = StatusModel::byId((string)$s['reblog_of_id']);
+            if (!$boostTarget || !in_array((string)($boostTarget['visibility'] ?? ''), ['public', 'unlisted'], true)) {
+                http_response_code(404);
+                header('Content-Type: text/html; charset=utf-8');
+                echo '<!DOCTYPE html><html><head><meta charset=utf-8><title>404</title></head><body><h1>Post not found</h1></body></html>';
+                exit;
+            }
         }
 
         // Content negotiation: serve ActivityPub JSON when requested (Mastodon search, etc.)

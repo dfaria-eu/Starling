@@ -59,7 +59,7 @@ class SessionsCtrl
 
     public function delete(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:accounts']);
         $currentToken = (string)((auth_context()['token']['token'] ?? '') ?: '');
         $tokenId = (string)($p['id'] ?? '');
         $body = req_body();
@@ -129,7 +129,7 @@ class DeveloperAppsCtrl
 
     public function create(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:filters']);
         $d = req_body();
         $clientName = trim((string)($d['client_name'] ?? ''));
         if ($clientName === '') err_out('Application name required', 422);
@@ -148,7 +148,7 @@ class DeveloperAppsCtrl
 
     public function delete(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:filters']);
         $appId = (string)($p['id'] ?? '');
         $app = OAuthModel::appById($appId);
         if (!$app || (string)($app['owner_user_id'] ?? '') !== $user['id']) err_out('Not found', 404);
@@ -158,7 +158,7 @@ class DeveloperAppsCtrl
 
     public function createToken(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:filters']);
         $appId = (string)($p['id'] ?? '');
         $app = OAuthModel::appById($appId);
         if (!$app || (string)($app['owner_user_id'] ?? '') !== $user['id']) err_out('Not found', 404);
@@ -177,7 +177,7 @@ class DeveloperAppsCtrl
 
     public function revokeToken(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:filters']);
         $token = (string)($p['token'] ?? '');
         $row = DB::one(
             'SELECT t.token
@@ -240,7 +240,7 @@ class AccountLifecycleCtrl
 {
     public function delete(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:filters']);
         $d = req_body();
         $password = (string)($d['current_password'] ?? '');
         if ($password === '' || !password_verify($password, (string)($user['password'] ?? ''))) {
@@ -381,7 +381,7 @@ class FiltersCtrl
 
     public function create(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:filters']);
         $d    = req_body();
         $id   = uuid(); $now = now_iso();
         $keywords = $this->normalizeKeywords($d);
@@ -414,7 +414,7 @@ class FiltersCtrl
 
     public function update(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:accounts']);
         $f    = DB::one('SELECT * FROM filters WHERE id=? AND user_id=?', [$p['id'], $user['id']]);
         if (!$f) err_out('Not found', 404);
         $d = req_body();
@@ -455,7 +455,7 @@ class FiltersCtrl
 
     public function delete(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:filters']);
         $f = DB::one('SELECT id FROM filters WHERE id=? AND user_id=?', [$p['id'], $user['id']]);
         if (!$f) err_out('Not found', 404);
         DB::delete('filter_keywords', 'filter_id=?', [$p['id']]);
@@ -477,7 +477,7 @@ class UserDomainBlocksCtrl
 
     public function create(array $p): void
     {
-        $user   = require_auth('write');
+        $user   = require_auth(['write', 'write:blocks']);
         $d      = req_body();
         $domain = strtolower(trim($d['domain'] ?? ''));
         if (!$domain) err_out('domain required', 422);
@@ -492,7 +492,7 @@ class UserDomainBlocksCtrl
 
     public function delete(array $p): void
     {
-        $user   = require_auth('write');
+        $user   = require_auth(['write', 'write:blocks']);
         $domain = strtolower(trim(req_body()['domain'] ?? $_GET['domain'] ?? ''));
         if (!$domain) err_out('domain required', 422);
         DB::delete('user_domain_blocks', 'user_id=? AND domain=?', [$user['id'], $domain]);
@@ -572,7 +572,7 @@ class SuggestionsCtrl
 
     public function delete(array $p): void
     {
-        require_auth('write');
+        require_auth(['write', 'write:accounts']);
         json_out([]);
     }
 }
@@ -591,7 +591,7 @@ class AccountLookupCtrl
         $acct = ltrim($acct, '@');
 
         if (str_contains($acct, '@')) {
-            [$username, $domain] = explode('@', $acct, 2);
+            [$username, $domain] = $this->splitLookupAcct($acct);
             if (is_local($domain)) {
                 $u = UserModel::byUsername($username);
                 if ($u && !$this->isHiddenFromViewer($viewerId, $u['id'])) { json_out(UserModel::toMasto($u)); }
@@ -609,6 +609,20 @@ class AccountLookupCtrl
         }
 
         err_out('Not found', 404);
+    }
+
+    private function splitLookupAcct(string $acct): array
+    {
+        $parts = explode('@', ltrim(trim($acct), '@'));
+        $domain = strtolower((string)array_pop($parts));
+        $username = implode('@', $parts);
+
+        $duplicateSuffix = '@' . $domain;
+        if ($domain !== '' && str_ends_with(strtolower($username), $duplicateSuffix)) {
+            $username = substr($username, 0, -strlen($duplicateSuffix));
+        }
+
+        return [$username, $domain];
     }
 
     private function isHiddenFromViewer(?string $viewerId, string $targetId, ?string $domain = null): bool
@@ -642,7 +656,7 @@ class FeaturedTagsCtrl
 
     public function create(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:accounts']);
         $d    = req_body();
         $name = mb_strtolower(ltrim(trim((string)($d['name'] ?? '')), '#'), 'UTF-8');
         if (!$name) err_out('name required', 422);
@@ -659,7 +673,7 @@ class FeaturedTagsCtrl
 
     public function delete(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:accounts']);
         DB::delete('featured_tags', 'id=? AND user_id=?', [$p['id'], $user['id']]);
         json_out([]);
     }
@@ -842,7 +856,7 @@ class TagsApiCtrl
 
     public function follow(array $p): void
     {
-        $user = require_auth(['follow', 'write']);
+        $user = require_auth(['follow', 'write', 'write:follows']);
         $name = mb_strtolower(ltrim((string)($p['name'] ?? ''), '#'), 'UTF-8');
         if (!$name) err_out('tag name required', 422);
 
@@ -864,7 +878,7 @@ class TagsApiCtrl
 
     public function unfollow(array $p): void
     {
-        $user = require_auth(['follow', 'write']);
+        $user = require_auth(['follow', 'write', 'write:follows']);
         $name = mb_strtolower(ltrim((string)($p['name'] ?? ''), '#'), 'UTF-8');
         $ht   = DB::one('SELECT id FROM hashtags WHERE name=?', [$name]);
         if ($ht) {

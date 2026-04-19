@@ -29,10 +29,11 @@ class NoteCtrl {
         if (!$u) err_out('Not found', 404);
         if (!empty($s['reblog_of_id'])) {
             $orig = StatusModel::byId((string)$s['reblog_of_id']);
-            if ($orig) {
+            if ($orig && in_array((string)($orig['visibility'] ?? ''), ['public', 'unlisted'], true) && StatusModel::canView($orig, null)) {
                 $announce = Builder::announce($s, $orig, $u);
                 ap_json_out($announce);
             }
+            err_out('Not found', 404);
         }
         $note = Builder::note($s, $u);
         $note = ['@context' => Builder::getContext()] + $note;

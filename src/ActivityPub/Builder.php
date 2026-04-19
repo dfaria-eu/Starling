@@ -16,6 +16,10 @@ class Builder
             'Emoji'       => 'toot:Emoji',
             'discoverable'=> 'toot:discoverable',
             'indexable'   => 'toot:indexable',
+            'featuredTags' => ['@id' => 'http://joinmastodon.org/ns#featuredTags', '@type' => '@id'],
+            'schema'      => 'http://schema.org#',
+            'PropertyValue' => 'schema:PropertyValue',
+            'value'       => 'schema:value',
             'fedibird'    => 'http://fedibird.com/ns#',
             'quoteUri'    => ['@id' => 'fedibird:quoteUri', '@type' => '@id'],
         ],
@@ -154,7 +158,7 @@ class Builder
 
         // Conditionally include optional fields — omit nulls
         if ($s['updated_at'] && $s['updated_at'] !== $s['created_at']) {
-            $result['updated'] = best_iso_timestamp($s['updated_at'] ?? null, $s['created_at'] ?? null, $s['id'] ?? null);
+            $result['updated'] = best_iso_timestamp($s['updated_at'] ?? null, $s['created_at'] ?? null, null);
         }
         if ($s['cw'] ?? '') {
             $result['summary'] = $s['cw'];
@@ -200,7 +204,7 @@ class Builder
             'type'      => 'Update',
             'id'        => $s['uri'] . '#update/' . md5($s['updated_at']),
             'actor'     => $actorUrl,
-            'published' => best_iso_timestamp($s['updated_at'] ?? null, $s['created_at'] ?? null, $s['id'] ?? null),
+            'published' => best_iso_timestamp($s['updated_at'] ?? null, $s['created_at'] ?? null, null),
             'to'        => $note['to'],
             'cc'        => $note['cc'],
             'object'    => $note,
@@ -483,7 +487,7 @@ class Builder
         return array_values(array_filter(array_map(fn($f) => !empty($f['name']) ? [
             'type'  => 'PropertyValue',
             'name'  => $f['name'],
-            'value' => \App\Models\UserModel::fieldValueToHtml($f['value'] ?? ''),
+            'value' => \App\Models\UserModel::fieldValueToActivityPubHtml($f['value'] ?? ''),
         ] : null, $fields)));
     }
 

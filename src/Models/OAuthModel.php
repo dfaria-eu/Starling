@@ -5,6 +5,45 @@ namespace App\Models;
 
 class OAuthModel
 {
+    private static function normalizeRedirectUris(mixed $raw): string
+    {
+        $items = is_array($raw)
+            ? $raw
+            : preg_split('/\R+/', (string)$raw);
+        $items = array_values(array_unique(array_filter(array_map(
+            static fn($v) => trim((string)$v),
+            $items ?: []
+        ), 'strlen')));
+        if (!$items) {
+            $items = ['urn:ietf:wg:oauth:2.0:oob'];
+        }
+
+        $out = [];
+        foreach ($items as $uri) {
+            if (preg_match('/[\x00-\x1F\x7F]/', $uri)) {
+                continue;
+            }
+            if ($uri === 'urn:ietf:wg:oauth:2.0:oob') {
+                $out[] = $uri;
+                continue;
+            }
+            $scheme = strtolower((string)parse_url($uri, PHP_URL_SCHEME));
+            if ($scheme === '' || in_array($scheme, ['javascript', 'data', 'vbscript', 'file'], true)) {
+                continue;
+            }
+            if (in_array($scheme, ['http', 'https'], true) && !filter_var($uri, FILTER_VALIDATE_URL)) {
+                continue;
+            }
+            $out[] = $uri;
+        }
+
+        $out = array_values(array_unique($out));
+        if (!$out) {
+            $out = ['urn:ietf:wg:oauth:2.0:oob'];
+        }
+        return implode("\n", $out);
+    }
+
     public static function normalizeScopes(?string $requested, string $allowed = 'read write follow push'): string
     {
         $allowedList = preg_split('/\s+/', trim($allowed)) ?: [];
@@ -47,13 +86,7 @@ class OAuthModel
         $id = uuid();
         $scopes = self::normalizeScopes($d['scopes'] ?? $d['scope'] ?? 'read write follow push');
         $redirectRaw = $d['redirect_uris'] ?? $d['redirect_uri'] ?? 'urn:ietf:wg:oauth:2.0:oob';
-        if (is_array($redirectRaw)) {
-            $redirectUris = array_values(array_filter(array_map('trim', $redirectRaw), 'strlen'));
-            $redirectUri  = implode("\n", $redirectUris);
-        } else {
-            $redirectUri = trim((string)$redirectRaw);
-        }
-        if ($redirectUri === '') $redirectUri = 'urn:ietf:wg:oauth:2.0:oob';
+        $redirectUri  = self::normalizeRedirectUris($redirectRaw);
         DB::insert('oauth_apps', [
             'id'            => $id,
             'owner_user_id' => (string)($d['owner_user_id'] ?? ''),

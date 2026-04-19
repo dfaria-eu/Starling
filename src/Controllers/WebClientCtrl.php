@@ -2991,6 +2991,7 @@ async function refreshAfterCreate(status) {
 
 async function showHome(tabId) {
     if (tabId !== undefined) {
+        const tabChanged = tabId !== _homeTab;
         // If clicking the already-active tab, scroll to top and refresh (Bluesky UX)
         if (tabId === _homeTab && WCFG.view === 'HOME') {
             window.scrollTo({top: 0, behavior: 'smooth'});
@@ -2998,6 +2999,10 @@ async function showHome(tabId) {
         _homeTab = tabId;
         const cur = history.state || {};
         history.replaceState({...cur, view: 'HOME', homeTab: _homeTab}, '');
+        if (tabChanged) {
+            _pendingPosts = 0;
+            updateNewPostsBtn();
+        }
     } else if (_homeTab === 'home') {
         const savedDefault = userStorageGet('defaultHomeTab', 'home') || 'home';
         if (savedDefault === 'local' && userStorageGet('showLocalTab', '0') === '1') {
@@ -5343,7 +5348,7 @@ function startStreaming() {
 }
 
 function updateNotifBadge() {
-    const label = _pendingNotifs > 9 ? '9+' : String(_pendingNotifs);
+    const label = _pendingNotifs > 99 ? '99+' : String(_pendingNotifs);
     // Update both desktop sidebar and mobile bottom nav
     document.querySelectorAll('[data-view="NOTIFICATIONS"]').forEach(el => {
         let badge = el.querySelector('.notif-badge');
@@ -5394,7 +5399,7 @@ async function checkUnreadNotifications() {
 }
 
 function updateNewPostsBtn() {
-    const label = _pendingPosts > 9 ? '9+' : String(_pendingPosts);
+    const label = _pendingPosts > 99 ? '99+' : String(_pendingPosts);
     document.querySelectorAll('[data-view="HOME"]').forEach(el => {
         let badge = el.querySelector('.notif-badge');
         if (!badge) {
@@ -5436,9 +5441,10 @@ function navigate(view, id = null) {
     if (view === 'PROFILE' && !id) id = WCFG.myId;
     WCFG.view   = view;
     WCFG.viewId = id;
-    // Hide/show floating pill and reset pending count when entering HOME
+    // Hide/show floating pill. Keep pending Home updates visible until the
+    // user explicitly reloads them or Home is refreshed.
     const pill = document.getElementById('new-posts-pill');
-    if (view === 'HOME') { _pendingPosts = 0; updateNewPostsBtn(); }
+    if (view === 'HOME') { updateNewPostsBtn(); }
     else if (pill) pill.style.display = 'none';
     let url = '/web';
     if (view === 'LOCAL')              url = '/web/local';
@@ -5470,7 +5476,7 @@ function navigateReplace(view, id = null) {
     WCFG.view   = view;
     WCFG.viewId = id;
     const pill = document.getElementById('new-posts-pill');
-    if (view === 'HOME') { _pendingPosts = 0; updateNewPostsBtn(); }
+    if (view === 'HOME') { updateNewPostsBtn(); }
     else if (pill) pill.style.display = 'none';
     let url = '/web';
     if (view === 'LOCAL')              url = '/web/local';
@@ -6263,7 +6269,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Restore _homeTab BEFORE cache lookup (cache key depends on it)
         if (view === 'HOME' && state?.homeTab) _homeTab = state.homeTab;
-        if (view === 'HOME') { _pendingPosts = 0; updateNewPostsBtn(); }
+        if (view === 'HOME') { updateNewPostsBtn(); }
 
         setActiveNav(view);
 

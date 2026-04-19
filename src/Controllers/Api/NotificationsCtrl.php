@@ -255,6 +255,28 @@ class NotificationsCtrl
         return $count;
     }
 
+    public function unreadCount(array $user): int
+    {
+        $this->normalizeNotificationIds($user['id']);
+        $this->backfillReadStateFromMarker($user['id']);
+        $rows = DB::all(
+            'SELECT * FROM notifications
+              WHERE user_id=? AND read_at IS NULL
+              ORDER BY CAST(id AS INTEGER) DESC
+              LIMIT 5000',
+            [$user['id']]
+        );
+        $policy = $this->loadPolicy($user);
+        $count = 0;
+        foreach ($rows as $row) {
+            if ($this->notificationRequiresRequest($row, $user['id'], $policy)) continue;
+            if ($this->isHiddenFromViewer($user['id'], (string)($row['from_acct_id'] ?? ''))) continue;
+            if (!$this->hasRenderableStatus($row, $user['id'])) continue;
+            $count++;
+        }
+        return $count;
+    }
+
     private function backfillReadStateFromMarker(string $userId): void
     {
         static $done = [];
@@ -433,14 +455,14 @@ class NotificationsCtrl
 
     public function clear(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:notifications']);
         DB::delete('notifications', 'user_id=?', [$user['id']]);
         json_out([]);
     }
 
     public function dismiss(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:notifications']);
         DB::delete('notifications', 'id=? AND user_id=?', [$p['id'], $user['id']]);
         json_out([]);
     }

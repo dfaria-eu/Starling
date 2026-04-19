@@ -311,7 +311,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function updateCredentials(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:accounts']);
         $d    = req_body();
         $upd  = [];
         $src  = is_array($d['source'] ?? null) ? $d['source'] : [];
@@ -418,14 +418,26 @@ use App\ActivityPub\{Builder, Delivery};
             $ra = DB::one('SELECT * FROM remote_actors WHERE LOWER(username)=? AND domain=?', [strtolower($username), $domain]);
             if (!$ra) {
                 $ra = \App\Models\RemoteActorModel::fetchByAcct($username, $domain);
-            } elseif ((int)$ra['follower_count'] === 0 && (int)$ra['following_count'] === 0
-                   && time() - (int)strtotime($ra['fetched_at']) > 300) {
+            } else {
                 $actorId = $ra['id'];
-                defer_after_response(static function () use ($actorId): void {
-                    if (throttle_allow('remote_actor_refresh:' . $actorId, 1800)) {
-                        \App\Models\RemoteActorModel::fetch($actorId, true);
+                $needsVerificationRefresh = \App\Models\RemoteActorModel::hasUnverifiedVerifiableFields($ra);
+                if ($needsVerificationRefresh && bool_val($_GET['refresh'] ?? false)) {
+                    if (throttle_allow('remote_actor_verify_refresh:' . $actorId, 60)) {
+                        $fresh = \App\Models\RemoteActorModel::fetch($actorId, true);
+                        if ($fresh) $ra = $fresh;
                     }
-                });
+                } elseif (((int)$ra['follower_count'] === 0 && (int)$ra['following_count'] === 0
+                       && time() - (int)strtotime($ra['fetched_at']) > 300)
+                       || $needsVerificationRefresh) {
+                    defer_after_response(static function () use ($actorId, $needsVerificationRefresh): void {
+                        $key = $needsVerificationRefresh
+                            ? 'remote_actor_verify_refresh:' . $actorId
+                            : 'remote_actor_refresh:' . $actorId;
+                        if (throttle_allow($key, 1800)) {
+                            \App\Models\RemoteActorModel::fetch($actorId, true);
+                        }
+                    });
+                }
             }
             if ($ra && !$this->isHiddenFromViewer($viewerId, $ra['id'], $ra['domain'] ?? null)) json_out(UserModel::remoteToMasto($ra));
             err_out('Not found', 404);
@@ -470,10 +482,14 @@ use App\ActivityPub\{Builder, Delivery};
             // Never block profile rendering on remote refreshes. Refresh after the response
             // so iOS/web profile screens don't sit forever with the follow button spinning.
             $age = time() - (int)strtotime($remote['fetched_at']);
-            if ($age > 300) {
+            $needsVerificationRefresh = RemoteActorModel::hasUnverifiedVerifiableFields($remote);
+            if ($age > 300 || $needsVerificationRefresh) {
                 $actorId = $remote['id'];
-                defer_after_response(static function () use ($actorId): void {
-                    if (throttle_allow('remote_actor_refresh:' . $actorId, 1800)) {
+                defer_after_response(static function () use ($actorId, $needsVerificationRefresh): void {
+                    $key = $needsVerificationRefresh
+                        ? 'remote_actor_verify_refresh:' . $actorId
+                        : 'remote_actor_refresh:' . $actorId;
+                    if (throttle_allow($key, 1800)) {
                         RemoteActorModel::fetch($actorId, true);
                     }
                 });
@@ -942,7 +958,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function block(array $p): void
     {
-        $viewer = require_auth(['follow', 'write']);
+        $viewer = require_auth(['follow', 'write', 'write:blocks']);
         [$local, $remote] = $this->resolve($p['id']);
         $targetId = $local ? $local['id'] : ($remote ? $remote['id'] : $p['id']);
         DB::insertIgnore('blocks', ['id' => uuid(), 'user_id' => $viewer['id'], 'target_id' => $targetId, 'created_at' => now_iso()]);
@@ -981,7 +997,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function unblock(array $p): void
     {
-        $viewer = require_auth(['follow', 'write']);
+        $viewer = require_auth(['follow', 'write', 'write:blocks']);
         [$local, $remote] = $this->resolve($p['id']);
         $targetId = $local ? $local['id'] : ($remote ? $remote['id'] : $p['id']);
         DB::delete('blocks', 'user_id=? AND target_id=?', [$viewer['id'], $targetId]);
@@ -993,7 +1009,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function mute(array $p): void
     {
-        $viewer = require_auth(['follow', 'write']);
+        $viewer = require_auth(['follow', 'write', 'write:mutes']);
         [$local, $remote] = $this->resolve($p['id']);
         $targetId = $local ? $local['id'] : ($remote ? $remote['id'] : $p['id']);
         DB::insertIgnore('mutes', ['id' => uuid(), 'user_id' => $viewer['id'], 'target_id' => $targetId, 'created_at' => now_iso()]);
@@ -1002,7 +1018,7 @@ use App\ActivityPub\{Builder, Delivery};
 
     public function unmute(array $p): void
     {
-        $viewer = require_auth(['follow', 'write']);
+        $viewer = require_auth(['follow', 'write', 'write:mutes']);
         [$local, $remote] = $this->resolve($p['id']);
         $targetId = $local ? $local['id'] : ($remote ? $remote['id'] : $p['id']);
         DB::delete('mutes', 'user_id=? AND target_id=?', [$viewer['id'], $targetId]);

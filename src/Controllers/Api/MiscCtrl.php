@@ -186,7 +186,7 @@ class MediaCtrl
 {
     public function upload(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:media']);
         $file = $_FILES['file'] ?? null;
         if (!$file) err_out('No file uploaded', 422);
         $m = MediaModel::upload($file, $user['id']);
@@ -202,8 +202,24 @@ class MediaCtrl
 
         // Whitelist allowed media extensions to prevent serving executable files
         $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
-        $allowed = ['jpg','jpeg','png','gif','webp','avif','heic','heif','svg','mp4','webm','mov','mp3','ogg','wav','m4a','pdf'];
-        if (!in_array($ext, $allowed, true)) { http_response_code(403); exit; }
+        $allowedMimeByExt = [
+            'jpg'  => ['image/jpeg'],
+            'jpeg' => ['image/jpeg'],
+            'png'  => ['image/png'],
+            'gif'  => ['image/gif'],
+            'webp' => ['image/webp'],
+            'avif' => ['image/avif'],
+            'heic' => ['image/heic', 'image/heif'],
+            'heif' => ['image/heif', 'image/heic'],
+            'mp4'  => ['video/mp4'],
+            'webm' => ['video/webm'],
+            'mov'  => ['video/quicktime', 'video/mp4'],
+            'mp3'  => ['audio/mpeg', 'audio/mp3'],
+            'ogg'  => ['audio/ogg', 'video/ogg'],
+            'wav'  => ['audio/wav', 'audio/x-wav'],
+            'm4a'  => ['audio/mp4', 'audio/x-m4a'],
+        ];
+        if (!isset($allowedMimeByExt[$ext])) { http_response_code(403); exit; }
 
         $path = AP_MEDIA_DIR . '/' . $filename;
         if (!file_exists($path) || !is_file($path)) {
@@ -211,10 +227,14 @@ class MediaCtrl
         }
 
         $mime = mime_content_type($path) ?: 'application/octet-stream';
+        if (!in_array($mime, $allowedMimeByExt[$ext], true)) {
+            http_response_code(403); exit;
+        }
         $size = filesize($path);
         $etag = md5($filename . $size);
 
         header('Content-Type: ' . $mime);
+        header('X-Content-Type-Options: nosniff');
         header('ETag: "' . $etag . '"');
         header('Cache-Control: public, max-age=31536000, immutable');
         header('Access-Control-Allow-Origin: *');
@@ -268,7 +288,7 @@ class MediaCtrl
 
     public function update(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:media']);
         $d    = req_body();
         if (isset($d['description'])) {
             DB::update('media_attachments', ['description' => $d['description']], 'id=? AND user_id=?', [$p['id'], $user['id']]);
@@ -618,7 +638,7 @@ class ConversationsCtrl
 
     public function read(array $p): void
     {
-        $user   = require_auth('write');
+        $user   = require_auth(['write', 'write:conversations']);
         $rootId = $p['id'];
         $root   = StatusModel::byId($rootId);
         if (!$root || ($root['visibility'] ?? '') !== 'direct' || !StatusModel::canView($root, $user['id'])) {
@@ -785,7 +805,7 @@ class FollowRequestsCtrl
 
     public function authorize(array $p): void
     {
-        $user      = require_auth(['follow', 'write']);
+        $user      = require_auth(['follow', 'write', 'write:follows']);
         $clientId  = $p['id'];
 
         // The client sends the Mastodon account ID: UUID for local users, masto_id (md5)
@@ -843,7 +863,7 @@ class FollowRequestsCtrl
 
     public function reject(array $p): void
     {
-        $user     = require_auth(['follow', 'write']);
+        $user     = require_auth(['follow', 'write', 'write:follows']);
         $clientId = $p['id'];
 
         // Same resolution: client sends masto_id, follows table has AP URL
@@ -917,7 +937,7 @@ class ListsCtrl
 
     public function create(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:lists']);
         $d    = req_body();
         if (array_key_exists('title', $d) && !is_string($d['title'])) {
             err_out('title must be a string', 422);
@@ -941,7 +961,7 @@ class ListsCtrl
 
     public function reorder(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:lists']);
         $d    = req_body();
         $ids  = array_values(array_filter((array)($d['order'] ?? []), 'is_string'));
         if (empty($ids)) { json_out([]); return; }
@@ -963,7 +983,7 @@ class ListsCtrl
 
     public function update(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:lists']);
         $l = DB::one('SELECT * FROM lists WHERE id=? AND user_id=?', [$p['id'], $user['id']]);
         if (!$l) err_out('Not found', 404);
         $d = req_body();
@@ -979,7 +999,7 @@ class ListsCtrl
 
     public function delete(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:lists']);
         $l = DB::one('SELECT * FROM lists WHERE id=? AND user_id=?', [$p['id'], $user['id']]);
         if (!$l) err_out('Not found', 404);
         DB::delete('list_accounts', 'list_id=?', [$p['id']]);
@@ -1033,7 +1053,7 @@ class ListsCtrl
 
     public function addAccounts(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:lists']);
         $l = DB::one('SELECT id FROM lists WHERE id=? AND user_id=?', [$p['id'], $user['id']]);
         if (!$l) err_out('Not found', 404);
         $d = req_body();
@@ -1054,7 +1074,7 @@ class ListsCtrl
 
     public function removeAccounts(array $p): void
     {
-        $user = require_auth('write');
+        $user = require_auth(['write', 'write:lists']);
         $l = DB::one('SELECT id FROM lists WHERE id=? AND user_id=?', [$p['id'], $user['id']]);
         if (!$l) err_out('Not found', 404);
         $d = req_body();

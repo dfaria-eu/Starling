@@ -180,7 +180,7 @@ class RemoteActorModel
             'outbox_url'     => $d['outbox']    ?? '',
             'followers_url'  => $d['followers'] ?? '',
             'following_url'  => $d['following'] ?? '',
-            'fields'         => self::extractFields($d['attachment'] ?? []),
+            'fields'         => self::extractFields($d['attachment'] ?? [], $d, $fetchCounts),
             'also_known_as'  => json_encode((array)($d['alsoKnownAs'] ?? [])),
             'moved_to'       => is_string($d['movedTo'] ?? null) ? $d['movedTo'] : '',
             'is_locked'      => ($d['manuallyApprovesFollowers'] ?? false) ? 1 : 0,
@@ -239,17 +239,69 @@ class RemoteActorModel
         return 0;
     }
 
-    private static function extractFields(mixed $attachment): string
+    private static function extractFields(mixed $attachment, array $actor = [], bool $verify = false): string
     {
         if (!is_array($attachment)) return '[]';
         $fields = [];
+        $actorId = (string)($actor['id'] ?? '');
+        $profileUrl = self::extractProfileUrl($actor['url'] ?? null, $actorId);
+        $acceptUrls = array_values(array_unique(array_filter([$actorId, $profileUrl], 'is_string')));
         foreach ($attachment as $item) {
-            if (!is_array($item) || ($item['type'] ?? '') !== 'PropertyValue') continue;
+            if (!is_array($item) || !self::isPropertyValueAttachment($item['type'] ?? null)) continue;
             $name = trim((string)($item['name'] ?? ''));
             if (!$name) continue;
-            $fields[] = ['name' => $name, 'value' => $item['value'] ?? ''];
+            $value = self::fieldValueString($item['value'] ?? '');
+            $field = ['name' => $name, 'value' => $value];
+            if ($verify && $actorId !== '') {
+                $url = UserModel::verifiableUrlFromFieldValue($value);
+                if ($url !== '') {
+                    $field['verified_at'] = UserModel::verifyRelMe($url, $actorId, $acceptUrls);
+                }
+            }
+            $fields[] = $field;
         }
         return json_encode(array_slice($fields, 0, 4));
+    }
+
+    public static function hasUnverifiedVerifiableFields(array $actor): bool
+    {
+        $fields = json_decode((string)($actor['fields'] ?? '[]'), true);
+        if (!is_array($fields)) return false;
+
+        foreach ($fields as $field) {
+            if (!is_array($field)) continue;
+            if (!empty($field['verified_at'])) continue;
+            if (UserModel::verifiableUrlFromFieldValue((string)($field['value'] ?? '')) !== '') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static function isPropertyValueAttachment(mixed $type): bool
+    {
+        $types = is_array($type) ? $type : [$type];
+        foreach ($types as $candidate) {
+            $candidate = strtolower(trim((string)$candidate));
+            if (in_array($candidate, [
+                'propertyvalue',
+                'schema:propertyvalue',
+                'http://schema.org#propertyvalue',
+                'https://schema.org/propertyvalue',
+            ], true)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static function fieldValueString(mixed $value): string
+    {
+        if (is_string($value)) return $value;
+        if (!is_array($value)) return '';
+        if (isset($value['@value']) && is_string($value['@value'])) return $value['@value'];
+        $first = reset($value);
+        return is_string($first) ? $first : '';
     }
 
     private static function extractImage(mixed $icon): string
@@ -313,59 +365,90 @@ class RemoteActorModel
      */
     public static function httpGetDetailed(string $url, string $accept, ?array $signingActor = null): array
     {
-        if (!self::isSafeUrl($url)) {
+        $currentUrl = $url;
+        if (!self::isSafeUrl($currentUrl)) {
             return ['ok' => false, 'data' => null, 'error' => 'unsafe_url', 'http_code' => 0];
         }
-
-        $headerLines = [
-            'Accept: ' . $accept,
-            'User-Agent: ' . AP_SOFTWARE . '/' . AP_VERSION . ' (+https://' . AP_DOMAIN . ')',
-        ];
 
         // Signed GET: use instance actor (first admin user) or provided actor
         if ($signingActor === null) {
             $signingActor = DB::one('SELECT * FROM users WHERE is_admin=1 AND is_suspended=0 ORDER BY created_at ASC LIMIT 1');
         }
-        if ($signingActor && !empty($signingActor['private_key'])) {
-            $keyId    = actor_url($signingActor['username']) . '#main-key';
-            $signHdrs = \App\Models\CryptoModel::signRequest('GET', $url, $signingActor['private_key'], $keyId);
-            foreach ($signHdrs as $k => $v) {
-                if ($k !== 'Content-Type' && $k !== 'Digest') {
-                    $headerLines[] = "$k: $v";
+
+        $buildHeaders = static function (string $requestUrl) use ($accept, $signingActor): array {
+            $headerLines = [
+                'Accept: ' . $accept,
+                'User-Agent: ' . AP_SOFTWARE . '/' . AP_VERSION . ' (+https://' . AP_DOMAIN . ')',
+            ];
+
+            if ($signingActor && !empty($signingActor['private_key'])) {
+                $keyId    = actor_url($signingActor['username']) . '#main-key';
+                $signHdrs = \App\Models\CryptoModel::signRequest('GET', $requestUrl, $signingActor['private_key'], $keyId);
+                foreach ($signHdrs as $k => $v) {
+                    if ($k !== 'Content-Type' && $k !== 'Digest') {
+                        $headerLines[] = "$k: $v";
+                    }
                 }
             }
+
+            return $headerLines;
+        };
+
+        $httpCode = 0;
+        $raw = '';
+        for ($redirects = 0; $redirects <= 3; $redirects++) {
+            if (!self::isSafeUrl($currentUrl)) {
+                return ['ok' => false, 'data' => null, 'error' => $currentUrl === $url ? 'unsafe_url' : 'unsafe_redirect_url', 'http_code' => $httpCode];
+            }
+
+            $ch = curl_init($currentUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_TIMEOUT        => 10,
+                CURLOPT_FOLLOWLOCATION => false,
+                CURLOPT_HEADER         => true,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_HTTPHEADER     => $buildHeaders($currentUrl),
+            ]);
+            $response = curl_exec($ch);
+            $errno    = curl_errno($ch);
+            $err      = curl_error($ch);
+            $httpCode = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            self::closeCurlHandle($ch);
+
+            if ($response === false) {
+                return [
+                    'ok' => false,
+                    'data' => null,
+                    'error' => $errno === 6 ? 'dns_unresolved' : ('curl_error:' . ($err !== '' ? $err : (string)$errno)),
+                    'http_code' => $httpCode,
+                ];
+            }
+
+            $rawResponse = (string)$response;
+            $headerBlock = substr($rawResponse, 0, $headerSize);
+            $raw = substr($rawResponse, $headerSize);
+
+            if ($httpCode >= 300 && $httpCode < 400) {
+                if (!preg_match('/^Location:\s*(.+)$/im', $headerBlock, $m)) {
+                    return ['ok' => false, 'data' => null, 'error' => 'redirect_missing_location', 'http_code' => $httpCode];
+                }
+                $nextUrl = absolute_url($currentUrl, trim($m[1]));
+                if ($nextUrl === '' || !self::isSafeUrl($nextUrl)) {
+                    return ['ok' => false, 'data' => null, 'error' => 'unsafe_redirect_url', 'http_code' => $httpCode];
+                }
+                $currentUrl = $nextUrl;
+                continue;
+            }
+
+            break;
         }
 
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_TIMEOUT        => 10,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS      => 3,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_HTTPHEADER     => $headerLines,
-        ]);
-        $raw      = curl_exec($ch);
-        $errno    = curl_errno($ch);
-        $err      = curl_error($ch);
-        $httpCode = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-        self::closeCurlHandle($ch);
-
-        if ($raw === false) {
-            return [
-                'ok' => false,
-                'data' => null,
-                'error' => $errno === 6 ? 'dns_unresolved' : ('curl_error:' . ($err !== '' ? $err : (string)$errno)),
-                'http_code' => $httpCode,
-            ];
-        }
-
-        // SSRF protection: check redirect destination if the URL changed
-        if ($finalUrl && $finalUrl !== $url && !self::isSafeUrl($finalUrl)) {
-            return ['ok' => false, 'data' => null, 'error' => 'unsafe_redirect_url', 'http_code' => $httpCode];
+        if ($httpCode >= 300 && $httpCode < 400) {
+            return ['ok' => false, 'data' => null, 'error' => 'too_many_redirects', 'http_code' => $httpCode];
         }
 
         if ($httpCode >= 400) {

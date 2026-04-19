@@ -626,12 +626,16 @@ function flake_iso(?string $id): ?string
 function best_iso_timestamp(?string $primary, ?string $secondary = null, ?string $flakeId = null): string
 {
     $flake = flake_iso($flakeId);
+    $flakeTs = $flake !== null ? strtotime($flake) : false;
 
     foreach ([$primary, $secondary] as $candidate) {
         $iso = iso_z($candidate);
         if ($iso === null) continue;
 
         $ts = strtotime($iso);
+        if ($ts !== false && $flakeTs !== false && $ts > $flakeTs + 300) {
+            return $flake;
+        }
         if ($ts !== false && $ts > time() + 300) {
             if ($flake !== null) return $flake;
             continue;
@@ -830,18 +834,26 @@ function ensure_html(string $content): string
             function ($m) {
                 $attrs = $m[1];
                 $safeHref = '';
+                $relTokens = [];
                 if (preg_match('/\shref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))/i', $attrs, $hrefMatch)) {
                     $href = html_entity_decode((string)($hrefMatch[1] ?: $hrefMatch[2] ?: $hrefMatch[3] ?: ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
                     if (preg_match('~^https?://~i', $href)) {
                         $safeHref = htmlspecialchars($href, ENT_QUOTES | ENT_HTML5, 'UTF-8');
                     }
                 }
+                if (preg_match('/\srel\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))/i', $attrs, $relMatch)) {
+                    $relRaw = strtolower(html_entity_decode((string)($relMatch[1] ?: $relMatch[2] ?: $relMatch[3] ?: ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                    $relTokens = preg_split('/\s+/', trim($relRaw)) ?: [];
+                }
                 // Rebuild the link so unquoted or dangerous href values do not survive.
                 $attrs = preg_replace('/\s+href\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]*)/i', '', $attrs);
                 // Remove existing rel/target so we can re-add them canonically
                 $attrs = preg_replace('/\s+(?:rel|target)\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]*)/i', '', $attrs);
                 $hrefAttr = $safeHref !== '' ? ' href="' . $safeHref . '"' : '';
-                return '<a' . $attrs . $hrefAttr . ' rel="nofollow noopener noreferrer" target="_blank">';
+                $rel = in_array('me', $relTokens, true)
+                    ? 'me nofollow noopener noreferrer'
+                    : 'nofollow noopener noreferrer';
+                return '<a' . $attrs . $hrefAttr . ' rel="' . $rel . '" target="_blank">';
             },
             $html
         );

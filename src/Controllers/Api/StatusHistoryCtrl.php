@@ -33,7 +33,7 @@ class StatusHistoryCtrl
         $poll = PollModel::byStatusId($s['id']);
 
         $fmt = fn(array $row, bool $isCurrent) => [
-            'created_at'      => best_iso_timestamp($row['created_at'] ?? null, $s['updated_at'] ?? $s['created_at'] ?? null, $s['id'] ?? null),
+            'created_at'      => best_iso_timestamp($row['created_at'] ?? null, $s['updated_at'] ?? $s['created_at'] ?? null, null),
             'content'         => (int)($s['local'] ?? 1) ? text_to_html($row['content']) : ensure_html($row['content']),
             'spoiler_text'    => $row['cw'],
             'sensitive'       => (bool)$row['sensitive'],
@@ -57,7 +57,7 @@ class StatusHistoryCtrl
 
         json_out(array_map(function(array $row, int $idx) use ($fmt, $s) {
             $out = $fmt($row, $idx === 0);
-            $out['created_at'] = best_iso_timestamp($row['created_at'] ?? null, $s['updated_at'] ?? $s['created_at'] ?? null, $s['id'] ?? null);
+            $out['created_at'] = best_iso_timestamp($row['created_at'] ?? null, $s['updated_at'] ?? $s['created_at'] ?? null, null);
             return $out;
         }, $history, array_keys($history)));
     }
