@@ -862,6 +862,132 @@ function html_to_plain(string $html): string
     return $text;
 }
 
+function html_to_local_markup(string $html): string
+{
+    $trimmed = trim($html);
+    if ($trimmed === '') return '';
+    if ($trimmed === strip_tags($trimmed)) return html_to_plain($trimmed);
+    if (!class_exists(\DOMDocument::class)) return html_to_plain($trimmed);
+
+    $doc = new \DOMDocument();
+    $wrapped = '<!DOCTYPE html><html><body>' . $trimmed . '</body></html>';
+    if (!@$doc->loadHTML($wrapped, LIBXML_NOWARNING | LIBXML_NOERROR)) {
+        return html_to_plain($trimmed);
+    }
+
+    $renderBlockChildren = null;
+
+    $renderInline = static function (\DOMNode $node) use (&$renderInline): string {
+        if ($node instanceof \DOMText) {
+            return html_entity_decode($node->nodeValue ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+        if (!$node instanceof \DOMElement) {
+            $out = '';
+            foreach ($node->childNodes as $child) $out .= $renderInline($child);
+            return $out;
+        }
+
+        $tag = strtolower($node->tagName);
+        if ($tag === 'a') {
+            $href = trim((string)$node->getAttribute('href'));
+            if ($href !== '') return $href;
+        }
+        $children = '';
+        foreach ($node->childNodes as $child) $children .= $renderInline($child);
+
+        return match ($tag) {
+            'strong', 'b' => '**' . $children . '**',
+            'em', 'i'     => '*' . $children . '*',
+            'u'           => '++' . $children . '++',
+            'del', 's', 'strike' => '~~' . $children . '~~',
+            'code'        => '`' . str_replace('`', '', $children) . '`',
+            'br'          => "\n",
+            default       => $children,
+        };
+    };
+
+    $renderBlock = static function (\DOMNode $node) use (&$renderBlock, &$renderBlockChildren, $renderInline): string {
+        if ($node instanceof \DOMText) {
+            return html_entity_decode($node->nodeValue ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+        if (!$node instanceof \DOMElement) {
+            $out = '';
+            foreach ($node->childNodes as $child) $out .= $renderBlock($child);
+            return $out;
+        }
+
+        $tag = strtolower($node->tagName);
+
+        if (in_array($tag, ['ul', 'ol'], true)) {
+            $items = [];
+            $idx = 1;
+            foreach ($node->childNodes as $child) {
+                if (!$child instanceof \DOMElement || strtolower($child->tagName) !== 'li') continue;
+                $item = trim($renderBlock($child));
+                if ($item === '') continue;
+                $prefix = $tag === 'ol' ? ($idx++ . '. ') : '- ';
+                $item = preg_replace("/\n+/", "\n", $item);
+                $item = preg_replace('/\n/', "\n  ", $item);
+                $items[] = $prefix . $item;
+            }
+            return implode("\n", $items) . "\n\n";
+        }
+
+        if ($tag === 'blockquote') {
+            $inner = trim($renderBlockChildren($node, $renderBlock));
+            if ($inner === '') return '';
+            $quoted = implode("\n", array_map(
+                static fn(string $line): string => $line === '' ? '>' : '> ' . $line,
+                preg_split("/\r\n|\r|\n/", $inner) ?: []
+            ));
+            return $quoted . "\n\n";
+        }
+
+        if ($tag === 'pre') {
+            $text = trim(html_entity_decode($node->textContent ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            return ($text !== '' ? $text : '') . ($text !== '' ? "\n\n" : '');
+        }
+
+        if ($tag === 'p') {
+            return trim($renderInline($node)) . "\n\n";
+        }
+
+        if (in_array($tag, ['div', 'section', 'article'], true)) {
+            return trim($renderBlockChildren($node, $renderBlock)) . "\n\n";
+        }
+
+        if ($tag === 'li') {
+            return trim($renderInline($node));
+        }
+
+        return $renderBlockChildren($node, $renderBlock);
+    };
+
+    $renderBlockChildren = static function (\DOMNode $node, callable $renderer): string {
+        $out = '';
+        foreach ($node->childNodes as $child) $out .= $renderer($child);
+        return $out;
+    };
+
+    $body = $doc->getElementsByTagName('body')->item(0);
+    if (!$body) return html_to_plain($trimmed);
+
+    $out = '';
+    foreach ($body->childNodes as $child) $out .= $renderBlock($child);
+    $out = html_entity_decode($out, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $out = preg_replace("/[ \t]+\n/", "\n", $out);
+    $out = preg_replace("/\n{3,}/", "\n\n", trim($out));
+    return $out;
+}
+
+function local_markup_uses_rich_formatting(string $text): bool
+{
+    return (bool)preg_match(
+        '/(\*\*.+?\*\*|~~.+?~~|\+\+.+?\+\+|`[^`]+`|(^|\n)>\s|(^|\n)(?:[-*]\s|\d+\.\s)|(^|\W)(?:\*[^*\n]+\*|_[^_\n]+_)(?=$|\W))/s',
+        $text
+    );
+}
+
 function site_favicon_url(): string
 {
     return 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22%3E%E2%8B%B0%E2%8B%B1%3C/text%3E%3C/svg%3E';

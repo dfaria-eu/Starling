@@ -299,6 +299,9 @@ class StatusesCtrl
                     if ($m) json_out($m);
                 }
             } catch (\Throwable $e) {
+                if (str_contains(strtolower($e->getMessage()), 'no such column: idempotency_key')) {
+                    \App\Models\Schema::ensureCriticalBackfillsNow();
+                }
                 error_log('[Starling] statuses.create idempotency lookup skipped: ' . $e->getMessage());
             }
         }
@@ -519,12 +522,12 @@ class StatusesCtrl
         $upd = ['updated_at' => $now];
         $newContent = $s['content'];
         if (isset($d['status'])) {
-            // Clients like Ivory may send back the rendered HTML instead of plain text.
-            // Local posts store plain text; text_to_html() converts on read.
-            // If we receive HTML here, strip it to plain text to avoid double-encoding.
+            // Clients like Ivory may send back rendered HTML instead of the stored source text.
+            // Local posts store plain text plus a small markup subset, so convert safe HTML
+            // back into that local representation instead of flattening formatting away.
             $newContent = $d['status'];
             if ($newContent !== strip_tags($newContent)) {
-                $newContent = html_to_plain($newContent);
+                $newContent = html_to_local_markup($newContent);
             }
             if (mb_strlen($newContent) > AP_POST_CHARS) err_out('Status too long', 422);
             $upd['content'] = $newContent;

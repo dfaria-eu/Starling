@@ -18,10 +18,7 @@ class Schema
         $db = DB::pdo();
         $currentVersion = (int)$db->query('PRAGMA user_version')->fetchColumn();
 
-        if ($currentVersion < self::SCHEMA_VERSION || !self::criticalBackfillsMarked()) {
-            self::ensureCriticalBackfills($db);
-            self::markCriticalBackfills();
-        }
+        self::ensureCriticalBackfillsNow($db, $currentVersion);
 
         // Skip all DDL if the schema is already at the current version.
         // On the very first run (user_version=0) this falls through and creates everything.
@@ -621,6 +618,16 @@ class Schema
         $db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
     }
 
+    public static function ensureCriticalBackfillsNow(?\PDO $db = null, ?int $currentVersion = null): void
+    {
+        $db ??= DB::pdo();
+        $currentVersion ??= (int)$db->query('PRAGMA user_version')->fetchColumn();
+        if ($currentVersion < self::SCHEMA_VERSION || !self::criticalBackfillsMarked() || !self::criticalBackfillsPresent($db)) {
+            self::ensureCriticalBackfills($db);
+            self::markCriticalBackfills();
+        }
+    }
+
     private static function ensureCriticalBackfills(\PDO $db): void
     {
         try { $db->exec("ALTER TABLE statuses ADD COLUMN quote_of_id TEXT"); } catch (\Throwable) {}
@@ -654,6 +661,26 @@ class Schema
     private static function criticalBackfillsMarked(): bool
     {
         return is_file(self::criticalBackfillsMarkerPath());
+    }
+
+    private static function criticalBackfillsPresent(\PDO $db): bool
+    {
+        $hasColumn = static function (string $table, string $column) use ($db): bool {
+            try {
+                $rows = $db->query('PRAGMA table_info(' . $table . ')')->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+            } catch (\Throwable) {
+                return false;
+            }
+            foreach ($rows as $row) {
+                if (($row['name'] ?? null) === $column) return true;
+            }
+            return false;
+        };
+
+        if (!$hasColumn('statuses', 'idempotency_key')) return false;
+        if (!$hasColumn('statuses', 'quote_of_id')) return false;
+        if (!$hasColumn('statuses', 'expires_at')) return false;
+        return true;
     }
 
     private static function markCriticalBackfills(): void

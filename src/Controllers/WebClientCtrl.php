@@ -5894,9 +5894,12 @@ async function rejectFollowRequest(accountId, btn) {
 async function editStatus(id) {
     try {
         const s = await Api.get('/api/v1/statuses/' + id + '/source');
+        const editText = (s.content_type === 'text/html' && typeof s.text_plain === 'string')
+            ? s.text_plain
+            : s.text;
         Compose.openEdit(
             id,
-            s.text,
+            editText,
             s.spoiler_text || '',
             s.visibility || 'public',
             s.poll || null,

@@ -76,10 +76,14 @@ class StatusHistoryCtrl
             'SELECT ma.* FROM media_attachments ma JOIN status_media sm ON sm.media_id=ma.id WHERE sm.status_id=? ORDER BY sm.position',
             [$s['id']]
         );
+        $plainText = (string)($s['content'] ?? '');
+        $richSource = (bool)($s['local'] ?? 1) && local_markup_uses_rich_formatting($plainText);
 
         json_out([
             'id'           => $s['id'],
-            'text'         => $s['content'],
+            'text'         => $richSource ? text_to_html($plainText) : $plainText,
+            'text_plain'   => $plainText,
+            'content_type' => $richSource ? 'text/html' : 'text/plain',
             'spoiler_text' => $s['cw'],
             'visibility'   => $s['visibility'] ?? 'public',
             'expires_at'   => iso_z($s['expires_at'] ?? null),
