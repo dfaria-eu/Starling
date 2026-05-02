@@ -1,10 +1,10 @@
 <?php
 declare(strict_types=1);
 
-// Detect ROOT automatically.
+// Detectar ROOT automaticamente
 $candidates = [
-    __DIR__,                           // Everything in the public root (flat layout)
-    dirname(__DIR__),                  // Separate public/ directory
+    __DIR__,                          // tudo na raiz pública (estrutura flat)
+    dirname(__DIR__),                  // public/ separado (estrutura projectada)
     dirname(__DIR__, 2) . '/activitypub-php',
 ];
 
@@ -19,10 +19,11 @@ foreach ($candidates as $c) {
 if ($root === null) {
     http_response_code(500);
     header('Content-Type: text/plain; charset=utf-8');
-    echo "ERROR: config/config.php not found.\n\n";
-    echo "Checked locations:\n";
+    echo "ERRO: config/config.php não encontrado.\n\n";
+    echo "Locais procurados:\n";
     foreach ($candidates as $c) echo "  $c/config/config.php\n";
-    echo "\nPlace config/, src/, and storage/ in the same directory as this index.php.\n";
+    echo "\nColoca este index.php no document root e, sempre que possivel, mantem config/, src/ e storage/ fora da pasta publica.\n";
+    echo "Se o shared host obrigar uma estrutura flat, garante que esses diretorios ficam bloqueados no servidor web.\n";
     exit;
 }
 
