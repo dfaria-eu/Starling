@@ -8,7 +8,7 @@ class Schema
     private static bool $done = false;
 
     /** Increment this when adding new tables or columns. */
-    private const SCHEMA_VERSION = 20;
+    public const SCHEMA_VERSION = 20;
 
     public static function install(): void
     {
@@ -16,12 +16,15 @@ class Schema
         self::$done = true;
 
         $db = DB::pdo();
+        $currentVersion = (int)$db->query('PRAGMA user_version')->fetchColumn();
 
-        self::ensureCriticalBackfills($db);
+        if ($currentVersion < self::SCHEMA_VERSION || !self::criticalBackfillsMarked()) {
+            self::ensureCriticalBackfills($db);
+            self::markCriticalBackfills();
+        }
 
         // Skip all DDL if the schema is already at the current version.
         // On the very first run (user_version=0) this falls through and creates everything.
-        $currentVersion = (int)$db->query('PRAGMA user_version')->fetchColumn();
         if ($currentVersion >= self::SCHEMA_VERSION) return;
 
         $db->exec("CREATE TABLE IF NOT EXISTS users (
@@ -460,9 +463,19 @@ class Schema
             raw_json   TEXT NOT NULL,
             error      TEXT NOT NULL DEFAULT '',
             sig_headers TEXT NOT NULL DEFAULT '{}',
+            sig_debug  TEXT NOT NULL DEFAULT '{}',
+            request_method TEXT NOT NULL DEFAULT '',
+            request_path TEXT NOT NULL DEFAULT '',
+            request_host TEXT NOT NULL DEFAULT '',
+            remote_ip  TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         )");
         try { $db->exec("ALTER TABLE inbox_log ADD COLUMN sig_headers TEXT NOT NULL DEFAULT '{}'"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN sig_debug TEXT NOT NULL DEFAULT '{}'"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN request_method TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN request_path TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN request_host TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN remote_ip TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
 
         // Featured tags (shown on profile)
         $db->exec("CREATE TABLE IF NOT EXISTS featured_tags (
@@ -622,7 +635,29 @@ class Schema
         try { $db->exec("ALTER TABLE tombstones ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE tombstones ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'"); } catch (\Throwable) {}
         try { $db->exec("ALTER TABLE inbox_log ADD COLUMN sig_headers TEXT NOT NULL DEFAULT '{}'"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN sig_debug TEXT NOT NULL DEFAULT '{}'"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN request_method TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN request_path TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN request_host TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
+        try { $db->exec("ALTER TABLE inbox_log ADD COLUMN remote_ip TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
         try { $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_status_idempotency ON statuses(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"); } catch (\Throwable) {}
         try { $db->exec("CREATE INDEX IF NOT EXISTS idx_status_expires ON statuses(expires_at)"); } catch (\Throwable) {}
+    }
+
+    private static function criticalBackfillsMarkerPath(): string
+    {
+        $dir = ROOT . '/storage/runtime';
+        if (!is_dir($dir)) @mkdir($dir, 0755, true);
+        return $dir . '/schema_backfills_v' . self::SCHEMA_VERSION . '.lock';
+    }
+
+    private static function criticalBackfillsMarked(): bool
+    {
+        return is_file(self::criticalBackfillsMarkerPath());
+    }
+
+    private static function markCriticalBackfills(): void
+    {
+        @file_put_contents(self::criticalBackfillsMarkerPath(), now_iso(), LOCK_EX);
     }
 }

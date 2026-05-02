@@ -104,6 +104,15 @@ class InstanceCtrl
     }
     public function emojis(array $p): void   { json_out([]); }
     public function rules(array $p): void    { json_out(AdminModel::instanceRules()); }
+    public function health(array $p): void
+    {
+        $user = authed_user();
+        if (!$user || empty($user['is_admin'])) {
+            err_out('Forbidden', 403);
+        }
+        $details = !isset($_GET['details']) || bool_val($_GET['details']);
+        json_out(runtime_health_report($details));
+    }
 
     private static function adminAccount(): ?array
     {

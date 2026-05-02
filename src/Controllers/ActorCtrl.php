@@ -334,8 +334,10 @@ HTML;
         $u = UserModel::byUsername($p['username']);
         if (!$u) err_out('Not found', 404);
 
-        $accept = $_SERVER['HTTP_ACCEPT'] ?? '';
-        if (str_contains($accept, 'activity+json') || str_contains($accept, 'ld+json')) {
+        $accept = strtolower((string)($_SERVER['HTTP_ACCEPT'] ?? ''));
+        if (str_contains($accept, 'activity+json')
+            || str_contains($accept, 'ld+json')
+            || str_contains($accept, 'application/json')) {
             ap_json_out(Builder::actor($u));
         }
         $requestPath = rawurldecode(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/');
@@ -1187,7 +1189,12 @@ HTML;
         $query   = (string)parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_QUERY);
         if ($query !== '') $path .= '?' . $query;
 
-        InboxProcessor::process($activity, $headers, 'POST', $path, $raw);
+        InboxProcessor::process($activity, $headers, 'POST', $path, $raw, [
+            'method' => 'POST',
+            'path' => $path,
+            'host' => (string)($_SERVER['HTTP_HOST'] ?? ''),
+            'remote_ip' => client_ip(),
+        ]);
 
         defer_after_response(static function (): void {
             if (throttle_allow('delivery_retry_queue', 10)) {

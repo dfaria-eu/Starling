@@ -63,6 +63,15 @@ class RemoteActorModel
         }
 
         $http = self::httpGetDetailed($url, self::ACTOR_ACCEPT);
+        if ((!$http['ok'] || !is_array($http['data']) || empty($http['data']['id']))) {
+            foreach (self::actorFetchRetryPlan($url, $http['error'] ?? '') as $retry) {
+                $candidate = self::httpGetDetailed($retry['url'], self::ACTOR_ACCEPT, $retry['signed'] ? null : []);
+                if ($candidate['ok'] && is_array($candidate['data']) && !empty($candidate['data']['id'])) {
+                    $http = $candidate;
+                    break;
+                }
+            }
+        }
         if ((!$http['ok'] || !is_array($http['data']) || empty($http['data']['id']))
             && self::looksLikeWordpressComVanityActor($url)) {
             $canonicalUrl = self::resolveWordpressComCanonicalActorUrl($url);
@@ -88,6 +97,31 @@ class RemoteActorModel
         return $actor
             ? ['ok' => true, 'actor' => $actor, 'error' => '']
             : ['ok' => false, 'actor' => null, 'error' => 'actor_upsert_failed'];
+    }
+
+    /**
+     * Some remote actors are flaky about trailing slashes or signed GETs.
+     * Only use these retries after the primary fetch failed.
+     *
+     * @return list<array{url:string,signed:bool}>
+     */
+    private static function actorFetchRetryPlan(string $url, string $error): array
+    {
+        $variants = [];
+        $alt = str_ends_with($url, '/') ? rtrim($url, '/') : ($url . '/');
+        if ($alt !== $url && self::isSafeUrl($alt)) {
+            $variants[] = ['url' => $alt, 'signed' => true];
+        }
+
+        // Retry unsigned when the remote server timed out or may dislike signed GETs.
+        if (str_starts_with($error, 'curl_error:') || in_array($error, ['http_401', 'http_403', 'http_406'], true)) {
+            $variants[] = ['url' => $url, 'signed' => false];
+            if ($alt !== $url && self::isSafeUrl($alt)) {
+                $variants[] = ['url' => $alt, 'signed' => false];
+            }
+        }
+
+        return $variants;
     }
 
     /** Resolve @user@domain via WebFinger, then fetch actor. */

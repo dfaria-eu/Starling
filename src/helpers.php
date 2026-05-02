@@ -473,6 +473,44 @@ function bearer(): ?string
     return preg_match('/^Bearer\s+(\S+)$/i', $h, $m) ? $m[1] : null;
 }
 
+function generated_config(): array
+{
+    static $config = null;
+    if ($config !== null) return $config;
+
+    $path = ROOT . '/storage/config.generated.php';
+    if (!is_file($path)) {
+        $config = [];
+        return $config;
+    }
+
+    $loaded = require $path;
+    $config = is_array($loaded) ? $loaded : [];
+    return $config;
+}
+
+function oauth_token_ttl_days(): int
+{
+    $cfg = generated_config();
+    $raw = $cfg['oauth_token_ttl_days'] ?? 0;
+    if (!is_numeric($raw)) return 0;
+    return max(0, min(3650, (int)$raw));
+}
+
+function oauth_token_is_expired(array $row): bool
+{
+    $ttlDays = oauth_token_ttl_days();
+    if ($ttlDays <= 0) return false;
+
+    $createdAt = trim((string)($row['created_at'] ?? ''));
+    if ($createdAt === '') return false;
+
+    $createdTs = strtotime($createdAt);
+    if ($createdTs === false) return false;
+
+    return $createdTs < (time() - ($ttlDays * 86400));
+}
+
 function authed_user(): ?array
 {
     $ctx = auth_context();
@@ -481,20 +519,18 @@ function authed_user(): ?array
 
 function auth_context(): ?array
 {
-    // Accept token via Authorization header.
-    // Only the SSE endpoint may use ?access_token= because EventSource cannot send headers.
-    $queryToken = null;
+    // Prefer headers and cookies. Keep ?access_token as a compatibility fallback
+    // for third-party SSE clients, but the first-party web client should rely on
+    // the HttpOnly auth cookie so bearer tokens do not land in access logs.
     $path = (string)parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
-    if ($path === '/api/v1/streaming/user') {
-        $queryToken = $_GET['access_token'] ?? null;
-    }
-    $tok = bearer() ?? $queryToken ?? ($_COOKIE['ap_auth'] ?? null) ?? null;
+    $queryToken = str_starts_with($path, '/api/v1/streaming') ? ($_GET['access_token'] ?? null) : null;
+    $tok = bearer() ?? ($_COOKIE['ap_auth'] ?? null) ?? $queryToken ?? null;
     if (!$tok) return null;
 
     $row = \App\Models\OAuthModel::tokenByValue($tok);
     if (!$row || !$row['user_id']) return null;
 
-    \App\Models\DB::update('oauth_tokens', ['last_used' => now_iso()], 'token=?', [$tok]);
+    \App\Models\OAuthModel::touchTokenUsage($row);
     $user = \App\Models\UserModel::byId($row['user_id']);
     if (!$user || !empty($user['is_suspended'])) return null;
 
@@ -621,6 +657,156 @@ function flake_iso(?string $id): ?string
     } catch (\Throwable) {
         return null;
     }
+}
+
+function install_security_report(): array
+{
+    $checks = [];
+    $serverSoftware = strtolower((string)($_SERVER['SERVER_SOFTWARE'] ?? ''));
+    $apacheLike = str_contains($serverSoftware, 'apache') || str_contains($serverSoftware, 'litespeed');
+    $baseUrl = rtrim((string)(generated_config()['base_url'] ?? AP_BASE_URL), '/');
+
+    $targets = [
+        ['code' => 'db_file', 'label' => 'SQLite database', 'path' => '/storage/db/activitypub.sqlite'],
+        ['code' => 'generated_config', 'label' => 'Generated config', 'path' => '/storage/config.generated.php'],
+        ['code' => 'config_php', 'label' => 'config/config.php', 'path' => '/config/config.php'],
+        ['code' => 'bootstrap_php', 'label' => 'src/bootstrap.php', 'path' => '/src/bootstrap.php'],
+    ];
+
+    foreach ($targets as $target) {
+        $probe = install_security_probe($baseUrl . $target['path']);
+        $checks[] = [
+            'code' => $target['code'],
+            'label' => $target['label'],
+            'path' => $target['path'],
+            'status' => $probe['status'],
+            'result' => $probe['result'],
+            'message' => $probe['message'],
+            'url' => $baseUrl . $target['path'],
+        ];
+    }
+
+    return [
+        'ok' => !array_filter($checks, static fn (array $check): bool => $check['result'] !== 'blocked'),
+        'checks' => $checks,
+        'notes' => [
+            'This installation relies on web-server rules to protect sensitive paths.',
+            $apacheLike
+                ? 'Apache/LiteSpeed-style protection appears expected for this deployment.'
+                : '.htaccess may be ignored on this server stack; rely on direct HTTP checks instead.',
+        ],
+    ];
+}
+
+function install_security_probe(string $url): array
+{
+    if (!function_exists('curl_init')) {
+        return [
+            'status' => null,
+            'result' => 'unknown',
+            'message' => 'cURL is not available, so the live HTTP check could not run.',
+        ];
+    }
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_NOBODY => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_TIMEOUT => 8,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => 0,
+        CURLOPT_USERAGENT => 'Starling-Install-Check/1.0',
+    ]);
+    curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $error = trim((string)curl_error($ch));
+    curl_close($ch);
+
+    if ($error !== '') {
+        return [
+            'status' => null,
+            'result' => 'unknown',
+            'message' => 'HTTP probe failed: ' . $error,
+        ];
+    }
+
+    if (in_array($status, [403, 404], true)) {
+        return [
+            'status' => $status,
+            'result' => 'blocked',
+            'message' => 'Direct HTTP access is blocked.',
+        ];
+    }
+
+    if ($status >= 200 && $status < 300) {
+        return [
+            'status' => $status,
+            'result' => 'exposed',
+            'message' => 'Direct HTTP access is allowed.',
+        ];
+    }
+
+    return [
+        'status' => $status,
+        'result' => 'unclear',
+        'message' => 'HTTP access returned an unexpected status and should be reviewed.',
+    ];
+}
+
+function runtime_health_report(bool $includeDetails = true): array
+{
+    $runtimeDir = ROOT . '/storage/runtime';
+    $mediaDir   = AP_MEDIA_DIR;
+    $dbExists   = is_file(AP_DB_PATH);
+    $dbWritable = ($dbExists && is_writable(AP_DB_PATH)) || (!$dbExists && is_writable(dirname(AP_DB_PATH)));
+    $runtimeWritable = is_dir($runtimeDir) ? is_writable($runtimeDir) : is_writable(dirname($runtimeDir));
+    $mediaWritable   = is_dir($mediaDir) ? is_writable($mediaDir) : is_writable(dirname($mediaDir));
+    $generatedExists = is_file(ROOT . '/storage/config.generated.php');
+    $install = install_security_report();
+
+    $deliveryDue = null;
+    $deliveryTotal = null;
+    $tableExists = \App\Models\DB::one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_queue' LIMIT 1");
+    if ($tableExists) {
+        $deliveryTotal = (int)(\App\Models\DB::one('SELECT COUNT(*) c FROM delivery_queue')['c'] ?? 0);
+        $deliveryDue = (int)(\App\Models\DB::one(
+            "SELECT COUNT(*) c FROM delivery_queue
+             WHERE next_retry_at <= ? AND attempts < 8",
+            [now_iso()]
+        )['c'] ?? 0);
+    }
+
+    $report = [
+        'ok' => $dbWritable && $runtimeWritable && $mediaWritable,
+        'checks' => [
+            'db_exists' => $dbExists,
+            'db_writable' => $dbWritable,
+            'runtime_writable' => $runtimeWritable,
+            'media_writable' => $mediaWritable,
+            'generated_config_present' => $generatedExists,
+            'auto_maintenance_enabled' => \App\Models\AdminModel::isAutoMaintenanceEnabled(),
+            'dns_php_available' => function_exists('dns_get_record'),
+            'curl_available' => function_exists('curl_init'),
+        ],
+        'warnings' => [],
+        'install_checks' => $install['checks'],
+    ];
+
+    if ($includeDetails) {
+        $report['details'] = [
+            'db_path' => AP_DB_PATH,
+            'db_size_bytes' => $dbExists ? (int)(filesize(AP_DB_PATH) ?: 0) : 0,
+            'runtime_dir' => $runtimeDir,
+            'media_dir' => $mediaDir,
+            'delivery_queue_total' => $deliveryTotal,
+            'delivery_queue_due' => $deliveryDue,
+            'oauth_token_ttl_days' => oauth_token_ttl_days(),
+        ];
+    }
+
+    return $report;
 }
 
 function best_iso_timestamp(?string $primary, ?string $secondary = null, ?string $flakeId = null): string

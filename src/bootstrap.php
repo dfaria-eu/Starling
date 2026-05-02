@@ -23,8 +23,57 @@ spl_autoload_register(function (string $class): void {
 // ── Helpers ─────────────────────────────────────────────────
 require ROOT . '/src/helpers.php';
 
+// ── Shared-hosting guard rails ──────────────────────────────
+$ensurePublicDirDenyRules = static function (): void {
+    $rules = <<<HTACCESS
+Options -Indexes
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Deny from all
+</IfModule>
+
+HTACCESS;
+
+    foreach (['config', 'src', 'storage'] as $dirName) {
+        $dir = ROOT . '/' . $dirName;
+        if (!is_dir($dir)) continue;
+        $path = $dir . '/.htaccess';
+        if (is_file($path)) continue;
+        @file_put_contents($path, $rules, LOCK_EX);
+    }
+};
+$ensurePublicDirDenyRules();
+
+$persistInstallSecurityReport = static function (): void {
+    $dir = ROOT . '/storage/runtime';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    @file_put_contents(
+        $dir . '/install_security_report.json',
+        json_encode(install_security_report(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        LOCK_EX
+    );
+};
+$persistInstallSecurityReport();
+
 // ── Auto-create DB schema ────────────────────────────────────
-\App\Models\Schema::install();
+$schemaMarkerPath = static function (): string {
+    $dir = ROOT . '/storage/runtime';
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    return $dir . '/schema_bootstrap_v' . \App\Models\Schema::SCHEMA_VERSION . '.lock';
+};
+$shouldCheckSchema = static function () use ($schemaMarkerPath): bool {
+    if (!is_file(AP_DB_PATH)) return true;
+    $marker = $schemaMarkerPath();
+    if (!is_file($marker)) return true;
+    $lastCheck = (int)@filemtime($marker);
+    return $lastCheck < (time() - 300);
+};
+if ($shouldCheckSchema()) {
+    \App\Models\Schema::install();
+    @file_put_contents($schemaMarkerPath(), now_iso(), LOCK_EX);
+}
 
 $writeGeneratedConfig = static function (array $config): bool {
     $path = ROOT . '/storage/config.generated.php';
@@ -100,8 +149,9 @@ if (!headers_sent()) {
 $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
 if (!str_starts_with($requestPath, '/api/v1/streaming')) {
     defer_after_response(static function (): void {
-        if (throttle_allow('delivery_retry_queue', 30)) {
-            \App\ActivityPub\Delivery::processRetryQueue(\App\ActivityPub\Delivery::requestDrainBatch());
+        $requestDrainBatch = \App\ActivityPub\Delivery::requestDrainBatch();
+        if ($requestDrainBatch > 0 && throttle_allow('delivery_retry_queue', 30)) {
+            \App\ActivityPub\Delivery::processRetryQueue($requestDrainBatch);
         }
         if (throttle_allow('local_status_expiry', 60)) {
             \App\Models\StatusModel::deleteExpiredLocal(25);

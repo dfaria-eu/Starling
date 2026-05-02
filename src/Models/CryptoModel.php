@@ -8,6 +8,35 @@ class CryptoModel
     /** In-memory cache for public keys fetched during this request */
     private static array $keyCache = [];
 
+    private static function actorUrlForSignature(string $keyId, string $actorHint = ''): string
+    {
+        return $keyId !== '' ? self::actorUrlFromKeyId($keyId) : $actorHint;
+    }
+
+    private static function signatureDebugPayload(string $method, string $path, string $actorUrl, string $actorHint, string $signingStr, string $publicKey = ''): array
+    {
+        return [
+            'method' => $method,
+            'path' => $path,
+            'derived_actor_url' => $actorUrl,
+            'actor_hint' => $actorHint,
+            'signing_string' => $signingStr,
+            'public_key_fingerprint' => $publicKey !== '' ? self::pemFingerprint($publicKey) : '',
+        ];
+    }
+
+    private static function signatureResult(bool $ok, string $error, string $keyId, string $actorUrl, string $algorithm, string $headers, array $extra = []): array
+    {
+        return array_merge([
+            'ok' => $ok,
+            'error' => $error,
+            'key_id' => $keyId,
+            'actor_url' => $actorUrl,
+            'algorithm' => $algorithm,
+            'headers' => $headers,
+        ], $extra);
+    }
+
     public static function generateKeyPair(): array
     {
         $res = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
@@ -89,14 +118,7 @@ class CryptoModel
     {
         $sig = $headers['signature'] ?? '';
         if (!$sig) {
-            return [
-                'ok' => false,
-                'error' => 'missing_signature_header',
-                'key_id' => '',
-                'actor_url' => '',
-                'algorithm' => '',
-                'headers' => '',
-            ];
+            return self::signatureResult(false, 'missing_signature_header', '', '', '', '');
         }
 
         $signatureInput = trim((string)($headers['signature-input'] ?? ''));
@@ -116,24 +138,10 @@ class CryptoModel
         }
 
         if (!preg_match('/\bheaders="([^"]+)"/i', $sig, $hm)) {
-            return [
-                'ok' => false,
-                'error' => 'signature_missing_headers_list',
-                'key_id' => $keyId,
-                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
-                'algorithm' => '',
-                'headers' => '',
-            ];
+            return self::signatureResult(false, 'signature_missing_headers_list', $keyId, self::actorUrlForSignature($keyId, $actorHint), '', '');
         }
         if (!preg_match('/\bsignature="([^"]+)"/i', $sig, $sm)) {
-            return [
-                'ok' => false,
-                'error' => 'signature_missing_signature_value',
-                'key_id' => $keyId,
-                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
-                'algorithm' => '',
-                'headers' => $hm[1],
-            ];
+            return self::signatureResult(false, 'signature_missing_signature_value', $keyId, self::actorUrlForSignature($keyId, $actorHint), '', $hm[1]);
         }
         // Reject explicitly stated algorithms outside the accepted set.
         // hs2019 = "algorithm determined by key type" (IETF draft-cavage-http-signatures-12).
@@ -142,14 +150,7 @@ class CryptoModel
         // RSA PKCS#1 v1.5 with SHA-256, which matches our OpenSSL verification.
         $algorithm = preg_match('/\balgorithm="([^"]+)"/i', $sig, $am) ? strtolower($am[1]) : '';
         if ($algorithm !== '' && !in_array($algorithm, ['rsa-sha256', 'rsa-v1_5-sha256', 'hs2019', 'ed25519'], true)) {
-            return [
-                'ok' => false,
-                'error' => 'unsupported_algorithm:' . $algorithm,
-                'key_id' => $keyId,
-                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
-                'algorithm' => $algorithm,
-                'headers' => $hm[1],
-            ];
+            return self::signatureResult(false, 'unsupported_algorithm:' . $algorithm, $keyId, self::actorUrlForSignature($keyId, $actorHint), $algorithm, $hm[1]);
         }
 
         $hdrList = explode(' ', $hm[1]);
@@ -161,14 +162,7 @@ class CryptoModel
         $expires = preg_match('/\bexpires=(\d+)\b/', $sig, $em) ? $em[1] : null;
         $timeError = self::validateSignatureTimeBounds($created, $expires);
         if ($timeError !== '') {
-            return [
-                'ok' => false,
-                'error' => $timeError,
-                'key_id' => $keyId,
-                'actor_url' => $keyId !== '' ? self::actorUrlFromKeyId($keyId) : ($actorHint !== '' ? $actorHint : ''),
-                'algorithm' => $algorithm,
-                'headers' => $hm[1],
-            ];
+            return self::signatureResult(false, $timeError, $keyId, self::actorUrlForSignature($keyId, $actorHint), $algorithm, $hm[1]);
         }
 
         $parts = [];
@@ -234,7 +228,7 @@ class CryptoModel
             }
         }
 
-        $actorUrl = $keyId !== '' ? self::actorUrlFromKeyId($keyId) : $actorHint;
+        $actorUrl = self::actorUrlForSignature($keyId, $actorHint);
         if ($actorUrl === '') {
             return [
                 'ok' => false,
@@ -257,14 +251,7 @@ class CryptoModel
                 : self::fetchSingleActorPublicKey($actorHint);
         }
         if ($pub && self::_verifySig($signingStr, $sigB64, $pub)) {
-            return [
-                'ok' => true,
-                'error' => '',
-                'key_id' => $keyId,
-                'actor_url' => $actorUrl,
-                'algorithm' => $algorithm,
-                'headers' => $hm[1],
-            ];
+            return self::signatureResult(true, '', $keyId, $actorUrl, $algorithm, $hm[1]);
         }
 
         // If verification failed, the remote actor may have rotated their key.
@@ -281,14 +268,9 @@ class CryptoModel
             }
         }
         if (!$actor) {
-            return [
-                'ok' => false,
-                'error' => $pub ? 'signature_mismatch_after_cached_key' : 'public_key_fetch_failed',
-                'key_id' => $keyId,
-                'actor_url' => $actorUrl,
-                'algorithm' => $algorithm,
-                'headers' => $hm[1],
-            ];
+            return self::signatureResult(false, $pub ? 'signature_mismatch_after_cached_key' : 'public_key_fetch_failed', $keyId, $actorUrl, $algorithm, $hm[1], [
+                'debug' => self::signatureDebugPayload($method, $path, $actorUrl, $actorHint, $signingStr, $pub ?: ''),
+            ]);
         }
         $freshPem = $keyId !== ''
             ? self::extractKeyByIdFromRawJson($actor['raw_json'] ?? '', $keyId)
@@ -306,24 +288,12 @@ class CryptoModel
         self::$keyCache[$cacheKey] = $freshPem;
 
         if (self::_verifySig($signingStr, $sigB64, $freshPem)) {
-            return [
-                'ok' => true,
-                'error' => '',
-                'key_id' => $keyId,
-                'actor_url' => $actorUrl,
-                'algorithm' => $algorithm,
-                'headers' => $hm[1],
-            ];
+            return self::signatureResult(true, '', $keyId, $actorUrl, $algorithm, $hm[1]);
         }
 
-        return [
-            'ok' => false,
-            'error' => $pub ? 'signature_mismatch_after_refresh' : 'signature_mismatch',
-            'key_id' => $keyId,
-            'actor_url' => $actorUrl,
-            'algorithm' => $algorithm,
-            'headers' => $hm[1],
-        ];
+        return self::signatureResult(false, $pub ? 'signature_mismatch_after_refresh' : 'signature_mismatch', $keyId, $actorUrl, $algorithm, $hm[1], [
+            'debug' => self::signatureDebugPayload($method, $path, $actorUrl, $actorHint, $signingStr, $freshPem),
+        ]);
     }
 
     /**
@@ -476,6 +446,13 @@ class CryptoModel
                 'actor_url' => $actorUrl,
                 'algorithm' => $alg,
                 'headers' => $componentsRaw,
+                'debug' => [
+                    'method' => $method,
+                    'path' => $path,
+                    'derived_actor_url' => $actorUrl,
+                    'actor_hint' => $actorHint,
+                    'signing_string' => $signingStr,
+                ],
             ];
         }
 
@@ -495,6 +472,14 @@ class CryptoModel
                 'actor_url' => $actorUrl,
                 'algorithm' => $alg,
                 'headers' => $componentsRaw,
+                'debug' => [
+                    'method' => $method,
+                    'path' => $path,
+                    'derived_actor_url' => $actorUrl,
+                    'actor_hint' => $actorHint,
+                    'signing_string' => $signingStr,
+                    'public_key_fingerprint' => self::pemFingerprint($pub),
+                ],
             ];
     }
 
@@ -651,6 +636,14 @@ class CryptoModel
         $sigRaw = base64_decode($sigB64, true);
         if ($sigRaw === false) return false;
         return openssl_verify($signingStr, $sigRaw, $key, OPENSSL_ALGO_SHA256) === 1;
+    }
+
+    private static function pemFingerprint(string $pubPem): string
+    {
+        $stripped = str_replace(["\n", "\r", "-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----"], '', $pubPem);
+        $der = base64_decode(trim($stripped), true);
+        if ($der === false || $der === '') return '';
+        return 'sha256:' . base64_encode(hash('sha256', $der, true));
     }
 
     /**

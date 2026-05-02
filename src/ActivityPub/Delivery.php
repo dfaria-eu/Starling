@@ -104,6 +104,21 @@ class Delivery
         } while ($cycles < self::wakeFallbackMaxCycles() && self::hasDueRetries());
     }
 
+    private static function isInteractiveRequestContext(): bool
+    {
+        $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?? '/';
+        if ($requestPath === '/internal/queue-wake') return false;
+        if (str_starts_with($requestPath, '/inbox')) return false;
+        if (str_starts_with($requestPath, '/users/') && str_ends_with($requestPath, '/inbox')) return false;
+        if (str_starts_with($requestPath, '/api/v1/streaming')) return false;
+        return true;
+    }
+
+    private static function drainWakeFallbackInteractive(): void
+    {
+        self::processRetryQueue(1);
+    }
+
     private static function isQueueableUrl(string $url): bool
     {
         $parts = parse_url($url);
@@ -493,12 +508,17 @@ class Delivery
         // fall back to draining a small local slice after the response instead of leaving
         // the queue stuck until the next incoming request.
         if ($ok === false || $code >= 400 || $code === 0) {
+            $interactive = self::isInteractiveRequestContext();
             self::logQueue('wake_fallback', [
                 'http_code' => $code,
                 'curl_ok' => $ok !== false,
-                'mode' => 'local_drain',
+                'mode' => $interactive ? 'interactive_local_drain' : 'local_drain',
             ], 'wake_fallback', 30);
-            self::drainWakeFallback();
+            if ($interactive) {
+                self::drainWakeFallbackInteractive();
+            } else {
+                self::drainWakeFallback();
+            }
         }
     }
 

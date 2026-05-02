@@ -483,6 +483,24 @@ class AdminCtrl
         $this->redirect('/admin/federation');
     }
 
+    public function federationRefetchActor(array $p): void
+    {
+        $this->requireAuth();
+        $this->requirePost();
+        $actorUrl = trim((string)($_POST['actor_url'] ?? ''));
+        if ($actorUrl === '') {
+            $this->flash('error', 'Actor URL is required.');
+            $this->redirect('/admin/federation');
+        }
+        $result = AdminModel::refetchRemoteActor($actorUrl);
+        if (!empty($result['ok'])) {
+            $this->flash('success', 'Actor refreshed: <strong>' . htmlspecialchars($actorUrl, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</strong>');
+        } else {
+            $this->flash('error', 'Could not refresh actor: <strong>' . htmlspecialchars($actorUrl, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '</strong> (' . htmlspecialchars((string)($result['error'] ?? 'unknown_error'), ENT_QUOTES | ENT_HTML5, 'UTF-8') . ')');
+        }
+        $this->redirect('/admin/federation');
+    }
+
     public function settings(array $p): void
     {
         $this->requireAuth();
@@ -500,6 +518,7 @@ class AdminCtrl
         $description = trim((string)($_POST['description'] ?? ''));
         $sourceUrl = rtrim(trim((string)($_POST['source_url'] ?? '')), '/');
         $atprotoDid = trim((string)($_POST['atproto_did'] ?? ''));
+        $oauthTokenTtlDays = max(0, min(3650, (int)($_POST['oauth_token_ttl_days'] ?? 0)));
         $openReg = !empty($_POST['open_reg']);
 
         $scheme = (string)parse_url($baseUrl, PHP_URL_SCHEME);
@@ -544,6 +563,7 @@ class AdminCtrl
         $current['software'] = $current['software'] ?? AP_SOFTWARE;
         $current['source_url'] = $sourceUrl !== '' ? $sourceUrl : $baseUrl;
         $current['atproto_did'] = $atprotoDid;
+        $current['oauth_token_ttl_days'] = $oauthTokenTtlDays;
 
         $this->writeGeneratedConfig($current);
         $admin = AdminModel::currentAdmin();
@@ -553,7 +573,7 @@ class AdminCtrl
             'instance',
             AP_DOMAIN,
             'Updated instance settings.',
-            ['site_name' => $siteName, 'base_url' => $baseUrl, 'admin_email' => strtolower($adminEmail), 'open_reg' => $openReg]
+            ['site_name' => $siteName, 'base_url' => $baseUrl, 'admin_email' => strtolower($adminEmail), 'open_reg' => $openReg, 'oauth_token_ttl_days' => $oauthTokenTtlDays]
         );
         $this->flash('success', 'Instance settings saved. Reload the app to see all changes reflected everywhere.');
         $this->redirect('/admin/settings');
@@ -577,6 +597,23 @@ class AdminCtrl
         $row = AdminModel::inboxLogDetail($p['id']);
         if (!$row) { $this->flash('error', 'Entry not found.'); $this->redirect('/admin/inbox-log'); }
         $this->html($this->layout('Detail — Inbox Log', $this->inboxDetailContent($row)));
+    }
+
+    public function retryInboxLog(array $p): void
+    {
+        $this->requireAuth();
+        $this->requirePost();
+        $id = (string)($p['id'] ?? '');
+        $result = AdminModel::retryInboxLogEntry($id);
+        if (empty($result['ok'])) {
+            $this->flash('error', 'Retry failed: ' . htmlspecialchars((string)($result['error'] ?? 'unknown_error'), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            $this->redirect('/admin/inbox-log/' . rawurlencode($id));
+        }
+        $msg = !empty($result['accepted'])
+            ? 'Inbox entry reprocessed and accepted. A new inbox log entry was created.'
+            : 'Inbox entry reprocessed and rejected again. A new inbox log entry was created.';
+        $this->flash('success', $msg);
+        $this->redirect('/admin/inbox-log/' . rawurlencode($id));
     }
 
     // ── Maintenance ───────────────────────────────────────────
@@ -1896,6 +1933,17 @@ HTML;
 </div>
 
 <div class="section">
+  <div class="section-title">Refetch actor now</div>
+  <form method="POST" action="/admin/federation/refetch-actor" class="form-row">
+    <div class="form-group" style="min-width:420px">
+      <label>Actor URL</label>
+      <input type="url" name="actor_url" placeholder="https://example.social/users/alice" style="width:100%" required>
+    </div>
+    <div class="form-group"><label>&nbsp;</label><button class="btn btn-primary">Refetch actor</button></div>
+  </form>
+</div>
+
+<div class="section">
   <div class="section-title">Blocked domains ({$e(count($blocked))})</div>
   <div class="tbl-wrap">
     <table><thead><tr><th>Domain</th><th>Blocked by</th><th>Date</th><th></th></tr></thead>
@@ -1928,10 +1976,57 @@ HTML;
         $description = $generated['description'] ?? AP_DESCRIPTION;
         $sourceUrl = $generated['source_url'] ?? AP_SOURCE_URL;
         $atprotoDid = $generated['atproto_did'] ?? AP_ATPROTO_DID;
+        $oauthTokenTtlDays = (int)($generated['oauth_token_ttl_days'] ?? oauth_token_ttl_days());
         $openReg = !empty($generated['open_reg']) || AP_OPEN_REG;
         $openChecked = $openReg ? ' checked' : '';
+        $health = runtime_health_report(true);
+        $install = install_security_report();
+        $healthCards = [
+            ['label' => 'DB writable', 'value' => !empty($health['checks']['db_writable']) ? 'Yes' : 'No'],
+            ['label' => 'Runtime writable', 'value' => !empty($health['checks']['runtime_writable']) ? 'Yes' : 'No'],
+            ['label' => 'Media writable', 'value' => !empty($health['checks']['media_writable']) ? 'Yes' : 'No'],
+            ['label' => 'Auto maintenance', 'value' => !empty($health['checks']['auto_maintenance_enabled']) ? 'Enabled' : 'Disabled'],
+            ['label' => 'Queue due', 'value' => (string)($health['details']['delivery_queue_due'] ?? 'n/a')],
+            ['label' => 'Token TTL', 'value' => $oauthTokenTtlDays > 0 ? $oauthTokenTtlDays . ' days' : 'Disabled'],
+        ];
+        $healthCardsHtml = '';
+        foreach ($healthCards as $card) {
+            $healthCardsHtml .= "<div class='card'><div class='card-label'>{$e($card['label'])}</div><div class='card-value'>{$e($card['value'])}</div></div>";
+        }
+        $installHtml = '';
+        foreach ($install['checks'] as $check) {
+            $badge = $check['result'] === 'blocked'
+                ? 'badge-green'
+                : ($check['result'] === 'exposed' ? 'badge-red' : 'badge-amber');
+            $label = $check['result'] === 'blocked'
+                ? 'BLOCKED'
+                : ($check['result'] === 'exposed' ? 'EXPOSED' : 'UNCLEAR');
+            $status = $check['status'] !== null ? 'HTTP ' . (int)$check['status'] : 'No HTTP status';
+            $installHtml .= "<div class='card' style='margin-bottom:.75rem'><div style='display:flex;gap:.5rem;align-items:center;margin-bottom:.45rem;flex-wrap:wrap'><span class='badge {$badge}'>{$label}</span><span class='card-label'>{$e($check['label'])}</span><span class='card-sub'>{$e($status)}</span></div><div class='card-sub'>{$e($check['message'])}</div><div class='card-sub' style='margin-top:.35rem'><code>{$e($check['path'])}</code></div></div>";
+        }
+        if ($installHtml === '') {
+            $installHtml = "<div class='card'><div class='card-sub'>No live install checks were available.</div></div>";
+        }
+        $installNotesHtml = '';
+        foreach ($install['notes'] as $note) {
+            $installNotesHtml .= "<div class='card-sub' style='margin-top:.45rem'>{$e($note)}</div>";
+        }
 
         return <<<HTML
+<div class="section">
+  <div class="section-title">Runtime health</div>
+  <div class="cards" style="margin-bottom:1rem">{$healthCardsHtml}</div>
+  <div class="card">
+    <div class="card-sub">Health JSON is also available to administrators at <code>/api/v1/instance/health</code>.</div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">Install hardening</div>
+  {$installHtml}
+  <div class="card">{$installNotesHtml}</div>
+</div>
+
 <div class="section">
   <div class="section-title">Instance settings</div>
   <form method="POST" action="/admin/settings" class="form-row">
@@ -1959,6 +2054,10 @@ HTML;
       <label>AT Protocol DID</label>
       <input type="text" name="atproto_did" value="{$e($atprotoDid)}" placeholder="did:plc:...">
     </div>
+    <div class="form-group" style="min-width:220px">
+      <label>OAuth token max age (days)</label>
+      <input type="number" min="0" max="3650" name="oauth_token_ttl_days" value="{$e($oauthTokenTtlDays)}" placeholder="0">
+    </div>
     <div class="form-group" style="min-width:180px">
       <label>&nbsp;</label>
       <label style="display:flex;align-items:center;gap:.45rem;cursor:pointer;text-transform:none;letter-spacing:0">
@@ -1976,6 +2075,7 @@ HTML;
   <div class="section-title">Notes</div>
   <div class="card" style="max-width:860px">
     <div class="card-sub">These settings are stored in <code>storage/config.generated.php</code>. Changing the base URL or domain after federation has already started can break identifiers and remote references, so do that only with care.</div>
+    <div class="card-sub" style="margin-top:.55rem">OAuth token max age is disabled when set to <code>0</code>. When enabled, tokens are revoked lazily on their next authenticated use.</div>
   </div>
 </div>
 HTML;
@@ -1990,10 +2090,16 @@ HTML;
         foreach ($data['rows'] as $r) {
             $hasErr  = $r['error'] !== '';
             $errBadge= $hasErr ? "<span class='badge badge-red'>error</span>" : "<span class='badge badge-green'>ok</span>";
+            $requestLine = trim((string)($r['request_method'] ?? '')) !== ''
+                ? $e(trim((string)$r['request_method']) . ' ' . trim((string)($r['request_path'] ?? '')))
+                : '—';
+            $remoteIp = trim((string)($r['remote_ip'] ?? '')) !== '' ? $e($r['remote_ip']) : '—';
             $rows .= "<tr>
               <td class='td-mono' style='font-size:.7rem'>{$e($this->fmtDateTime($r['created_at'] ?? ''))}</td>
               <td><span class='badge badge-blue'>{$e($r['type'])}</span></td>
               <td class='td-mono td-dim' style='font-size:.7rem;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{$e($r['actor_url'])}</td>
+              <td class='td-mono td-dim' style='font-size:.68rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{$requestLine}</td>
+              <td class='td-mono td-dim' style='font-size:.68rem'>{$remoteIp}</td>
               <td>$errBadge</td>
               <td><a href='/admin/inbox-log/{$e($r['id'])}' class='btn btn-sm btn-ghost'>View</a></td>
             </tr>";
@@ -2026,7 +2132,7 @@ HTML;
 <div style="font-size:.75rem;color:var(--text3);margin-bottom:.8rem">{$e($data['total'])} entries</div>
 <div class="tbl-wrap">
   <table>
-    <thead><tr><th>Date</th><th>Type</th><th>Actor</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Date</th><th>Type</th><th>Actor</th><th>Request</th><th>IP</th><th>Status</th><th></th></tr></thead>
     <tbody>{$rows}</tbody>
   </table>
 </div>
@@ -2039,22 +2145,46 @@ HTML;
         $e    = fn($v) => htmlspecialchars((string)$v, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         $json = json_encode(json_decode($r['raw_json']), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         $sigHeaders = json_decode((string)($r['sig_headers'] ?? '{}'), true);
+        $sigDebug = json_decode((string)($r['sig_debug'] ?? '{}'), true);
         $sigJson = '';
         if (is_array($sigHeaders) && $sigHeaders) {
             $sigJson = json_encode($sigHeaders, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         }
+        $sigDebugJson = '';
+        if (is_array($sigDebug) && $sigDebug) {
+            $sigDebugJson = json_encode($sigDebug, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+        $requestParts = [];
+        if (($r['request_method'] ?? '') !== '' || ($r['request_path'] ?? '') !== '') {
+            $requestParts[] = trim((string)($r['request_method'] ?? '')) . ' ' . trim((string)($r['request_path'] ?? ''));
+        }
+        if (($r['request_host'] ?? '') !== '') {
+            $requestParts[] = 'host=' . trim((string)$r['request_host']);
+        }
+        if (($r['remote_ip'] ?? '') !== '') {
+            $requestParts[] = 'ip=' . trim((string)$r['remote_ip']);
+        }
+        $requestSummary = $requestParts ? implode(' · ', array_filter($requestParts)) : '—';
+        $actorUrl = trim((string)($r['actor_url'] ?? ''));
         $errHtml = $r['error'] ? "<div class='flash flash-error' style='margin-bottom:1rem'><strong>Error:</strong> {$e($r['error'])}</div>" : '';
         $sigHtml = $sigJson !== '' ? "<div class=\"section-title\">Signature headers</div>\n<pre class=\"code\">{$e($sigJson)}</pre>" : '';
+        $sigDebugHtml = $sigDebugJson !== '' ? "<div class=\"section-title\">Signature debug</div>\n<pre class=\"code\">{$e($sigDebugJson)}</pre>" : '';
+        $retryForm = "<form method=\"POST\" action=\"/admin/inbox-log/{$e($r['id'])}/retry\" style=\"display:inline-flex\"><button class=\"btn btn-primary btn-sm\" type=\"submit\">Retry verification</button></form>";
+        $refetchForm = $actorUrl !== ''
+            ? "<form method=\"POST\" action=\"/admin/federation/refetch-actor\" style=\"display:inline-flex\"><input type=\"hidden\" name=\"actor_url\" value=\"{$e($actorUrl)}\"><button class=\"btn btn-ghost btn-sm\" type=\"submit\">Refetch actor now</button></form>"
+            : '';
 
         return <<<HTML
-<div style="margin-bottom:1rem"><a href="/admin/inbox-log" class="btn btn-ghost btn-sm">← Back</a></div>
+<div style="margin-bottom:1rem;display:flex;gap:.6rem;flex-wrap:wrap;align-items:center"><a href="/admin/inbox-log" class="btn btn-ghost btn-sm">← Back</a>{$retryForm}{$refetchForm}</div>
 {$errHtml}
 <div class="cards" style="grid-template-columns:repeat(3,auto) 1fr;gap:.6rem;margin-bottom:1.5rem">
   <div class="card"><div class="card-label">Type</div><div style="color:var(--blue);font-weight:600">{$e($r['type'])}</div></div>
   <div class="card"><div class="card-label">Date</div><div class="card-value" style="font-size:.9rem">{$e($this->fmtDateTime($r['created_at'] ?? ''))}</div></div>
   <div class="card"><div class="card-label">Actor</div><div class="card-value" style="font-size:.7rem;word-break:break-all">{$e($r['actor_url'])}</div></div>
+  <div class="card"><div class="card-label">Request</div><div class="card-value" style="font-size:.72rem;word-break:break-all">{$e($requestSummary)}</div></div>
 </div>
 {$sigHtml}
+{$sigDebugHtml}
 <div class="section-title">Raw activity JSON</div>
 <pre class="code">{$e($json)}</pre>
 HTML;

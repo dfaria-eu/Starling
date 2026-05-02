@@ -232,6 +232,10 @@ class WebClientCtrl
             echo 'Access denied.';
             exit;
         }
+        // Close the web CSRF session before opening the dedicated admin session.
+        // Otherwise PHP keeps using the current session name and the admin login
+        // state gets written into the wrong cookie namespace.
+        session_write_close();
         \App\Models\AdminModel::startSession();
         session_regenerate_id(true);
         $_SESSION['admin_user_id'] = $user['id'];
@@ -242,111 +246,99 @@ class WebClientCtrl
 
     public function home(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('HOME', null, $user, $token));
+        $this->renderShellView('HOME');
     }
 
     public function local(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('LOCAL', null, $user, $token));
+        $this->renderShellView('LOCAL');
     }
 
     public function notifications(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('NOTIFICATIONS', null, $user, $token));
+        $this->renderShellView('NOTIFICATIONS');
     }
 
     public function thread(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('THREAD', $p['id'], $user, $token));
+        $this->renderShellView('THREAD', (string)$p['id']);
     }
 
     public function profile(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('PROFILE', $p['id'], $user, $token));
+        $this->renderShellView('PROFILE', (string)$p['id']);
     }
 
     public function followers(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('FOLLOWERS', $p['id'], $user, $token));
+        $this->renderShellView('FOLLOWERS', (string)$p['id']);
     }
 
     public function following(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('FOLLOWING', $p['id'], $user, $token));
+        $this->renderShellView('FOLLOWING', (string)$p['id']);
     }
 
     public function tagTimeline(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('TAG_TIMELINE', urldecode((string)$p['id']), $user, $token));
+        $this->renderShellView('TAG_TIMELINE', urldecode((string)$p['id']));
     }
 
     public function search(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('SEARCH', null, $user, $token));
+        $this->renderShellView('SEARCH');
     }
 
     public function favourites(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('FAVOURITES', null, $user, $token));
+        $this->renderShellView('FAVOURITES');
     }
 
     public function bookmarks(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('BOOKMARKS', null, $user, $token));
+        $this->renderShellView('BOOKMARKS');
     }
 
     public function conversations(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('CONVERSATIONS', null, $user, $token));
+        $this->renderShellView('CONVERSATIONS');
     }
 
     public function settings(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('SETTINGS', null, $user, $token));
+        $this->renderShellView('SETTINGS');
     }
 
     public function intentCompose(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
         $text = substr(trim($_GET['text'] ?? ''), 0, AP_POST_CHARS);
-        $this->html($this->shell('HOME', null, $user, $token, $text ?: null));
+        $this->renderShellView('HOME', null, $text ?: null);
     }
 
     public function explore(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('EXPLORE', null, $user, $token));
+        $this->renderShellView('EXPLORE');
     }
 
     public function lists(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('LISTS', null, $user, $token));
+        $this->renderShellView('LISTS');
     }
 
     public function listTimeline(array $p): void
     {
-        [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('LIST_TIMELINE', $p['id'], $user, $token));
+        $this->renderShellView('LIST_TIMELINE', (string)$p['id']);
     }
 
     public function editProfile(array $p): void
     {
+        $this->renderShellView('EDIT_PROFILE');
+    }
+
+    private function renderShellView(string $view, ?string $viewId = null, ?string $composeText = null): void
+    {
         [$user, $token] = $this->requireAuth();
-        $this->html($this->shell('EDIT_PROFILE', null, $user, $token));
+        $this->html($this->shell($view, $viewId, $user, $token, $composeText));
     }
 
     // ── Output helpers ────────────────────────────────────────────────────────
@@ -372,58 +364,11 @@ class WebClientCtrl
     private function shell(string $view, ?string $viewId, array $user, string $token, ?string $composeText = null): string
     {
         $this->startSession();
-        $bootData = [
-            'token'         => $token,
-            'domain'        => AP_DOMAIN,
-            'myId'          => $user['id'],
-            'myUsername'    => $user['username'],
-            'myDisplayName' => $user['display_name'] ?: $user['username'],
-            'myAvatar'      => local_media_url_or_fallback($user['avatar'] ?? '', '/img/avatar.svg'),
-            'isAdmin'       => (bool)$user['is_admin'],
-            'webCsrf'       => $_SESSION['web_csrf'] ?? '',
-            'postChars'     => AP_POST_CHARS,
-            'view'          => $view,
-            'viewId'        => $viewId,
-            'composeText'   => $composeText,
-        ];
+        $bootData = $this->shellBootData($view, $viewId, $user, $token, $composeText);
         $bootJson = json_encode($bootData, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP);
         $domain   = htmlspecialchars(AP_DOMAIN, ENT_QUOTES);
         $webCsrf  = htmlspecialchars((string)($_SESSION['web_csrf'] ?? ''), ENT_QUOTES);
-
-        $navLinks = [
-            ['view' => 'HOME',          'label' => 'Home',
-             'icon'  => '<path d="M12 3L4 10v10h5v-6h6v6h5V10L12 3zm0 2.84L18 11v7h-3v-6H9v6H6v-7l6-5.16z"/>',
-             'iconA' => '<path d="M12 3L4 10v10h5v-6h6v6h5V10L12 3z"/>'],
-            ['view' => 'EXPLORE',       'label' => 'Explore',
-             'icon'  => '<path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>',
-             'iconA' => '<path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>'],
-            ['view' => 'NOTIFICATIONS', 'label' => 'Notifications',
-             'icon'  => '<path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2zm-2 1H8v-6c0-2.48 1.51-4.5 4-4.5s4 2.02 4 4.5v6z"/>',
-             'iconA' => '<path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/>'],
-            ['view' => 'CONVERSATIONS', 'label' => 'Conversations',
-             'icon'  => '<path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/>',
-             'iconA' => '<path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/>'],
-            ['view' => 'LISTS',         'label' => 'Lists',
-             'icon'  => '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>',
-             'iconA' => '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>'],
-            ['view' => 'PROFILE',       'label' => 'Profile',
-             'icon'  => '<path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>',
-             'iconA' => '<path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>'],
-            ['view' => 'SETTINGS',      'label' => 'Settings',
-             'icon'  => '<path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>',
-             'iconA' => '<path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>'],
-        ];
-
-        $navHtml = '';
-        foreach ($navLinks as $nl) {
-            $dataView  = htmlspecialchars($nl['view'], ENT_QUOTES);
-            $label     = htmlspecialchars($nl['label'], ENT_QUOTES);
-            $navHtml  .= '<a class="nav-link" data-view="' . $dataView . '" href="#" title="' . $label . '">'
-                       . '<svg class="nav-icon" viewBox="0 0 24 24">' . $nl['icon'] . '</svg>'
-                       . '<svg class="nav-icon-active" viewBox="0 0 24 24">' . ($nl['iconA'] ?? $nl['icon']) . '</svg>'
-                       . '<span>' . $label . '</span>'
-                       . '</a>' . "\n";
-        }
+        $navHtml  = $this->renderShellNavigation($this->shellNavLinks());
 
         return '<!DOCTYPE html>
 <html lang="en">
@@ -634,6 +579,66 @@ class WebClientCtrl
 <script>' . $this->js() . '</script>
 </body>
 </html>';
+    }
+
+    private function shellBootData(string $view, ?string $viewId, array $user, string $token, ?string $composeText = null): array
+    {
+        return [
+            'token'         => $token,
+            'domain'        => AP_DOMAIN,
+            'myId'          => $user['id'],
+            'myUsername'    => $user['username'],
+            'myDisplayName' => $user['display_name'] ?: $user['username'],
+            'myAvatar'      => local_media_url_or_fallback($user['avatar'] ?? '', '/img/avatar.svg'),
+            'isAdmin'       => (bool)$user['is_admin'],
+            'webCsrf'       => $_SESSION['web_csrf'] ?? '',
+            'postChars'     => AP_POST_CHARS,
+            'view'          => $view,
+            'viewId'        => $viewId,
+            'composeText'   => $composeText,
+        ];
+    }
+
+    private function shellNavLinks(): array
+    {
+        return [
+            ['view' => 'HOME',          'label' => 'Home',
+             'icon'  => '<path d="M12 3L4 10v10h5v-6h6v6h5V10L12 3zm0 2.84L18 11v7h-3v-6H9v6H6v-7l6-5.16z"/>',
+             'iconA' => '<path d="M12 3L4 10v10h5v-6h6v6h5V10L12 3z"/>'],
+            ['view' => 'EXPLORE',       'label' => 'Explore',
+             'icon'  => '<path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>',
+             'iconA' => '<path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>'],
+            ['view' => 'NOTIFICATIONS', 'label' => 'Notifications',
+             'icon'  => '<path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2zm-2 1H8v-6c0-2.48 1.51-4.5 4-4.5s4 2.02 4 4.5v6z"/>',
+             'iconA' => '<path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/>'],
+            ['view' => 'CONVERSATIONS', 'label' => 'Conversations',
+             'icon'  => '<path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/>',
+             'iconA' => '<path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/>'],
+            ['view' => 'LISTS',         'label' => 'Lists',
+             'icon'  => '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>',
+             'iconA' => '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>'],
+            ['view' => 'PROFILE',       'label' => 'Profile',
+             'icon'  => '<path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>',
+             'iconA' => '<path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>'],
+            ['view' => 'SETTINGS',      'label' => 'Settings',
+             'icon'  => '<path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>',
+             'iconA' => '<path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>'],
+        ];
+    }
+
+    private function renderShellNavigation(array $navLinks): string
+    {
+        $navHtml = '';
+        foreach ($navLinks as $nl) {
+            $dataView  = htmlspecialchars($nl['view'], ENT_QUOTES);
+            $label     = htmlspecialchars($nl['label'], ENT_QUOTES);
+            $navHtml  .= '<a class="nav-link" data-view="' . $dataView . '" href="#" title="' . $label . '">'
+                       . '<svg class="nav-icon" viewBox="0 0 24 24">' . $nl['icon'] . '</svg>'
+                       . '<svg class="nav-icon-active" viewBox="0 0 24 24">' . ($nl['iconA'] ?? $nl['icon']) . '</svg>'
+                       . '<span>' . $label . '</span>'
+                       . '</a>' . "\n";
+        }
+        return $navHtml;
     }
 
     // ── Login page ────────────────────────────────────────────────────────────
@@ -5309,7 +5314,7 @@ let _sse = null, _pendingPosts = 0, _pendingNotifs = 0, _sseDelay = 2000;
 function startStreaming() {
     if (_sse) return;
     try {
-        const url = '/api/v1/streaming/user?access_token=' + encodeURIComponent(WCFG.token);
+        const url = '/api/v1/streaming/user';
         _sse = new EventSource(url);
         _sse.addEventListener('open', () => { _sseDelay = 2000; });
         _sse.addEventListener('update', e => {
@@ -5399,17 +5404,7 @@ async function checkUnreadNotifications() {
 }
 
 function updateNewPostsBtn() {
-    const label = _pendingPosts > 99 ? '99+' : String(_pendingPosts);
-    document.querySelectorAll('[data-view="HOME"]').forEach(el => {
-        let badge = el.querySelector('.notif-badge');
-        if (!badge) {
-            badge = document.createElement('span');
-            badge.className = 'notif-badge';
-            el.appendChild(badge);
-        }
-        badge.style.display = _pendingPosts > 0 ? '' : 'none';
-        badge.textContent = label;
-    });
+    document.querySelectorAll('[data-view="HOME"] .notif-badge').forEach(el => el.remove());
     // Floating pill (only when on HOME view)
     const pill = document.getElementById('new-posts-pill');
     if (pill) {

@@ -117,12 +117,13 @@ class InboxProcessor
         DB::run('UPDATE statuses SET reply_count=? WHERE id=?', [$count, $statusId]);
     }
 
-    public static function process(array $activity, array $headers, string $method, string $path, string $rawBody = ''): bool
+    public static function process(array $activity, array $headers, string $method, string $path, string $rawBody = '', array $requestMeta = []): bool
     {
         $type    = $activity['type'] ?? '';
         $actorId = is_string($activity['actor'] ?? null)
             ? $activity['actor']
             : ($activity['actor']['id'] ?? '');
+        $requestMeta = self::normalizeRequestMeta($requestMeta, $method, $path, $headers);
 
         // ── 1. Domain block check ─────────────────────────────
         if ($actorId) {
@@ -184,7 +185,11 @@ class InboxProcessor
                     if ($rsaDetail !== '') $sigError .= ' rsa=' . $rsaDetail;
                     if ($algo !== '') $sigError .= ' alg=' . $algo;
                     if ($headersList !== '') $sigError .= ' headers=' . $headersList;
-                    self::log($actorId, $type, $activity, $sigError, $headers);
+                    self::log($actorId, $type, $activity, $sigError, $headers, [
+                        'request' => ['method' => $method, 'path' => $path],
+                        'http_signature' => $httpSigResult,
+                        'rsa_signature' => $rsaSigResult,
+                    ], $requestMeta);
                     return false;
                     }
                 }
@@ -206,7 +211,10 @@ class InboxProcessor
                 $sigError = 'Missing HTTP Signature — rejected';
                 $rsaDetail = trim((string)($rsaSigResult['error'] ?? ''));
                 if ($rsaDetail !== '') $sigError .= ' rsa=' . $rsaDetail;
-                self::log($actorId, $type, $activity, $sigError, $headers);
+                self::log($actorId, $type, $activity, $sigError, $headers, [
+                    'request' => ['method' => $method, 'path' => $path],
+                    'rsa_signature' => $rsaSigResult,
+                ], $requestMeta);
                 return false;
                 } else {
                 $sigError = '';
@@ -215,7 +223,7 @@ class InboxProcessor
         }
 
         // ── 3. Log ────────────────────────────────────────────
-        self::log($actorId, $type, $activity, $sigError, $headers);
+        self::log($actorId, $type, $activity, $sigError, $headers, [], $requestMeta);
 
         // ── 4. Ensure actor is cached ────────────────────────
         if ($actorId) RemoteActorModel::fetch($actorId);
@@ -1919,13 +1927,32 @@ class InboxProcessor
         return 'direct';
     }
 
-    private static function log(string $actor, string $type, array $activity, string $error = '', array $headers = []): void
+    private static function normalizeRequestMeta(array $requestMeta, string $method, string $path, array $headers): array
+    {
+        return [
+            'method' => strtoupper(trim((string)($requestMeta['method'] ?? $method))),
+            'path' => trim((string)($requestMeta['path'] ?? $path)),
+            'host' => trim((string)($requestMeta['host'] ?? ($headers['host'] ?? ''))),
+            'remote_ip' => trim((string)($requestMeta['remote_ip'] ?? '')),
+            'retry_of' => trim((string)($requestMeta['retry_of'] ?? '')),
+            'retry_reason' => trim((string)($requestMeta['retry_reason'] ?? '')),
+        ];
+    }
+
+    private static function log(string $actor, string $type, array $activity, string $error = '', array $headers = [], array $sigDebug = [], array $requestMeta = []): void
     {
         try {
+            $requestMeta = self::normalizeRequestMeta($requestMeta, 'POST', '/inbox', $headers);
             $sigHeaders = [];
             foreach (['signature', 'signature-input', 'digest', 'content-digest', 'date', 'host', 'user-agent', 'content-type'] as $name) {
                 $value = trim((string)($headers[$name] ?? ''));
                 if ($value !== '') $sigHeaders[$name] = $value;
+            }
+            if ($requestMeta['retry_of'] !== '' || $requestMeta['retry_reason'] !== '') {
+                $sigDebug['retry'] = array_filter([
+                    'of' => $requestMeta['retry_of'],
+                    'reason' => $requestMeta['retry_reason'],
+                ], static fn ($value): bool => $value !== '');
             }
             DB::insert('inbox_log', [
                 'id'         => uuid(),
@@ -1934,6 +1961,11 @@ class InboxProcessor
                 'raw_json'   => json_encode($activity),
                 'error'      => $error,
                 'sig_headers'=> json_encode($sigHeaders, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                'sig_debug'  => json_encode($sigDebug, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                'request_method' => $requestMeta['method'],
+                'request_path' => $requestMeta['path'],
+                'request_host' => $requestMeta['host'],
+                'remote_ip'  => $requestMeta['remote_ip'],
                 'created_at' => now_iso(),
             ]);
         } catch (\Throwable) { /* non-fatal */ }

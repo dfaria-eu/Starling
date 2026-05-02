@@ -179,17 +179,38 @@ class OAuthModel
 
     public static function tokenByValue(string $tok): ?array
     {
-        return DB::one('SELECT * FROM oauth_tokens WHERE token=?', [$tok]);
+        $row = DB::one('SELECT * FROM oauth_tokens WHERE token=?', [$tok]);
+        if ($row && oauth_token_is_expired($row)) {
+            DB::delete('oauth_tokens', 'token=?', [$tok]);
+            return null;
+        }
+        return $row;
     }
 
     public static function userByToken(string $tok): ?array
     {
         $row = self::tokenByValue($tok);
         if (!$row || !$row['user_id']) return null;
-        DB::update('oauth_tokens', ['last_used' => now_iso()], 'token=?', [$tok]);
+        self::touchTokenUsage($row);
         $user = UserModel::byId($row['user_id']);
         if (!$user || !empty($user['is_suspended'])) return null;
         return $user;
+    }
+
+    public static function touchTokenUsage(array|string $token, int $minIntervalSeconds = 900): void
+    {
+        $row = is_array($token) ? $token : self::tokenByValue($token);
+        if (!$row || empty($row['token'])) return;
+
+        $lastUsed = trim((string)($row['last_used'] ?? ''));
+        if ($lastUsed !== '') {
+            $lastUsedTs = strtotime($lastUsed);
+            if ($lastUsedTs !== false && $lastUsedTs > (time() - $minIntervalSeconds)) {
+                return;
+            }
+        }
+
+        DB::update('oauth_tokens', ['last_used' => now_iso()], 'token=?', [(string)$row['token']]);
     }
 
     public static function revoke(string $tok): void

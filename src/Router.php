@@ -49,6 +49,7 @@ class Router
         $this->get('/api/v1/instance/peers',          'Api\InstanceCtrl@peers');
         $this->get('/api/v1/instance/activity',       'Api\InstanceCtrl@activity');
         $this->get('/api/v1/instance/rules',          'Api\InstanceCtrl@rules');
+        $this->get('/api/v1/instance/health',         'Api\InstanceCtrl@health');
         $this->get('/api/v1/custom_emojis',           'Api\InstanceCtrl@emojis');
 
         // ── Accounts ──────────────────────────────────────────
@@ -263,12 +264,14 @@ class Router
         $this->post('/admin/reports/:id/update',      'AdminCtrl@reportUpdate');
         $this->get('/admin/federation',               'AdminCtrl@federation');
         $this->post('/admin/federation',              'AdminCtrl@federationAction');
+        $this->post('/admin/federation/refetch-actor','AdminCtrl@federationRefetchActor');
         $this->get('/admin/settings',                 'AdminCtrl@settings');
         $this->post('/admin/settings',                'AdminCtrl@settingsSave');
         $this->get('/admin/relays',                   'AdminCtrl@relays');
         $this->post('/admin/relays/action',           'AdminCtrl@relayAction');
         $this->get('/admin/inbox-log',                'AdminCtrl@inboxLog');
         $this->get('/admin/inbox-log/:id',            'AdminCtrl@inboxLogDetail');
+        $this->post('/admin/inbox-log/:id/retry',     'AdminCtrl@retryInboxLog');
         $this->get('/admin/maintenance',              'AdminCtrl@maintenance');
         $this->post('/admin/maintenance',             'AdminCtrl@maintenanceAction');
         $this->get('/admin/delivery-queue',           'AdminCtrl@deliveryQueue');

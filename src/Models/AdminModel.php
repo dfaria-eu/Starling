@@ -379,7 +379,7 @@ class AdminModel
                 'description' => 'Lower peaks and less inline work; best for tight hosting limits.',
                 'values' => [
                     'internal_wake_batch' => 10,
-                    'request_drain_batch' => 1,
+                    'request_drain_batch' => 0,
                     'inbox_drain_batch' => 3,
                     'wake_fallback_batch' => 6,
                     'wake_fallback_cycles' => 1,
@@ -392,7 +392,7 @@ class AdminModel
                 'description' => 'More throughput without drifting back into overly long batches.',
                 'values' => [
                     'internal_wake_batch' => 12,
-                    'request_drain_batch' => 2,
+                    'request_drain_batch' => 0,
                     'inbox_drain_batch' => 4,
                     'wake_fallback_batch' => 8,
                     'wake_fallback_cycles' => 1,
@@ -441,10 +441,38 @@ class AdminModel
         $saved = json_decode((string)($row['body'] ?? '{}'), true);
         if (!is_array($saved)) return $defaults;
 
+        $legacySharedProfiles = [
+            [
+                'internal_wake_batch' => 10,
+                'request_drain_batch' => 1,
+                'inbox_drain_batch' => 3,
+                'wake_fallback_batch' => 6,
+                'wake_fallback_cycles' => 1,
+                'delivery_connect_timeout' => 3,
+                'delivery_timeout' => 6,
+            ],
+            [
+                'internal_wake_batch' => 12,
+                'request_drain_batch' => 2,
+                'inbox_drain_batch' => 4,
+                'wake_fallback_batch' => 8,
+                'wake_fallback_cycles' => 1,
+                'delivery_connect_timeout' => 4,
+                'delivery_timeout' => 7,
+            ],
+        ];
+        foreach ($legacySharedProfiles as $legacy) {
+            if ($saved === $legacy) {
+                $saved['request_drain_batch'] = 0;
+                break;
+            }
+        }
+
         $out = [];
         foreach ($defaults as $key => $default) {
             $value = $saved[$key] ?? $default;
-            $out[$key] = max(1, (int)$value);
+            $min = $key === 'request_drain_batch' ? 0 : 1;
+            $out[$key] = max($min, (int)$value);
         }
         return $out;
     }
@@ -467,7 +495,8 @@ class AdminModel
             $values = $profiles[$preset]['values'];
         } else {
             foreach ($defaults as $key => $default) {
-                $value = max(1, (int)($input[$key] ?? $default));
+                $min = $key === 'request_drain_batch' ? 0 : 1;
+                $value = max($min, (int)($input[$key] ?? $default));
                 $values[$key] = match ($key) {
                     'request_drain_batch' => min($value, 10),
                     'inbox_drain_batch' => min($value, 20),
@@ -741,7 +770,7 @@ class AdminModel
 
         $total = DB::count('inbox_log', $where, $params);
         $rows  = DB::all(
-            "SELECT id,actor_url,type,error,created_at FROM inbox_log
+            "SELECT id,actor_url,type,error,request_method,request_path,remote_ip,created_at FROM inbox_log
              WHERE $where ORDER BY created_at DESC LIMIT $limit OFFSET $offset",
             $params
         );
@@ -754,6 +783,74 @@ class AdminModel
     public static function inboxLogDetail(string $id): ?array
     {
         return DB::one('SELECT * FROM inbox_log WHERE id=?', [$id]);
+    }
+
+    public static function refetchRemoteActor(string $actorUrl): array
+    {
+        $actorUrl = trim($actorUrl);
+        if ($actorUrl === '' || !preg_match('#^https?://#i', $actorUrl)) {
+            return ['ok' => false, 'error' => 'invalid_actor_url', 'actor' => null];
+        }
+        return RemoteActorModel::fetchDetailed($actorUrl, true);
+    }
+
+    public static function retryInboxLogEntry(string $id): array
+    {
+        $row = self::inboxLogDetail($id);
+        if (!$row) {
+            return ['ok' => false, 'error' => 'entry_not_found'];
+        }
+
+        $activity = json_decode((string)($row['raw_json'] ?? ''), true);
+        if (!is_array($activity)) {
+            return ['ok' => false, 'error' => 'invalid_activity_json'];
+        }
+
+        $headers = json_decode((string)($row['sig_headers'] ?? '{}'), true);
+        if (!is_array($headers)) {
+            $headers = [];
+        }
+
+        $sigDebug = json_decode((string)($row['sig_debug'] ?? '{}'), true);
+        if (!is_array($sigDebug)) {
+            $sigDebug = [];
+        }
+
+        $method = trim((string)($row['request_method'] ?? ''));
+        if ($method === '') {
+            $method = trim((string)($sigDebug['request']['method'] ?? 'POST'));
+        }
+        $path = trim((string)($row['request_path'] ?? ''));
+        if ($path === '') {
+            $path = trim((string)($sigDebug['request']['path'] ?? '/inbox'));
+        }
+        $host = trim((string)($row['request_host'] ?? ''));
+        if ($host !== '' && !isset($headers['host'])) {
+            $headers['host'] = $host;
+        }
+
+        $accepted = \App\ActivityPub\InboxProcessor::process(
+            $activity,
+            $headers,
+            $method !== '' ? $method : 'POST',
+            $path !== '' ? $path : '/inbox',
+            (string)($row['raw_json'] ?? ''),
+            [
+                'method' => $method !== '' ? $method : 'POST',
+                'path' => $path !== '' ? $path : '/inbox',
+                'host' => $host,
+                'remote_ip' => trim((string)($row['remote_ip'] ?? '')),
+                'retry_of' => $id,
+                'retry_reason' => 'admin_manual_retry',
+            ]
+        );
+
+        return [
+            'ok' => true,
+            'accepted' => $accepted,
+            'actor_url' => (string)($row['actor_url'] ?? ''),
+            'type' => (string)($row['type'] ?? ''),
+        ];
     }
 
     // ── Manutenção / limpeza ─────────────────────────────────
