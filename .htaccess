@@ -11,7 +11,6 @@ Header always set Access-Control-Allow-Headers "Authorization, Content-Type, Acc
 Header always set Access-Control-Expose-Headers "Link, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset"
 
 <IfModule LiteSpeed>
-    # Impedir que o LiteSpeed intercepte o header Link para HTTP/2 Push
     Header always set X-LiteSpeed-Vary "0"
     RewriteRule .* - [E=noabort:1]
 </IfModule>
