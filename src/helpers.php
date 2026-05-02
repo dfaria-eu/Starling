@@ -867,10 +867,16 @@ function site_favicon_url(): string
     return 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext x=%2250%25%22 y=%2252%25%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22 font-size=%2244%22 font-family=%22Arial,sans-serif%22%3E%E2%8B%B0%E2%8B%B1%3C/text%3E%3C/svg%3E';
 }
 
-function text_to_html(string $text): string
+function text_to_html_linkify_inline(string $text): string
 {
-    if ($text === '') return '';
     $s = htmlspecialchars($text, ENT_COMPAT | ENT_HTML5, 'UTF-8');
+    // Minimal local markup subset.
+    $s = preg_replace('/(?<!\*)\*\*([^\n*](?:.*?[^\n*])?)\*\*(?!\*)/u', '<strong>$1</strong>', $s);
+    $s = preg_replace('/(?<!~)~~([^\n~](?:.*?[^\n~])?)~~(?!~)/u', '<del>$1</del>', $s);
+    $s = preg_replace('/(?<!\+)\\+\\+([^\n+](?:.*?[^\n+])?)\\+\\+(?!\+)/u', '<u>$1</u>', $s);
+    $s = preg_replace('/(?<!\w)_([^_\n]+)_(?!\w)/u', '<em>$1</em>', $s);
+    $s = preg_replace('/(?<!\*)\*([^\n*]+)\*(?!\*)/u', '<em>$1</em>', $s);
+    $s = preg_replace('/(?<!`)`([^`\n]+)`(?!`)/u', '<code>$1</code>', $s);
     // mentions
     $s = preg_replace_callback(
         '/(?<![\/\w])@([A-Za-z0-9_][A-Za-z0-9_.-]*)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![A-Za-z0-9.-])/u',
@@ -911,10 +917,89 @@ function text_to_html(string $text): string
         },
         $s
     );
+    return $s;
+}
+
+function text_to_html_render_blocks(string $text, int $depth = 0): string
+{
+    if ($text === '') return '';
+    if ($depth > 2) {
+        return '<p>' . str_replace("\n", '<br>', text_to_html_linkify_inline($text)) . '</p>';
+    }
+
+    $lines = preg_split("/\r\n|\r|\n/", $text) ?: [];
+    $html = [];
+    $count = count($lines);
+
+    for ($i = 0; $i < $count;) {
+        $line = $lines[$i];
+        if (trim($line) === '') {
+            $i++;
+            continue;
+        }
+
+        if (preg_match('/^\s*>\s?(.*)$/', $line, $m)) {
+            $quoteLines = [$m[1]];
+            $i++;
+            while ($i < $count) {
+                if (trim($lines[$i]) === '') {
+                    $quoteLines[] = '';
+                    $i++;
+                    continue;
+                }
+                if (!preg_match('/^\s*>\s?(.*)$/', $lines[$i], $qm)) break;
+                $quoteLines[] = $qm[1];
+                $i++;
+            }
+            $html[] = '<blockquote>' . text_to_html_render_blocks(implode("\n", $quoteLines), $depth + 1) . '</blockquote>';
+            continue;
+        }
+
+        if (preg_match('/^\s*(\d+)\.\s+(.+)$/', $line, $m) || preg_match('/^\s*([*-])\s+(.+)$/', $line, $m)) {
+            $ordered = is_numeric($m[1]);
+            $items = [$m[2]];
+            $i++;
+            while ($i < $count) {
+                if ($ordered && preg_match('/^\s*\d+\.\s+(.+)$/', $lines[$i], $lm)) {
+                    $items[] = $lm[1];
+                    $i++;
+                    continue;
+                }
+                if (!$ordered && preg_match('/^\s*[*-]\s+(.+)$/', $lines[$i], $lm)) {
+                    $items[] = $lm[1];
+                    $i++;
+                    continue;
+                }
+                break;
+            }
+            $tag = $ordered ? 'ol' : 'ul';
+            $html[] = '<' . $tag . '>' . implode('', array_map(
+                static fn(string $item): string => '<li>' . str_replace("\n", '<br>', text_to_html_linkify_inline(trim($item))) . '</li>',
+                $items
+            )) . '</' . $tag . '>';
+            continue;
+        }
+
+        $paragraphLines = [$line];
+        $i++;
+        while ($i < $count) {
+            if (trim($lines[$i]) === '') break;
+            if (preg_match('/^\s*>\s?/', $lines[$i])) break;
+            if (preg_match('/^\s*(?:\d+\.\s+|[*-]\s+)/', $lines[$i])) break;
+            $paragraphLines[] = $lines[$i];
+            $i++;
+        }
+        $html[] = '<p>' . str_replace("\n", '<br>', text_to_html_linkify_inline(implode("\n", $paragraphLines))) . '</p>';
+    }
+
+    return implode('', $html);
+}
+
+function text_to_html(string $text): string
+{
+    if ($text === '') return '';
     // Split on blank lines → separate <p> elements (like Mastodon); single newline → <br>
-    $paragraphs = array_values(array_filter(array_map('trim', preg_split('/\n{2,}/', $s))));
-    if (!$paragraphs) return '';
-    return implode('', array_map(fn($p) => '<p>' . str_replace("\n", '<br>', $p) . '</p>', $paragraphs));
+    return text_to_html_render_blocks($text);
 }
 
 function extract_mentions(string $text): array
@@ -1008,7 +1093,7 @@ function ensure_html(string $content): string
     if ($content === '') return '';
     // If content already contains HTML tags, sanitise and return as-is
     if ($content !== strip_tags($content)) {
-        $html = strip_tags($content, '<p><br><a><strong><em><code><pre><ul><ol><li><blockquote><span>');
+        $html = strip_tags($content, '<p><br><a><strong><em><u><del><code><pre><ul><ol><li><blockquote><span>');
         // Strip event handler attributes (on*) and style attributes to prevent XSS.
         // strip_tags keeps all attributes on allowed tags, so we must do this explicitly.
         $html = preg_replace('/\s+on\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]*)/i', '', $html);

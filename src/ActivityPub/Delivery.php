@@ -36,7 +36,7 @@ class Delivery
 
     public static function requestDrainBatch(): int
     {
-        return max(1, (int)(self::tuning()['request_drain_batch'] ?? self::DEFAULT_REQUEST_DRAIN_BATCH));
+        return max(0, (int)(self::tuning()['request_drain_batch'] ?? self::DEFAULT_REQUEST_DRAIN_BATCH));
     }
 
     public static function inboxDrainBatch(): int

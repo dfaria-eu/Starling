@@ -748,6 +748,26 @@ a:hover{text-decoration:underline}
 .s-content a:hover{text-decoration:underline}
 .s-content p{margin-bottom:.35rem}
 .s-content p:last-child{margin-bottom:0}
+.s-content code,.quote-content code{
+  display:inline-block;padding:.08rem .38rem;border-radius:6px;
+  background:color-mix(in srgb,var(--hover) 70%,var(--surface));
+  border:1px solid var(--border);color:var(--text);font-size:.92em;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace
+}
+.s-content pre,.quote-content pre{
+  margin:.55rem 0;padding:.7rem .85rem;border-radius:12px;
+  background:color-mix(in srgb,var(--hover) 75%,var(--surface));
+  border:1px solid var(--border);overflow:auto
+}
+.s-content pre code,.quote-content pre code{display:block;padding:0;border:0;background:transparent}
+.s-content blockquote,.quote-content blockquote{
+  margin:.55rem 0;padding:.15rem 0 .15rem .85rem;
+  border-left:3px solid color-mix(in srgb,var(--blue) 35%,var(--border));
+  color:var(--text2);background:color-mix(in srgb,var(--hover) 55%,transparent);
+  border-radius:0 10px 10px 0
+}
+.s-content blockquote p,.quote-content blockquote p{margin-bottom:.25rem}
+.s-content blockquote p:last-child,.quote-content blockquote p:last-child{margin-bottom:0}
 
 /* CW */
 .cw-bar{
