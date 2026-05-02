@@ -1,11 +1,10 @@
 <?php
 declare(strict_types=1);
 
-// Detect ROOT automatically.
+// Detect the project root from common deployment layouts.
 $candidates = [
-    __DIR__,                           // Everything in the public root (flat layout)
-    dirname(__DIR__),                  // Separate public/ directory
-    dirname(__DIR__, 2) . '/activitypub-php',
+    __DIR__,          // Flat layout: index.php sits beside config/, src/, storage/
+    dirname(__DIR__), // Split layout: index.php sits inside a dedicated public/ dir
 ];
 
 $root = null;
@@ -22,7 +21,8 @@ if ($root === null) {
     echo "ERROR: config/config.php not found.\n\n";
     echo "Checked locations:\n";
     foreach ($candidates as $c) echo "  $c/config/config.php\n";
-    echo "\nPlace config/, src/, and storage/ in the same directory as this index.php.\n";
+    echo "\nPlace the Starling project root where this index.php can find config/config.php.\n";
+    echo "Supported layouts include a flat install or a separate public web root.\n";
     exit;
 }
 
