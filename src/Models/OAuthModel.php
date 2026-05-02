@@ -5,11 +5,11 @@ namespace App\Models;
 
 class OAuthModel
 {
-    private static function normalizeRedirectUris(mixed $raw): string
+    public static function parseRedirectUris(mixed $raw): array
     {
         $items = is_array($raw)
             ? $raw
-            : preg_split('/\R+/', (string)$raw);
+            : preg_split('/[\s\r\n]+/', trim((string)$raw));
         $items = array_values(array_unique(array_filter(array_map(
             static fn($v) => trim((string)$v),
             $items ?: []
@@ -27,7 +27,10 @@ class OAuthModel
                 $out[] = $uri;
                 continue;
             }
-            $scheme = strtolower((string)parse_url($uri, PHP_URL_SCHEME));
+            if (!preg_match('/^([a-z][a-z0-9+.-]*):/i', $uri, $m)) {
+                continue;
+            }
+            $scheme = strtolower($m[1]);
             if ($scheme === '' || in_array($scheme, ['javascript', 'data', 'vbscript', 'file'], true)) {
                 continue;
             }
@@ -41,7 +44,12 @@ class OAuthModel
         if (!$out) {
             $out = ['urn:ietf:wg:oauth:2.0:oob'];
         }
-        return implode("\n", $out);
+        return $out;
+    }
+
+    private static function normalizeRedirectUris(mixed $raw): string
+    {
+        return implode("\n", self::parseRedirectUris($raw));
     }
 
     public static function normalizeScopes(?string $requested, string $allowed = 'read write follow push'): string
@@ -221,16 +229,14 @@ class OAuthModel
     public static function appToMasto(array $a): array
     {
         $redirectUri = (string)($a['redirect_uri'] ?? '');
-        $redirectUris = preg_split('/\s+/', trim($redirectUri)) ?: [];
-        $redirectUris = array_values(array_filter($redirectUris, 'strlen'));
-        if (!$redirectUris) $redirectUris = ['urn:ietf:wg:oauth:2.0:oob'];
+        $redirectUris = self::parseRedirectUris($redirectUri);
 
         return [
             'id'            => $a['id'],
             'name'          => $a['name'],
             'website'       => $a['website'] ?: null,
             'scopes'        => preg_split('/\s+/', trim((string)($a['scopes'] ?? ''))) ?: [],
-            'redirect_uri'  => $redirectUri !== '' ? $redirectUri : $redirectUris[0],
+            'redirect_uri'  => $redirectUris[0],
             'redirect_uris' => $redirectUris,
             'client_id'     => $a['client_id'],
             'client_secret' => $a['client_secret'],

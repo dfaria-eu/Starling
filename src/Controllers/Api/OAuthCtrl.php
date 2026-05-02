@@ -45,7 +45,7 @@ class OAuthCtrl
         if ($redir === 'urn:ietf:wg:oauth:2.0:oob' || $registeredUri === 'urn:ietf:wg:oauth:2.0:oob') {
             return $redir === $registeredUri || $redir === 'urn:ietf:wg:oauth:2.0:oob';
         }
-        $allowed = array_filter(array_map('trim', preg_split('/\R+/', $registeredUri ?: '')));
+        $allowed = OAuthModel::parseRedirectUris($registeredUri);
         return in_array($redir, $allowed, true);
     }
 

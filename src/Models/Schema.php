@@ -103,12 +103,6 @@ class Schema
         )");
 
         try { $db->exec("ALTER TABLE oauth_tokens ADD COLUMN last_used TEXT NOT NULL DEFAULT ''"); } catch (\Throwable) {}
-        try { $db->exec("ALTER TABLE statuses ADD COLUMN quote_of_id TEXT"); } catch (\Throwable) {}
-        // Idempotency-Key support: prevents duplicate posts when the Mastodon iOS app retries
-        // a failed status creation request. The key is per-user (same key from different users
-        // is allowed). Index allows fast lookup without full table scan.
-        try { $db->exec("ALTER TABLE statuses ADD COLUMN idempotency_key TEXT"); } catch (\Throwable) {}
-        try { $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_status_idempotency ON statuses(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"); } catch (\Throwable) {}
 
         $db->exec("CREATE TABLE IF NOT EXISTS statuses (
             id               TEXT PRIMARY KEY,
@@ -137,6 +131,12 @@ class Schema
         $db->exec("CREATE INDEX IF NOT EXISTS idx_status_pub  ON statuses(visibility,local,created_at DESC)");
         $db->exec("CREATE INDEX IF NOT EXISTS idx_status_uri  ON statuses(uri)");
         $db->exec("CREATE INDEX IF NOT EXISTS idx_status_expires ON statuses(expires_at)");
+        try { $db->exec("ALTER TABLE statuses ADD COLUMN quote_of_id TEXT"); } catch (\Throwable) {}
+        // Idempotency-Key support: prevents duplicate posts when the Mastodon iOS app retries
+        // a failed status creation request. The key is per-user (same key from different users
+        // is allowed). Index allows fast lookup without full table scan.
+        try { $db->exec("ALTER TABLE statuses ADD COLUMN idempotency_key TEXT"); } catch (\Throwable) {}
+        try { $db->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_status_idempotency ON statuses(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"); } catch (\Throwable) {}
 
         // Link preview cards (cache de Open Graph)
         $db->exec("CREATE TABLE IF NOT EXISTS link_cards (
