@@ -58,8 +58,32 @@ Starling runs on a minimal PHP stack and is compatible with typical LAMP-style h
 ## Quick Start
 
 1. Copy the project to your server.
-2. Open `/install` and complete the installer.
-3. Open `/admin` for general settings and instance operation.
+2. Open `https://yourdomain.tld//install` and complete the installer.
+3. Open `https://yourdomain.tld//admin` for general settings and instance operation.
+
+## Docker Installation (optional)
+
+If you don't want to run the project on 'bare metal', you can use docker containers.
+
+1. Copy the project to your server, in a sub-directory. `git clone https://github.com/dfaria-eu/Starling.git` will create a sub-directory called Starling.
+2. In the parent directory above the project, create a compose.yaml file containing this:
+```
+services:
+  starling:
+    build: ./Starling
+    container_name: starling
+    ports:
+      - "5081:80"
+    volumes:
+      - /home/you/docker_stuff/starling/Starling:/var/www/html
+    restart: unless-stopped
+```
+
+3. Change the volume path to match your situation. In this example, starling is the parent and Starling is the project directory that `git clone` created.
+4. Run `docker compose up --build -d`
+5. Configure a reverse proxy to send traffic through to port 5081. Nginx or a Cloudflare tunnel, for example.
+6. Open `https://yourdomain.tld/install` in your browser and complete the installer.
+7. Open `https://yourdomain.tld/admin` for general settings and instance operation.
 
 ## Project Status
 
