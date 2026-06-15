@@ -728,7 +728,11 @@ class WebClientCtrl
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign In · ' . $domain . '</title>
 <link rel="icon" href="' . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">
-<style>' . $this->css() . '</style>
+<style>' . $this->css() . '
+  .login-toggle { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.9rem; }
+  .login-toggle input { cursor: pointer; margin: 0; width: auto; }
+  .login-toggle label { margin-bottom: 0; cursor: pointer; font-weight: normal; }
+</style>
 </head>
 <body>
 <nav id="sidebar" style="width:auto;position:static;border:none;background:transparent;padding:1rem 1.5rem 0;flex-direction:row;height:auto;gap:.5rem;display:flex;align-items:center">
@@ -747,12 +751,26 @@ class WebClientCtrl
       <div class="login-field">
         <label for="password">Password</label>
         <input id="password" type="password" name="password" autocomplete="current-password" required>
+        <div class="login-toggle">
+          <input type="checkbox" id="show-password-checkbox">
+          <label for="show-password-checkbox">Show Password</label>
+        </div>
       </div>
       <button type="submit" class="login-submit">Sign In</button>
     </form>
     ' . $signupCta . '
   </div>
 </div>
+<script>
+    document.addEventListener("DOMContentLoaded", function () {
+        var passwordInput = document.getElementById("password");
+        var toggleCheckbox = document.getElementById("show-password-checkbox");
+        
+        toggleCheckbox.addEventListener("change", function () {
+            passwordInput.type = this.checked ? "text" : "password";
+        });
+    });
+</script>
 </body>
 </html>';
     }
