@@ -728,11 +728,7 @@ class WebClientCtrl
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign In · ' . $domain . '</title>
 <link rel="icon" href="' . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">
-<style>' . $this->css() . '
-  .login-toggle { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.9rem; }
-  .login-toggle input { cursor: pointer; margin: 0; width: auto; }
-  .login-toggle label { margin-bottom: 0; cursor: pointer; font-weight: normal; }
-</style>
+<style>' . $this->css() . '</style>
 </head>
 <body>
 <nav id="sidebar" style="width:auto;position:static;border:none;background:transparent;padding:1rem 1.5rem 0;flex-direction:row;height:auto;gap:.5rem;display:flex;align-items:center">
@@ -836,11 +832,7 @@ class WebClientCtrl
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Create Account · ' . $domain . '</title>
 <link rel="icon" href="' . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">
-<style>' . $this->css() . '
-  .login-toggle { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.9rem; }
-  .login-toggle input { cursor: pointer; margin: 0; width: auto; }
-  .login-toggle label { margin-bottom: 0; cursor: pointer; font-weight: normal; }
-</style>
+<style>' . $this->css() . '</style>
 </head>
 <body>
 <nav id="sidebar" style="width:auto;position:static;border:none;background:transparent;padding:1rem 1.5rem 0;flex-direction:row;height:auto;gap:.5rem;display:flex;align-items:center;justify-content:space-between">
@@ -2285,6 +2277,29 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--blue);outline-offse
 .login-foot{margin-top:1rem;color:var(--text2);font-size:.88rem;text-align:center}
 .login-foot a,.login-alt-link{color:var(--blue)}
 .login-alt-link{font-size:.9rem;font-weight:600}
+
+/* Custom Login/Register Password Toggle styles matching Starling's system */
+.login-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  font-size: 0.85rem;
+  color: var(--text2); /* Matches secondary text color */
+}
+.login-toggle input[type="checkbox"] {
+  cursor: pointer;
+  margin: 0;
+  width: 14px;
+  height: 14px;
+  accent-color: var(--blue); /* Uses the app's native blue brand color */
+}
+.login-toggle label {
+  margin-bottom: 0;
+  cursor: pointer;
+  font-weight: 500;
+  user-select: none; /* Prevents text highlights when clicking quickly */
+}
 CSS;
     }
 
