@@ -836,7 +836,11 @@ class WebClientCtrl
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Create Account · ' . $domain . '</title>
 <link rel="icon" href="' . htmlspecialchars(\site_favicon_url(), ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">
-<style>' . $this->css() . '</style>
+<style>' . $this->css() . '
+  .login-toggle { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; font-size: 0.9rem; }
+  .login-toggle input { cursor: pointer; margin: 0; width: auto; }
+  .login-toggle label { margin-bottom: 0; cursor: pointer; font-weight: normal; }
+</style>
 </head>
 <body>
 <nav id="sidebar" style="width:auto;position:static;border:none;background:transparent;padding:1rem 1.5rem 0;flex-direction:row;height:auto;gap:.5rem;display:flex;align-items:center;justify-content:space-between">
@@ -864,12 +868,29 @@ class WebClientCtrl
       <div class="login-field">
         <label for="password_confirm">Confirm password</label>
         <input id="password_confirm" type="password" name="password_confirm" autocomplete="new-password" minlength="8" required>
+        <div class="login-toggle">
+          <input type="checkbox" id="show-passwords-checkbox">
+          <label for="show-passwords-checkbox">Show Passwords</label>
+        </div>
       </div>
       <button type="submit" class="login-submit">Create account</button>
     </form>
     <div class="login-foot">Already have an account? <a href="/web/login">Sign in</a></div>
   </div>
 </div>
+<script>
+    document.addEventListener("DOMContentLoaded", function () {
+        var passwordInput = document.getElementById("password");
+        var confirmInput = document.getElementById("password_confirm");
+        var toggleCheckbox = document.getElementById("show-passwords-checkbox");
+        
+        toggleCheckbox.addEventListener("change", function () {
+            var inputType = this.checked ? "text" : "password";
+            passwordInput.type = inputType;
+            confirmInput.type = inputType;
+        });
+    });
+</script>
 </body>
 </html>';
     }
