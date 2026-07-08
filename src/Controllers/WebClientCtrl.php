@@ -747,12 +747,26 @@ class WebClientCtrl
       <div class="login-field">
         <label for="password">Password</label>
         <input id="password" type="password" name="password" autocomplete="current-password" required>
+        <div class="login-toggle">
+          <input type="checkbox" id="show-password-checkbox">
+          <label for="show-password-checkbox">Show Password</label>
+        </div>
       </div>
       <button type="submit" class="login-submit">Sign In</button>
     </form>
     ' . $signupCta . '
   </div>
 </div>
+<script>
+    document.addEventListener("DOMContentLoaded", function () {
+        var passwordInput = document.getElementById("password");
+        var toggleCheckbox = document.getElementById("show-password-checkbox");
+        
+        toggleCheckbox.addEventListener("change", function () {
+            passwordInput.type = this.checked ? "text" : "password";
+        });
+    });
+</script>
 </body>
 </html>';
     }
@@ -846,12 +860,29 @@ class WebClientCtrl
       <div class="login-field">
         <label for="password_confirm">Confirm password</label>
         <input id="password_confirm" type="password" name="password_confirm" autocomplete="new-password" minlength="8" required>
+        <div class="login-toggle">
+          <input type="checkbox" id="show-passwords-checkbox">
+          <label for="show-passwords-checkbox">Show Passwords</label>
+        </div>
       </div>
       <button type="submit" class="login-submit">Create account</button>
     </form>
     <div class="login-foot">Already have an account? <a href="/web/login">Sign in</a></div>
   </div>
 </div>
+<script>
+    document.addEventListener("DOMContentLoaded", function () {
+        var passwordInput = document.getElementById("password");
+        var confirmInput = document.getElementById("password_confirm");
+        var toggleCheckbox = document.getElementById("show-passwords-checkbox");
+        
+        toggleCheckbox.addEventListener("change", function () {
+            var inputType = this.checked ? "text" : "password";
+            passwordInput.type = inputType;
+            confirmInput.type = inputType;
+        });
+    });
+</script>
 </body>
 </html>';
     }
@@ -2246,6 +2277,29 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--blue);outline-offse
 .login-foot{margin-top:1rem;color:var(--text2);font-size:.88rem;text-align:center}
 .login-foot a,.login-alt-link{color:var(--blue)}
 .login-alt-link{font-size:.9rem;font-weight:600}
+
+/* Custom Login/Register Password Toggle styles matching Starling's system */
+.login-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  font-size: 0.85rem;
+  color: var(--text2); /* Matches secondary text color */
+}
+.login-toggle input[type="checkbox"] {
+  cursor: pointer;
+  margin: 0;
+  width: 14px;
+  height: 14px;
+  accent-color: var(--blue); /* Uses the app's native blue brand color */
+}
+.login-toggle label {
+  margin-bottom: 0;
+  cursor: pointer;
+  font-weight: 500;
+  user-select: none; /* Prevents text highlights when clicking quickly */
+}
 CSS;
     }
 
