@@ -2871,7 +2871,7 @@ function renderProfileHeader(account, rel) {
     const isRequested = rel?.requested ?? false;
     const isNotifying = rel?.notifying ?? false;
     const dmBtn = !isOwn
-        ? `<button class="profile-dm-btn" onclick="Compose.openDM('${escJsSq(account.acct)}')" title="Enviar mensagem direta">
+        ? `<button class="profile-dm-btn" onclick="Compose.openDM('${escJsSq(account.acct)}')" title="Send a direct message">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
            </button>` : '';
     const notifyBtn = (!isOwn && isFollowing)
